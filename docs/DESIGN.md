@@ -85,6 +85,78 @@ method rather than a new struct field.
 `ToStep` mutates and returns itself, so a guard attached to a stored
 transition takes effect whether or not the result is reassigned.
 
+## Groups are a build-time expansion
+
+Several states usually accept an event the same way, and writing that per
+state duplicates a rule that has one reason to change. `FromEach(a, b, c)` is
+the shorthand for the fan-in, and `Group` is the version that the machine
+knows about.
+
+`FromEach` is variadic rather than `From` growing a second parameter, for two
+reasons. Go will not let a slice be spread into `From(s S, more ...S)` — the
+call needs `From(xs[0], xs[1:]...)`, which panics on an empty slice and makes
+the group-as-a-value idiom unusable. And `From(a, b)` puts two adjacent
+parameters of the same state type back into the API, which is the one thing
+the `From`/`On`/`To` split exists to prevent: `From(a, b).On(ev).To(b)`,
+written by someone who read the pair as source-and-target, type-checks and
+builds, silently adding `b --ev--> b` as an external self-transition that dips
+any gauge on `b` and empties the terminal set.
+
+A `Group` differs from `FromEach` in one way that matters: **a member that
+declares the event itself overrides the inherited edge.** That is what turns
+an enumeration into a hierarchy-like thing. It also means membership is
+declared in one place, so a new member inherits every group transition instead
+of needing each enumerating site found and edited.
+
+The expansion happens before `New` returns, so `Fire` is untouched — a group
+is not a state, never appears in `States()`, and a `*S` never holds one. This
+is why groups cost nothing: `BenchmarkFire` and `BenchmarkFireWithHooks` are
+unchanged by their existence.
+
+Because the override rule needs the whole explicit table before it can know
+what to skip, group expansion is a deferred pass — and it must run *before*
+the `GaugeWith` pass, which reads the finished table. So there are two phases,
+not one: expansion adds edges, then the rules that read edges run.
+
+### What groups deliberately are not
+
+A group has no entry or exit hooks, and no `Gauge`. The reason to want them is
+exactly the thing a flat expansion cannot reproduce: in a real hierarchy,
+moving between two substates of the same superstate does *not* run the
+superstate's hooks. With every row flat there is nowhere to record that, so a
+group gauge would decrement and increment on a move a hierarchy would treat as
+staying put — the same dip as a self-transition, in a counter whose whole
+purpose is not to drift.
+
+The usual demand for it dissolves on inspection. "How many participants are
+live" is the sum of the per-state gauges, computed where the counters are
+read; `sum by (state)` in a metrics backend needs no group at all, and has no
+dip to observe. Adding exact suppression means precomputing the ordered hook
+sequence per edge and restructuring `Machine` around a single
+`map[edge[S]]*plan[S]` — worth doing if a superstate ever genuinely needs its
+own hook, and not before.
+
+Groups do not nest, and entering one does not select an initial member.
+Overlapping groups are allowed, but two groups claiming the same event for one
+state is an error rather than a silent most-specific-wins, because with no
+nesting there is no specificity to appeal to.
+
+### The diagram is where a group can still lie
+
+`DOT` draws one arrow from a cluster boundary rather than one per member, and
+skips the sibling rows when it does. That makes a wrong decision worse than
+cosmetic: Graphviz refuses an `ltail` it cannot honour and the skipped rows
+disappear, so the picture shows a transition table that does not exist. Three
+cases therefore fall back to per-member arrows — a member that overrode the
+event, a group that lost members to an overlapping cluster, and a target that
+is itself a member.
+
+The count behind that decision is keyed on the trigger's identity, not its
+name. Keying on the name merges two same-named events into one group
+transition, and the arrow it collapses to covers neither of them. `Edge` keeps
+an unexported trigger and exposes `Edge.Is` for the same reason
+`Transition.Is` exists.
+
 ## States and events are named so they cannot be confused
 
 Events take an `ev` prefix; states take the plain domain prefix. Without that
@@ -228,8 +300,10 @@ boxed. See [Benchmark](../README.md#benchmark).
   In practice a machine is a package-level variable, not a dependency you
   inject, so this has not been a problem — but it rules out mocking the machine
   itself. Test against the states instead.
-- **Flat states only.** No hierarchical states, no substates, no orthogonal
-  regions.
+- **Flat states only.** [`Group`](#groups-are-a-build-time-expansion) covers
+  shared transitions and per-member overrides, but not the rest of a
+  hierarchy: no group entry/exit hooks or gauges, no nesting, no initial
+  transition into a group, no orthogonal regions.
 - **No built-in async.** No trigger queue, no run-to-completion mode. `Fire` is
   synchronous and reentrant-unsafe by design: if your state is already
   serialized behind a queue or a mutex, a second one inside the machine is pure

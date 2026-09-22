@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 )
 
 // Rule is one declaration a machine is made of: a transition, a gauge or a
@@ -33,8 +34,27 @@ type builder[S comparable] struct {
 	// here and read in a second pass.
 	decls []decl[S]
 
+	// Group transitions, which add edges and so must run before the rules
+	// that read the finished table.
+	expand []func(*builder[S])
+
 	// Rules that must run once every transition is known.
 	deferred []func(*builder[S])
+
+	// Which group each inherited row came from, so that two groups claiming
+	// the same (state, event) is reported rather than read as an override.
+	inherited map[edge[S]]string
+
+	// Targets of the group transitions declared so far, so that one declared
+	// twice reads as a duplicate rather than as a group clashing with itself.
+	groupEdges map[groupEdge]S
+}
+
+// groupEdge identifies one group transition, before it expands to a row per
+// member.
+type groupEdge struct {
+	group string
+	ev    *eventDef
 }
 
 type decl[S comparable] struct {
@@ -63,7 +83,9 @@ func New[S comparable](name string, rules ...Rule[S]) (*Machine[S], error) {
 			onEnterVia: make(map[edge[S]][]any),
 			onExitVia:  make(map[edge[S]][]any),
 		},
-		seen: make(map[S]bool),
+		seen:       make(map[S]bool),
+		inherited:  make(map[edge[S]]string),
+		groupEdges: make(map[groupEdge]S),
 	}
 
 	for i, r := range rules {
@@ -74,8 +96,24 @@ func New[S comparable](name string, rules ...Rule[S]) (*Machine[S], error) {
 		r.applyTo(b)
 	}
 
-	// Rules that need the whole transition table run once it exists, so a
+	// Checked before expansion, while seen holds only explicitly declared
+	// states, so a mistyped member is reported rather than quietly given
+	// edges of its own.
+	for _, g := range b.m.groups {
+		for _, s := range g.members {
+			if !b.seen[s] {
+				b.errs = append(b.errs, fmt.Errorf(
+					"group %s: member %v is not a state of this machine", g.name, s))
+			}
+		}
+	}
+
+	// Group transitions expand first, since they add edges. Rules that need
+	// the whole transition table then run against the finished one, so a
 	// GaugeWith can be declared before the edges it applies to.
+	for _, e := range b.expand {
+		e(b)
+	}
 	for _, d := range b.deferred {
 		d(b)
 	}
@@ -109,11 +147,38 @@ func MustNew[S comparable](name string, rules ...Rule[S]) *Machine[S] {
 // The source and target states are named by separate calls rather than passed
 // as two adjacent arguments of the same type, so they cannot be swapped by
 // mistake.
-func From[S comparable](s S) FromStep[S] { return FromStep[S]{from: s} }
+func From[S comparable](s S) FromStep[S] { return FromStep[S]{froms: []S{s}} }
 
-// FromStep is a transition with its source state fixed. It is a transient
+// FromEach begins a transition declaration with several source states: the
+// rule it produces registers one transition per source, all on the same event
+// and to the same target.
+//
+//	fsm.FromEach(pcpConnected, pcpReconnecting).On(evPcpKick).To(pcpDeleted)
+//
+// It is a fan-in shorthand, not a hierarchy — the sources are enumerated at
+// this declaration and the machine learns nothing that relates them. When they
+// are related, and especially when one of them needs to handle the event
+// differently, declare a [Group] and use [FromGroup] instead.
+//
+// A source list computed elsewhere can be spread into it directly:
+//
+//	fsm.FromEach(liveStates...).On(evAbort).To(dead)
+func FromEach[S comparable](ss ...S) FromStep[S] {
+	return FromStep[S]{froms: slices.Clone(ss)}
+}
+
+// FromGroup begins a transition declaration whose source is every member of g
+// that does not declare the event itself. See [Group].
+func FromGroup[S comparable](g Group[S]) FromStep[S] {
+	return FromStep[S]{group: &g}
+}
+
+// FromStep is a transition with its source states fixed. It is a transient
 // value in a [From] chain; call [FromStep.On] to continue.
-type FromStep[S comparable] struct{ from S }
+type FromStep[S comparable] struct {
+	froms []S
+	group *Group[S] // set by FromGroup instead of froms
+}
 
 // On names the event that triggers the transition.
 //
@@ -121,14 +186,15 @@ type FromStep[S comparable] struct{ from S }
 // rest of the chain, so a guard or action whose payload type does not match
 // the event is a compile error rather than a runtime surprise.
 func (f FromStep[S]) On[A any](ev Event[A]) OnStep[S, A] {
-	return OnStep[S, A]{from: f.from, ev: ev}
+	return OnStep[S, A]{froms: f.froms, group: f.group, ev: ev}
 }
 
-// OnStep is a transition with its source state and event fixed. It is a
+// OnStep is a transition with its source states and event fixed. It is a
 // transient value in a [From] chain; call [OnStep.To] to complete it.
 type OnStep[S comparable, A any] struct {
-	from S
-	ev   Event[A]
+	froms []S
+	group *Group[S]
+	ev    Event[A]
 }
 
 // To completes the transition. The result is a [Rule] ready for [New], and
@@ -142,7 +208,7 @@ type OnStep[S comparable, A any] struct {
 // on the state decrements and increments back to where it was. There is no
 // internal transition that skips the hooks; use an [ToStep.Action] for that.
 func (o OnStep[S, A]) To(to S) *ToStep[S, A] {
-	return &ToStep[S, A]{from: o.from, ev: o.ev, to: to}
+	return &ToStep[S, A]{froms: o.froms, group: o.group, ev: o.ev, to: to}
 }
 
 // ToStep is a complete transition, optionally carrying guards and actions.
@@ -151,12 +217,14 @@ func (o OnStep[S, A]) To(to S) *ToStep[S, A] {
 // Its methods mutate and return the same value, so a guard attached to a
 // stored ToStep takes effect whether or not the result is reassigned.
 type ToStep[S comparable, A any] struct {
-	from, to S
-	ev       Event[A]
-	guards   []func(context.Context, A) error
-	descs    []string
-	actions  []func(context.Context, A) error
-	errs     []error
+	froms   []S
+	group   *Group[S]
+	to      S
+	ev      Event[A]
+	guards  []func(context.Context, A) error
+	descs   []string
+	actions []func(context.Context, A) error
+	errs    []error
 }
 
 // Guard rejects the transition when f returns a non-nil error. The error is
@@ -194,7 +262,7 @@ func (t *ToStep[S, A]) Action(f func(context.Context, A) error) *ToStep[S, A] {
 }
 
 func (t *ToStep[S, A]) applyTo(b *builder[S]) {
-	where := fmt.Sprintf("transition %v -> %v", t.from, t.to)
+	where := t.describe()
 	for _, err := range t.errs {
 		b.errs = append(b.errs, fmt.Errorf("%s: %w", where, err))
 	}
@@ -204,23 +272,93 @@ func (t *ToStep[S, A]) applyTo(b *builder[S]) {
 		return
 	}
 
-	e := edge[S]{from: t.from, ev: t.ev.def}
-	if prev, dup := b.m.table[e]; dup {
-		b.errs = append(b.errs, fmt.Errorf("duplicate transition from %v on %s: already goes to %v, redeclared to %v",
-			t.from, t.ev.def.name, prev, t.to))
+	r := row[S]{
+		to:      t.to,
+		ev:      t.ev.def,
+		payload: payloadToken[A](),
+		desc:    joinDescs(t.descs),
+	}
+	r.guard, r.action = t.combine()
+
+	if t.group != nil {
+		t.expandGroup(b, r, where)
+		return
+	}
+	if len(t.froms) == 0 {
+		b.errs = append(b.errs, fmt.Errorf("%s: no source states", where))
 		return
 	}
 
-	b.m.table[e] = t.to
-	b.decls = append(b.decls, decl[S]{key: e, to: t.to, payload: payloadToken[A]()})
-	b.declare(t.from)
+	for _, s := range t.froms {
+		if prev, dup := b.m.table[edge[S]{from: s, ev: r.ev}]; dup {
+			b.errs = append(b.errs, fmt.Errorf("duplicate transition from %v on %s: already goes to %v, redeclared to %v",
+				s, r.ev.name, prev, t.to))
+			continue
+		}
+		r.from = s
+		b.register(r)
+	}
+}
+
+// expandGroup defers the rule until every explicit transition is known, so a
+// member that declares the event itself is seen and left alone.
+func (t *ToStep[S, A]) expandGroup(b *builder[S], r row[S], where string) {
+	g := *t.group
+	if !b.declareGroup(g) {
+		return
+	}
+	r.group = g.name
+
+	gk := groupEdge{group: g.name, ev: r.ev}
+	if prev, dup := b.groupEdges[gk]; dup {
+		b.errs = append(b.errs, fmt.Errorf(
+			"duplicate transition from group %s on %s: already goes to %v, redeclared to %v",
+			g.name, r.ev.name, prev, t.to))
+		return
+	}
+	b.groupEdges[gk] = t.to
+
+	// The target is a state of the machine whether or not any member ends up
+	// inheriting the edge, and declaring it now lets member validation see it.
 	b.declare(t.to)
 
-	// Combined here, where A is still known, so Fire needs a single assertion
-	// to a concrete func type and never boxes the payload.
+	b.expand = append(b.expand, func(b *builder[S]) {
+		var inherited, clashes int
+		for _, s := range g.members {
+			k := edge[S]{from: s, ev: r.ev}
+			if owner, clash := b.inherited[k]; clash {
+				b.errs = append(b.errs, fmt.Errorf(
+					"%s: groups %s and %s both give %v a transition on %s",
+					where, owner, g.name, s, r.ev.name))
+				clashes++
+				continue
+			}
+			if _, override := b.m.table[k]; override {
+				continue // the member declares this event itself and wins
+			}
+			b.inherited[k] = g.name
+			r.from = s
+			b.register(r)
+			inherited++
+		}
+		// Only when every member overrode it: a member lost to another group
+		// has already been reported, and saying it overrode the event itself
+		// would not be true.
+		if inherited == 0 && clashes == 0 {
+			b.errs = append(b.errs, fmt.Errorf(
+				"%s: every member of %s declares %s itself, so the group transition is unreachable",
+				where, g.name, r.ev.name))
+		}
+	})
+}
+
+// combine folds the guards and actions into one closure each, here where A is
+// still known, so Fire needs a single assertion to a concrete func type and
+// never boxes the payload. A nil result means there is nothing to store.
+func (t *ToStep[S, A]) combine() (guard, action any) {
 	if len(t.guards) > 0 {
 		guards, descs := t.guards, t.descs
-		b.m.guards[e] = func(ctx context.Context, a A) (string, error) {
+		guard = func(ctx context.Context, a A) (string, error) {
 			for i, g := range guards {
 				if err := g(ctx, a); err != nil {
 					return descs[i], err
@@ -231,7 +369,7 @@ func (t *ToStep[S, A]) applyTo(b *builder[S]) {
 	}
 	if len(t.actions) > 0 {
 		actions := t.actions
-		b.m.actions[e] = func(ctx context.Context, a A) error {
+		action = func(ctx context.Context, a A) error {
 			for _, act := range actions {
 				if err := act(ctx, a); err != nil {
 					return err
@@ -240,9 +378,52 @@ func (t *ToStep[S, A]) applyTo(b *builder[S]) {
 			return nil
 		}
 	}
+	return guard, action
+}
 
+// describe names the rule in error messages. The single-source form is the
+// common one and reads as it always has.
+func (t *ToStep[S, A]) describe() string {
+	switch {
+	case t.group != nil:
+		return fmt.Sprintf("transition group %s -> %v", t.group.name, t.to)
+	case len(t.froms) == 1:
+		return fmt.Sprintf("transition %v -> %v", t.froms[0], t.to)
+	default:
+		return fmt.Sprintf("transition %v -> %v", t.froms, t.to)
+	}
+}
+
+// row is one line of the transition table. Its fields are named because a
+// positional call with three states and three any values would be unreadable
+// and easy to transpose.
+type row[S comparable] struct {
+	from, to S
+	ev       *eventDef
+	guard    any // func(context.Context, A) (string, error)
+	action   any // func(context.Context, A) error
+	payload  any // (*A)(nil) for the event's payload type
+	desc     string
+	group    string // the group it was inherited from, empty if declared directly
+}
+
+// register adds one row to the transition table.
+func (b *builder[S]) register(r row[S]) {
+	e := edge[S]{from: r.from, ev: r.ev}
+	b.m.table[e] = r.to
+	b.decls = append(b.decls, decl[S]{key: e, to: r.to, payload: r.payload})
+	b.declare(r.from)
+	b.declare(r.to)
+
+	if r.guard != nil {
+		b.m.guards[e] = r.guard
+	}
+	if r.action != nil {
+		b.m.actions[e] = r.action
+	}
 	b.m.edges = append(b.m.edges, Edge[S]{
-		From: t.from, To: t.to, Event: t.ev.def.name, Guard: joinDescs(t.descs),
+		From: r.from, To: r.to, Event: r.ev.name, Guard: r.desc, Group: r.group,
+		trigger: r.ev,
 	})
 }
 
@@ -405,12 +586,111 @@ func GaugeWith[S comparable, A any](s S, inc, dec func(context.Context, A)) Rule
 	})
 }
 
+// Group is a named set of states that share transitions. A transition declared
+// with [FromGroup] applies to every member that does not declare that event
+// itself, so adding a member inherits the group's transitions and a member can
+// still specialise one:
+//
+//	var pcpLive = fsm.NewGroup("live", pcpConnected, pcpReconnecting)
+//
+//	fsm.FromGroup(pcpLive).On(evPcpKick).To(pcpDeleted)       // both members
+//	fsm.From(pcpReconnecting).On(evPcpKick).To(pcpAbandoned)  // overrides it
+//
+// Membership is declared in one place, which is the difference from
+// [FromEach]: enumerating the sources at each transition means a new member
+// silently inherits nothing.
+//
+// A Group is not a state. A *S never holds one and it does not appear in
+// [Machine.States] — it is a declaration-time grouping that expands to
+// ordinary rows in the transition table, so [Machine.Fire] neither knows nor
+// pays for it. Group entry and exit hooks are deliberately absent; see the
+// package documentation for what that rules out.
+//
+// A Group is itself a [Rule], so a group used only for [Group.Has] or for DOT
+// output can be passed to [New] on its own.
+type Group[S comparable] struct {
+	name    string
+	members []S
+}
+
+// NewGroup declares a group of states. name labels it in errors and in DOT
+// output, and must be unique within a machine.
+func NewGroup[S comparable](name string, members ...S) Group[S] {
+	return Group[S]{name: name, members: slices.Clone(members)}
+}
+
+// Name returns the group's declared name.
+func (g Group[S]) Name() string { return g.name }
+
+// Members returns the group's states, in declaration order.
+func (g Group[S]) Members() []S { return slices.Clone(g.members) }
+
+// Has reports whether s is a member of the group. It is the flat equivalent of
+// a hierarchical "is the machine anywhere inside this superstate".
+func (g Group[S]) Has(s S) bool { return slices.Contains(g.members, s) }
+
+func (g Group[S]) applyTo(b *builder[S]) { _ = b.declareGroup(g) }
+
+// declareGroup records a group once, rejecting a name reused for a different
+// set of members. It reports whether the group is usable, so that a broken one
+// produces a single error rather than one per rule that mentions it.
+func (b *builder[S]) declareGroup(g Group[S]) bool {
+	if g.name == "" {
+		b.errs = append(b.errs, errors.New("group declared with no name"))
+		return false
+	}
+	if len(g.members) == 0 {
+		b.errs = append(b.errs, fmt.Errorf("group %s has no members", g.name))
+		return false
+	}
+	// A repeated member would expand twice and read as the group clashing
+	// with itself.
+	for i, s := range g.members {
+		if slices.Index(g.members, s) != i {
+			b.errs = append(b.errs, fmt.Errorf("group %s lists %v twice", g.name, s))
+			return false
+		}
+	}
+
+	if i := slices.IndexFunc(b.m.groups, func(h Group[S]) bool { return h.name == g.name }); i >= 0 {
+		if !slices.Equal(b.m.groups[i].members, g.members) {
+			b.errs = append(b.errs, fmt.Errorf(
+				"group %s declared twice with different members: %v and %v",
+				g.name, b.m.groups[i].members, g.members))
+			return false
+		}
+		return true
+	}
+	b.m.groups = append(b.m.groups, g)
+	return true
+}
+
 // Edge is a registered transition, reported by [Machine.Edges].
 type Edge[S comparable] struct {
-	From  S
-	To    S
+	From S
+	To   S
+
+	// Event is the trigger's name, for display. Names are not unique —
+	// compare with [Edge.Is] to identify the trigger.
 	Event string
+
 	Guard string // guard description, empty when unguarded
+
+	// Group names the group this edge was inherited from, and is empty for a
+	// directly declared one. A group transition expands to one edge per
+	// member, so this is what tells the expansion apart from N hand-written
+	// rows.
+	Group string
+
+	trigger *eventDef
+}
+
+// Is reports whether ev is the trigger of this edge.
+//
+// Branch on this rather than on [Edge.Event], for the reason given on
+// [Transition.Is]: events are identified by declaration, not by name.
+func (e Edge[S]) Is[A any](ev Event[A]) bool {
+	return e.trigger != nil && e.trigger == ev.def
 }
 
 // declare records a state in first-seen order, so that introspection output is

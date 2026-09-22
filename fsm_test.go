@@ -947,3 +947,668 @@ func BenchmarkFire(b *testing.B) {
 		_ = m.Fire(ctx, &st, evFinish, 1)
 	}
 }
+
+// --- FromEach -------------------------------------------------------------
+
+func TestFromEachRegistersOneEdgePerSource(t *testing.T) {
+	m, err := fsm.New("job",
+		fsm.From(idle).On(evStart).To(running),
+		fsm.FromEach(idle, running).On(evCancel).To(cancelled),
+	)
+	if err != nil {
+		t.Fatalf("build: %v", err)
+	}
+
+	for _, from := range []state{idle, running} {
+		st := from
+		if err := m.Send(t.Context(), &st, evCancel); err != nil {
+			t.Fatalf("cancel from %v: %v", from, err)
+		}
+		if st != cancelled {
+			t.Errorf("cancel from %v left state %v, want cancelled", from, st)
+		}
+	}
+	if got := len(m.Edges()); got != 3 {
+		t.Errorf("Edges() reports %d edges, want 3", got)
+	}
+}
+
+// The reason FromEach is variadic rather than From growing a second parameter:
+// a group of sources computed elsewhere has to be spreadable.
+func TestFromEachSpreadsASlice(t *testing.T) {
+	live := []state{idle, running}
+	m, err := fsm.New("job",
+		fsm.From(idle).On(evStart).To(running),
+		fsm.FromEach(live...).On(evCancel).To(cancelled),
+	)
+	if err != nil {
+		t.Fatalf("build: %v", err)
+	}
+	if _, ok := m.To(running, evCancel); !ok {
+		t.Error("no cancel transition from running")
+	}
+}
+
+// Rules are values, so the slice a rule was built from must not keep affecting
+// it afterwards.
+func TestFromEachCopiesItsSources(t *testing.T) {
+	live := []state{idle, running}
+	rule := fsm.FromEach(live...).On(evCancel).To(cancelled)
+	live[1] = done
+
+	m, err := fsm.New("job", fsm.From(idle).On(evStart).To(running), rule)
+	if err != nil {
+		t.Fatalf("build: %v", err)
+	}
+	if _, ok := m.To(running, evCancel); !ok {
+		t.Error("mutating the source slice changed the rule")
+	}
+	if _, ok := m.To(done, evCancel); ok {
+		t.Error("rule picked up a source written after it was declared")
+	}
+}
+
+func TestFromEachWithNoSourcesIsAnError(t *testing.T) {
+	_, err := fsm.New("job",
+		fsm.From(idle).On(evStart).To(running),
+		fsm.FromEach[state]().On(evCancel).To(cancelled),
+	)
+	if err == nil {
+		t.Fatal("expected an error for FromEach with no sources")
+	}
+	if !strings.Contains(err.Error(), "no source states") {
+		t.Errorf("error does not mention the empty source list: %v", err)
+	}
+}
+
+func TestFromEachReportsARepeatedSource(t *testing.T) {
+	_, err := fsm.New("job", fsm.FromEach(idle, idle).On(evStart).To(running))
+	if err == nil {
+		t.Fatal("expected an error for a source listed twice")
+	}
+	if !strings.Contains(err.Error(), "duplicate transition") {
+		t.Errorf("unexpected error: %v", err)
+	}
+}
+
+func TestFromEachSharesGuardsAndActions(t *testing.T) {
+	var calls int
+	m, err := fsm.New("job",
+		fsm.From(idle).On(evStart).To(running),
+		fsm.FromEach(idle, running).On(evCancel).To(cancelled).
+			Guard("cancellable", func(context.Context, fsm.Unit) error { return nil }).
+			Action(func(context.Context, fsm.Unit) error { calls++; return nil }),
+	)
+	if err != nil {
+		t.Fatalf("build: %v", err)
+	}
+
+	for _, from := range []state{idle, running} {
+		st := from
+		if err := m.Send(t.Context(), &st, evCancel); err != nil {
+			t.Fatalf("cancel from %v: %v", from, err)
+		}
+	}
+	if calls != 2 {
+		t.Errorf("action ran %d times, want 2", calls)
+	}
+	for _, e := range m.Edges() {
+		if e.Event == "cancel" && e.Guard != "cancellable" {
+			t.Errorf("edge from %v lost its guard description", e.From)
+		}
+	}
+}
+
+// --- Groups ---------------------------------------------------------------
+
+var live = fsm.NewGroup("live", idle, running)
+
+func TestGroupTransitionAppliesToEveryMember(t *testing.T) {
+	m, err := fsm.New("job",
+		fsm.From(idle).On(evStart).To(running),
+		fsm.FromGroup(live).On(evCancel).To(cancelled),
+	)
+	if err != nil {
+		t.Fatalf("build: %v", err)
+	}
+
+	for _, from := range live.Members() {
+		st := from
+		if err := m.Send(t.Context(), &st, evCancel); err != nil {
+			t.Fatalf("cancel from %v: %v", from, err)
+		}
+		if st != cancelled {
+			t.Errorf("cancel from %v left state %v, want cancelled", from, st)
+		}
+	}
+}
+
+// The thing FromEach cannot do: a member handles the event its own way and the
+// group's transition applies to the rest.
+func TestGroupMemberOverridesInheritedEdge(t *testing.T) {
+	m, err := fsm.New("job",
+		fsm.From(idle).On(evStart).To(running),
+		fsm.FromGroup(live).On(evCancel).To(cancelled),
+		fsm.From(running).On(evCancel).To(done),
+	)
+	if err != nil {
+		t.Fatalf("build: %v", err)
+	}
+
+	if to, _ := m.To(running, evCancel); to != done {
+		t.Errorf("running cancels to %v, want done from its own rule", to)
+	}
+	if to, _ := m.To(idle, evCancel); to != cancelled {
+		t.Errorf("idle cancels to %v, want cancelled from the group", to)
+	}
+}
+
+// Declaration order must not matter: the override is found whether it is
+// written before or after the group transition.
+func TestGroupOverrideOrderDoesNotMatter(t *testing.T) {
+	m, err := fsm.New("job",
+		fsm.From(running).On(evCancel).To(done),
+		fsm.From(idle).On(evStart).To(running),
+		fsm.FromGroup(live).On(evCancel).To(cancelled),
+	)
+	if err != nil {
+		t.Fatalf("build: %v", err)
+	}
+	if to, _ := m.To(running, evCancel); to != done {
+		t.Errorf("running cancels to %v, want done", to)
+	}
+}
+
+func TestGroupEdgesCarryTheirProvenance(t *testing.T) {
+	m, err := fsm.New("job",
+		fsm.From(idle).On(evStart).To(running),
+		fsm.FromGroup(live).On(evCancel).To(cancelled),
+	)
+	if err != nil {
+		t.Fatalf("build: %v", err)
+	}
+
+	for _, e := range m.Edges() {
+		want := ""
+		if e.Event == "cancel" {
+			want = "live"
+		}
+		if e.Group != want {
+			t.Errorf("edge %v --%s--> %v has Group %q, want %q", e.From, e.Event, e.To, e.Group, want)
+		}
+	}
+	if groups := m.Groups(); len(groups) != 1 || groups[0].Name() != "live" {
+		t.Errorf("Groups() = %v, want one group named live", groups)
+	}
+}
+
+func TestGroupHasReportsMembership(t *testing.T) {
+	if !live.Has(idle) || !live.Has(running) {
+		t.Error("live should contain idle and running")
+	}
+	if live.Has(done) {
+		t.Error("live should not contain done")
+	}
+}
+
+// A group is not a state: it expands away at build time and never appears
+// anywhere a state value does.
+func TestGroupIsNotAState(t *testing.T) {
+	m, err := fsm.New("job",
+		fsm.From(idle).On(evStart).To(running),
+		fsm.FromGroup(live).On(evCancel).To(cancelled),
+	)
+	if err != nil {
+		t.Fatalf("build: %v", err)
+	}
+	if got := len(m.States()); got != 3 {
+		t.Errorf("States() reports %d states, want 3 (idle, running, cancelled)", got)
+	}
+	if got := m.Terminals(); len(got) != 1 || got[0] != cancelled {
+		t.Errorf("terminals %v, want [cancelled]", got)
+	}
+}
+
+func TestGroupRejectsUnknownMember(t *testing.T) {
+	typo := fsm.NewGroup("live", idle, done)
+	_, err := fsm.New("job",
+		fsm.From(idle).On(evStart).To(running),
+		fsm.FromGroup(typo).On(evCancel).To(cancelled),
+	)
+	if err == nil {
+		t.Fatal("expected an error for a member that is not a state of the machine")
+	}
+	if !strings.Contains(err.Error(), "member done is not a state") {
+		t.Errorf("unexpected error: %v", err)
+	}
+}
+
+func TestGroupRejectsTwoGroupsClaimingTheSameEvent(t *testing.T) {
+	other := fsm.NewGroup("other", running)
+	_, err := fsm.New("job",
+		fsm.From(idle).On(evStart).To(running),
+		fsm.FromGroup(live).On(evCancel).To(cancelled),
+		fsm.FromGroup(other).On(evCancel).To(done),
+	)
+	if err == nil {
+		t.Fatal("expected an error for overlapping groups claiming one event")
+	}
+	if !strings.Contains(err.Error(), "both give running a transition on cancel") {
+		t.Errorf("unexpected error: %v", err)
+	}
+}
+
+func TestGroupRejectsNameReusedForDifferentMembers(t *testing.T) {
+	_, err := fsm.New("job",
+		fsm.From(idle).On(evStart).To(running),
+		fsm.FromGroup(live).On(evCancel).To(cancelled),
+		fsm.FromGroup(fsm.NewGroup("live", idle)).On(evFinish).To(done),
+	)
+	if err == nil {
+		t.Fatal("expected an error for a group name reused with different members")
+	}
+	if !strings.Contains(err.Error(), "declared twice with different members") {
+		t.Errorf("unexpected error: %v", err)
+	}
+}
+
+func TestGroupWithNoMembersIsAnError(t *testing.T) {
+	_, err := fsm.New("job",
+		fsm.From(idle).On(evStart).To(running),
+		fsm.FromGroup(fsm.NewGroup[state]("empty")).On(evCancel).To(cancelled),
+	)
+	if err == nil {
+		t.Fatal("expected an error for a group with no members")
+	}
+	if !strings.Contains(err.Error(), "has no members") {
+		t.Errorf("unexpected error: %v", err)
+	}
+}
+
+// A group transition every member overrides is dead configuration, and saying
+// so is cheaper than leaving someone to notice the group does nothing.
+func TestGroupTransitionFullyOverriddenIsAnError(t *testing.T) {
+	_, err := fsm.New("job",
+		fsm.From(idle).On(evStart).To(running),
+		fsm.From(idle).On(evCancel).To(done),
+		fsm.From(running).On(evCancel).To(done),
+		fsm.FromGroup(live).On(evCancel).To(cancelled),
+	)
+	if err == nil {
+		t.Fatal("expected an error for a group transition every member overrides")
+	}
+	if !strings.Contains(err.Error(), "unreachable") {
+		t.Errorf("unexpected error: %v", err)
+	}
+}
+
+func TestGroupGuardRejectsEveryInheritedEdge(t *testing.T) {
+	m, err := fsm.New("job",
+		fsm.From(idle).On(evStart).To(running),
+		fsm.FromGroup(live).On(evCancel).To(cancelled).
+			Guard("never", func(context.Context, fsm.Unit) error { return errNonZeroExit }),
+	)
+	if err != nil {
+		t.Fatalf("build: %v", err)
+	}
+
+	for _, from := range live.Members() {
+		err := m.Check(t.Context(), from, evCancel, fsm.Unit{})
+		ge, ok := errors.AsType[*fsm.GuardError[state]](err)
+		if !ok {
+			t.Fatalf("check from %v: got %T, want *fsm.GuardError", from, err)
+		}
+		if ge.Guard != "never" {
+			t.Errorf("guard from %v named %q, want \"never\"", from, ge.Guard)
+		}
+	}
+}
+
+// Group expansion has to run before GaugeWith reads the table, or a gauge
+// silently misses every edge a group contributed.
+func TestGaugeWithSeesGroupInheritedEdges(t *testing.T) {
+	var delta int
+	m, err := fsm.New("job",
+		fsm.GaugeWith(cancelled,
+			func(_ context.Context, _ int) { delta++ },
+			func(_ context.Context, _ int) { delta-- },
+		),
+		fsm.From(idle).On(evFinish).To(running),
+		fsm.FromGroup(fsm.NewGroup("live", idle, running)).On(evFinish).To(cancelled),
+	)
+	if err != nil {
+		t.Fatalf("build: %v", err)
+	}
+
+	st := running
+	if err := m.Fire(t.Context(), &st, evFinish, 1); err != nil {
+		t.Fatalf("finish: %v", err)
+	}
+	if delta != 1 {
+		t.Errorf("gauge moved by %d on a group-inherited edge, want 1", delta)
+	}
+}
+
+// Groups are a build-time expansion, so the fire path must be unchanged.
+func TestGroupFireDoesNotAllocate(t *testing.T) {
+	m, err := fsm.New("job",
+		fsm.From(idle).On(evStart).To(running),
+		fsm.From(cancelled).On(evStart).To(idle),
+		fsm.FromGroup(live).On(evCancel).To(cancelled),
+	)
+	if err != nil {
+		t.Fatalf("build: %v", err)
+	}
+	ctx := t.Context()
+	st := running
+
+	avg := testing.AllocsPerRun(1000, func() {
+		_ = m.Send(ctx, &st, evCancel)
+		_ = m.Send(ctx, &st, evStart)
+	})
+	if avg != 0 {
+		t.Errorf("Fire allocates %.1f times per round trip on a grouped machine, want 0", avg)
+	}
+}
+
+func TestGroupDOTDrawsAClusterAndOneBoundaryEdge(t *testing.T) {
+	m, err := fsm.New("job",
+		fsm.From(idle).On(evStart).To(running),
+		fsm.FromGroup(live).On(evCancel).To(cancelled),
+	)
+	if err != nil {
+		t.Fatalf("build: %v", err)
+	}
+
+	got := m.DOT()
+	for _, want := range []string{
+		"compound=true;",
+		`subgraph "cluster_live" {`,
+		`label="live";`,
+		`ltail="cluster_live"`,
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("DOT output missing %q:\n%s", want, got)
+		}
+	}
+	if n := strings.Count(got, `[label="cancel"`); n != 1 {
+		t.Errorf("cancel drawn %d times, want once from the cluster boundary:\n%s", n, got)
+	}
+}
+
+// With a member overriding the event, a single boundary arrow would claim to
+// cover it, so each inherited edge is drawn on its own.
+func TestGroupDOTKeepsPerMemberEdgesWhenOverridden(t *testing.T) {
+	m, err := fsm.New("job",
+		fsm.From(idle).On(evStart).To(running),
+		fsm.FromEach(idle, running).On(evFinish).To(done),
+		fsm.FromGroup(fsm.NewGroup("live", idle, running, done)).On(evCancel).To(cancelled),
+		fsm.From(done).On(evCancel).To(idle),
+	)
+	if err != nil {
+		t.Fatalf("build: %v", err)
+	}
+
+	got := m.DOT()
+	if strings.Contains(got, "ltail=") {
+		t.Errorf("drew a boundary edge despite an override:\n%s", got)
+	}
+	if n := strings.Count(got, `[label="cancel"]`); n != 3 {
+		t.Errorf("cancel drawn %d times, want 3 (two inherited, one override):\n%s", n, got)
+	}
+}
+
+// A group transition's target is a state even before expansion runs, so a
+// group whose member is only ever named as another group's target is fine.
+func TestGroupTargetCountsAsADeclaredState(t *testing.T) {
+	_, err := fsm.New("job",
+		fsm.From(idle).On(evStart).To(running),
+		fsm.FromGroup(live).On(evCancel).To(cancelled),
+		fsm.FromGroup(fsm.NewGroup("finished", cancelled)).On(evStart).To(idle),
+	)
+	if err != nil {
+		t.Fatalf("build: %v", err)
+	}
+}
+
+func TestGroupRejectsTheSameTransitionDeclaredTwice(t *testing.T) {
+	_, err := fsm.New("job",
+		fsm.From(idle).On(evStart).To(running),
+		fsm.FromGroup(live).On(evCancel).To(cancelled),
+		fsm.FromGroup(live).On(evCancel).To(done),
+	)
+	if err == nil {
+		t.Fatal("expected an error for a group transition declared twice")
+	}
+	if !strings.Contains(err.Error(), "duplicate transition from group live on cancel") {
+		t.Errorf("unexpected error: %v", err)
+	}
+}
+
+// Rules are values and a set of them can be shared between machines, so
+// applying a group rule must not leave anything behind in the rule itself.
+func TestGroupRuleCanBeSharedBetweenMachines(t *testing.T) {
+	shared := []fsm.Rule[state]{
+		fsm.From(idle).On(evStart).To(running),
+		fsm.FromGroup(live).On(evCancel).To(cancelled),
+	}
+	first, err := fsm.New("first", shared...)
+	if err != nil {
+		t.Fatalf("first: %v", err)
+	}
+	second, err := fsm.New("second", shared...)
+	if err != nil {
+		t.Fatalf("second: %v", err)
+	}
+	if !slices.Equal(first.Edges(), second.Edges()) {
+		t.Errorf("machines built from one rule set differ:\n%v\n%v", first.Edges(), second.Edges())
+	}
+}
+
+// A broken group must produce one error, not a cascade: with no members there
+// is nothing to report as overridden.
+func TestGroupWithNoMembersReportsOneError(t *testing.T) {
+	_, err := fsm.New("job",
+		fsm.From(idle).On(evStart).To(running),
+		fsm.FromGroup(fsm.NewGroup[state]("empty")).On(evCancel).To(cancelled),
+	)
+	if err == nil {
+		t.Fatal("expected an error for a group with no members")
+	}
+	if got := strings.Count(err.Error(), "\n") + 1; got != 1 {
+		t.Errorf("reported %d errors, want 1:\n%v", got, err)
+	}
+	if !strings.Contains(err.Error(), "has no members") {
+		t.Errorf("unexpected error: %v", err)
+	}
+}
+
+// A Group is a Rule, so one used only for Has or for DOT output can be passed
+// to New without a transition attached to it.
+func TestBareGroupRuleIsRegistered(t *testing.T) {
+	m, err := fsm.New("job",
+		live,
+		fsm.From(idle).On(evStart).To(running),
+		fsm.From(running).On(evCancel).To(cancelled),
+	)
+	if err != nil {
+		t.Fatalf("build: %v", err)
+	}
+	if groups := m.Groups(); len(groups) != 1 || groups[0].Name() != "live" {
+		t.Fatalf("Groups() = %v, want one group named live", groups)
+	}
+	if got := m.DOT(); !strings.Contains(got, `subgraph "cluster_live"`) {
+		t.Errorf("DOT output has no cluster for a group with no transition:\n%s", got)
+	}
+	// No edge came from the group, so nothing is drawn from its boundary.
+	if strings.Contains(m.DOT(), "ltail=") {
+		t.Error("drew a boundary edge for a group with no transition")
+	}
+}
+
+// --- Group DOT and validation regressions ---------------------------------
+
+// Two events can share a name, so the boundary collapse is keyed on the
+// trigger itself. Counting by name merged two partial expansions into one
+// arrow that covered neither.
+func TestGroupDOTDistinguishesSameNamedEvents(t *testing.T) {
+	goA, goB := fsm.Signal("go"), fsm.Signal("go")
+	g := fsm.NewGroup("g", idle, running, done)
+
+	m, err := fsm.New("job",
+		fsm.From(idle).On(evStart).To(running),
+		fsm.From(running).On(evFinish).To(done),
+		fsm.FromGroup(g).On(goA).To(cancelled),
+		fsm.FromGroup(g).On(goB).To(cancelled),
+		fsm.From(idle).On(goA).To(done),    // overrides goA
+		fsm.From(running).On(goB).To(idle), // overrides goB
+		fsm.From(done).On(goB).To(idle),    // overrides goB
+	)
+	if err != nil {
+		t.Fatalf("build: %v", err)
+	}
+
+	// Every member overrides one of the two events, so neither group
+	// transition covers the whole group and nothing may be collapsed.
+	if got := m.DOT(); strings.Contains(got, "ltail=") {
+		t.Errorf("collapsed a partial expansion of same-named events:\n%s", got)
+	}
+	// goA is inherited by two members and goB by one, plus the three
+	// overrides: six rows, none of them merged with another.
+	if got := strings.Count(m.DOT(), `[label="go"`); got != 6 {
+		t.Errorf("drew %d \"go\" arrows, want 6\n%s", got, m.DOT())
+	}
+}
+
+func TestEdgeIsIdentifiesTheTrigger(t *testing.T) {
+	sameName := fsm.Signal("start")
+	m, err := fsm.New("job",
+		fsm.From(idle).On(evStart).To(running),
+		fsm.From(running).On(sameName).To(done),
+	)
+	if err != nil {
+		t.Fatalf("build: %v", err)
+	}
+
+	for _, e := range m.Edges() {
+		if e.Event != "start" {
+			t.Fatalf("unexpected event name %q", e.Event)
+		}
+		switch e.From {
+		case idle:
+			if !e.Is(evStart) || e.Is(sameName) {
+				t.Error("edge from idle did not identify evStart")
+			}
+		case running:
+			if !e.Is(sameName) || e.Is(evStart) {
+				t.Error("edge from running did not identify the same-named event")
+			}
+		}
+	}
+}
+
+// A state can only sit in one Graphviz cluster, so an overlapping group that
+// lost a member cannot be an edge tail: Graphviz would drop the ltail and the
+// other members' rows were already skipped.
+func TestGroupDOTKeepsPerMemberEdgesForOverlappingGroups(t *testing.T) {
+	first := fsm.NewGroup("first", idle, running)
+	second := fsm.NewGroup("second", running, done)
+
+	// first is declared first, so its cluster takes running and second is
+	// left holding only part of its membership.
+	m, err := fsm.New("job",
+		first,
+		fsm.From(idle).On(evStart).To(running),
+		fsm.From(running).On(evFinish).To(done),
+		fsm.FromGroup(second).On(evCancel).To(cancelled),
+	)
+	if err != nil {
+		t.Fatalf("build: %v", err)
+	}
+
+	got := m.DOT()
+	if strings.Contains(got, "ltail=") {
+		t.Errorf("collapsed an overlapping group that does not hold all its members:\n%s", got)
+	}
+	// Both inherited rows must still appear.
+	for _, want := range []string{`"running" -> "cancelled"`, `"done" -> "cancelled"`} {
+		if !strings.Contains(got, want) {
+			t.Errorf("DOT output lost %s:\n%s", want, got)
+		}
+	}
+	// And a state in two groups is drawn once.
+	if n := strings.Count(got, `"running" [shape=`); n != 1 {
+		t.Errorf("running declared %d times, want 1:\n%s", n, got)
+	}
+}
+
+// A target inside the group would make the boundary arrow a self-loop out of
+// its own cluster, which Graphviz refuses.
+func TestGroupDOTKeepsPerMemberEdgesWhenTargetIsAMember(t *testing.T) {
+	g := fsm.NewGroup("g", idle, running)
+	m, err := fsm.New("job",
+		fsm.From(idle).On(evStart).To(running),
+		fsm.FromGroup(g).On(evCancel).To(idle),
+	)
+	if err != nil {
+		t.Fatalf("build: %v", err)
+	}
+
+	got := m.DOT()
+	if strings.Contains(got, "ltail=") {
+		t.Errorf("collapsed a transition whose target is a member:\n%s", got)
+	}
+	for _, want := range []string{`"idle" -> "idle"`, `"running" -> "idle"`} {
+		if !strings.Contains(got, want) {
+			t.Errorf("DOT output lost %s:\n%s", want, got)
+		}
+	}
+}
+
+// A member lost to another group is already reported; claiming it overrode
+// the event itself would not be true.
+func TestGroupClashDoesNotAlsoReportUnreachable(t *testing.T) {
+	first := fsm.NewGroup("first", running)
+	second := fsm.NewGroup("second", running)
+
+	_, err := fsm.New("job",
+		fsm.From(idle).On(evStart).To(running),
+		fsm.FromGroup(first).On(evCancel).To(cancelled),
+		fsm.FromGroup(second).On(evCancel).To(done),
+	)
+	if err == nil {
+		t.Fatal("expected an error for two groups claiming one event")
+	}
+	if !strings.Contains(err.Error(), "both give running a transition on cancel") {
+		t.Errorf("unexpected error: %v", err)
+	}
+	if strings.Contains(err.Error(), "unreachable") {
+		t.Errorf("clash also reported as unreachable:\n%v", err)
+	}
+}
+
+func TestGroupRejectsARepeatedMember(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		rules []fsm.Rule[state]
+	}{
+		{"with a transition", []fsm.Rule[state]{
+			fsm.From(idle).On(evStart).To(running),
+			fsm.FromGroup(fsm.NewGroup("g", idle, idle)).On(evCancel).To(cancelled),
+		}},
+		{"bare", []fsm.Rule[state]{
+			fsm.From(idle).On(evStart).To(running),
+			fsm.NewGroup("g", idle, idle),
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := fsm.New("job", tc.rules...)
+			if err == nil {
+				t.Fatal("expected an error for a group listing a member twice")
+			}
+			if !strings.Contains(err.Error(), "lists idle twice") {
+				t.Errorf("unexpected error: %v", err)
+			}
+		})
+	}
+}

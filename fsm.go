@@ -15,6 +15,26 @@
 // [Machine.Fire] as errors. This matters when a machine is driven by a
 // replicated log: a panic on a malformed event would take down every replica
 // replaying it, not just one.
+//
+// # Groups
+//
+// States are flat. A [Group] gives a set of them shared transitions — a
+// transition declared with [FromGroup] applies to every member that does not
+// declare that event itself — but it is a declaration-time grouping that
+// expands to ordinary rows in the transition table before [New] returns.
+// [Machine.Fire] neither knows about groups nor pays for them.
+//
+// That expansion is most of what a hierarchical state machine's substates are
+// used for, and deliberately not all of it. A group has no entry or exit
+// hooks, because the reason to want them is the one thing expansion cannot
+// reproduce: in a real hierarchy, moving between two substates of the same
+// superstate does not run the superstate's hooks, and there is nowhere to
+// record that when every row is flat. So there is also no group [Gauge] — it
+// would decrement and increment on a move that a hierarchy would treat as
+// staying put. Count the member states individually and sum them where the
+// counters are read.
+//
+// Groups do not nest, and entering a group does not select an initial member.
 package fsm
 
 import (
@@ -125,6 +145,7 @@ type Machine[S comparable] struct {
 	// deterministic rather than map-iteration order.
 	states []S
 	edges  []Edge[S]
+	groups []Group[S]
 }
 
 // Name returns the machine's name, used in error messages and DOT output.
