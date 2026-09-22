@@ -9,9 +9,9 @@ that way. This file is the working detail behind it; the two are edited
 together.
 
 Library: `fsm.go` (package doc, `Event`, `Machine`, `Fire`, `Send`, `Check`,
-`Can`, `To`, the error types), `rules.go` (`New`/`MustNew`, the `Rule` type
-and everything that produces one — the `From`/`On`/`To` chain, `Gauge`,
-`OnEnter`, `OnExit` — plus the `WithGuard`/`WithAction` options),
+`Can`, `To`, the error types), `rules.go` (`New`/`MustNew`, the `Rule`
+interface and everything that produces one — the `From`/`On`/`To` chain with
+its `Guard`/`Action` methods, plus `Gauge`, `OnEnter`, `OnExit`),
 `introspect.go` (`States`,
 `Edges`, `Terminals`, `Unreachable`, `DOT`). Tests are `fsm_test.go` and the
 worked machines in `example_test.go`.
@@ -105,7 +105,7 @@ committed-and-diffable only as long as that holds.
   event takes down every replica replaying it rather than one host. Do not
   introduce a panic reachable from `Fire`.
 - **`GuardError` unwraps to the guard's error**, so a guard can reject with a
-  sentinel the caller matches with `errors.Is`. `WithGuard`'s `desc` is the
+  sentinel the caller matches with `errors.Is`. `Guard`'s `desc` is the
   *static* condition — it labels the edge in `DOT` and names the guard in the
   message — and the returned error is the *dynamic* reason it did not hold this
   time. Keep both; they are not redundant.
@@ -127,11 +127,13 @@ committed-and-diffable only as long as that holds.
   inside `New`'s argument list; it was the old method chain that made `gofmt`
   dedent them. Named callbacks in `example_test.go` (`markStopped`,
   `uploadsSettled`) are a readability choice, not a workaround.
-- **`Rule[S]` and `Option[A]` are different things** and the names have to
-  keep them apart: a `Rule` declares part of a machine and goes to `New`; an
-  `Option` configures one transition and goes to `To`. This is the one real
-  cost of taking rules as arguments instead of chaining a builder, so do not
-  blur it by naming a new constructor ambiguously.
+- **There is one option type: `Rule[S]`.** Guards and actions are methods on
+  the transition (`.To(b).Guard(…).Action(…)`), not a second `Option[A]` value
+  type. That was tried and removed: a struct of nillable fields failed
+  silently, dropping a nil guard *and its description*, so the machine read as
+  guarded and drew unguarded in `DOT`. As methods they can report through
+  `New`. Add a new modifier as a method on `ToStep`, never as a new argument
+  to `To`.
 - **Tests take their context from `t.Context()`, benchmarks from `b.Context()`.**
   The two `context.Background()` calls left in `example_test.go` are not an
   oversight: an `Example` function has no `testing.TB`, so there is nothing to

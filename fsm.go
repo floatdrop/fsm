@@ -76,7 +76,7 @@ type edge[S comparable] struct {
 // Hook is a state entry/exit callback. Hooks cannot fail: they exist for
 // bookkeeping that must stay paired with the state change, such as
 // incrementing and decrementing a gauge. Work that can fail belongs in an
-// action registered with [WithAction], which runs before the state changes and
+// action registered with [ToStep.Action], which runs before the state changes and
 // aborts the transition on error.
 type Hook[S comparable] func(context.Context, Transition[S])
 

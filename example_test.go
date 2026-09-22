@@ -77,9 +77,9 @@ var recordingFSM = fsm.MustNew("recording",
 	fsm.Gauge(recFinished, incr(recFinished), decr(recFinished)),
 	fsm.Gauge(recUploaded, incr(recUploaded), decr(recUploaded)),
 
-	fsm.From(recActive).On(evRecStop).To(recStopped, fsm.WithAction(markStopped)),
-	fsm.From(recStopped).On(evRecFinish).To(recFinished,
-		fsm.WithGuard("all chunks and tracks uploaded", uploadsSettled)),
+	fsm.From(recActive).On(evRecStop).To(recStopped).Action(markStopped),
+	fsm.From(recStopped).On(evRecFinish).To(recFinished).
+		Guard("all chunks and tracks uploaded", uploadsSettled),
 	fsm.From(recFinished).On(evRecUpload).To(recUploaded),
 )
 
@@ -162,8 +162,8 @@ func unintentional(_ context.Context, d disconnect) error {
 // than "absent from the map", so the last transition is expressible and can
 // carry a reason.
 var participantFSM = fsm.MustNew("participant",
-	fsm.From(pcpConnected).On(evPcpDrop).To(pcpReconnecting,
-		fsm.WithGuard("disconnect was not intentional", unintentional)),
+	fsm.From(pcpConnected).On(evPcpDrop).To(pcpReconnecting).
+		Guard("disconnect was not intentional", unintentional),
 	fsm.From(pcpReconnecting).On(evPcpReconnect).To(pcpConnected),
 	fsm.From(pcpConnected).On(evPcpKick).To(pcpDeleted),
 	fsm.From(pcpReconnecting).On(evPcpKick).To(pcpDeleted),

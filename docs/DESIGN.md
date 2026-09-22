@@ -60,15 +60,30 @@ there is nothing to swap:
 fsm.From(recStopped).On(evRecFinish).To(recFinished)
 ```
 
-The chain is also what carries the payload type: `From` knows `S`, `On[A]`
-picks up `A` from the event, and `To` takes options that must match it. A
-`WithGuard` written for the wrong payload is a compile error at the point it is
-declared. `To` erases `A` only after that check, which is why a `Rule[S]` can
-sit in the same list as transitions carrying any other payload.
+Guards and actions hang off the end of the same chain:
 
-Two things are called options-ish, and they are not the same: a **`Rule[S]`**
-declares part of a machine and goes to `New`; an **`Option[A]`** configures one
-transition and goes to `To`.
+```go
+fsm.From(recStopped).On(evRecFinish).To(recFinished).
+    Guard("all chunks and tracks uploaded", uploadsSettled).
+    Action(recordFinishTime)
+```
+
+The chain is what carries the payload type: `From` knows `S`, `On[A]` picks up
+`A` from the event, and `Guard`/`Action` accept only callbacks matching it — a
+guard written for the wrong payload is a compile error at the point it is
+declared. `ToStep[S, A]` erases `A` only when `New` applies it, which is why it
+can sit in the same list as transitions carrying any other payload.
+
+There is one option type, not two. An earlier design passed guards and actions
+as `Option[A]` values into `To(...)`, which meant a second options concept
+alongside `Rule`, and a struct of nillable fields that failed silently: a nil
+guard was dropped along with its description, so a machine read as guarded,
+ran unguarded, and drew unguarded in `DOT()`. As methods they report through
+`New` like every other configuration mistake, and a new modifier is a new
+method rather than a new struct field.
+
+`ToStep` mutates and returns itself, so a guard attached to a stored
+transition takes effect whether or not the result is reassigned.
 
 ## States and events are named so they cannot be confused
 
@@ -100,7 +115,7 @@ ge, ok := errors.AsType[*fsm.GuardError[recState]](err)
 // ge.Guard, ge.From, ge.To, ge.Event
 ```
 
-The `desc` passed to `WithGuard` is the *static* condition, used to label the
+The `desc` passed to `Guard` is the *static* condition, used to label the
 edge in `DOT()` output and named in the error message. The returned error is
 the *dynamic* reason the condition did not hold this time. `Check` returns the
 same error without firing, when you want the reason but not the transition;
@@ -112,7 +127,7 @@ first rejection wins, reported under the description it was declared with.
 ## Entry/exit hooks cannot fail
 
 They exist for bookkeeping that must stay paired with the state change. Work
-that can fail goes in `WithAction`, which runs *before* the state changes and
+that can fail goes in `Action`, which runs *before* the state changes and
 aborts the transition on error. The ordering is fixed:
 
 ```

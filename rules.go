@@ -10,9 +10,17 @@ import (
 // hook. Rules are values, so a set of them can be built up in a loop, stored,
 // and shared between machines.
 //
-// Rule is not [Option]. A Rule declares part of a machine and goes to [New];
-// an Option configures a single transition and goes to [OnStep.To].
-type Rule[S comparable] func(*builder[S])
+// Only this package implements Rule. Declare one with [From], [Gauge],
+// [OnEnter] or [OnExit].
+type Rule[S comparable] interface {
+	applyTo(*builder[S])
+}
+
+// ruleFunc adapts a plain closure to [Rule], for the declarations that need
+// no further chaining.
+type ruleFunc[S comparable] func(*builder[S])
+
+func (f ruleFunc[S]) applyTo(b *builder[S]) { f(b) }
 
 // builder accumulates the machine as rules are applied to it.
 type builder[S comparable] struct {
@@ -38,8 +46,12 @@ func New[S comparable](name string, rules ...Rule[S]) (*Machine[S], error) {
 		seen: make(map[S]bool),
 	}
 
-	for _, r := range rules {
-		r(b)
+	for i, r := range rules {
+		if r == nil {
+			b.errs = append(b.errs, fmt.Errorf("rule %d is nil", i))
+			continue
+		}
+		r.applyTo(b)
 	}
 
 	if len(b.m.table) == 0 {
@@ -63,7 +75,8 @@ func MustNew[S comparable](name string, rules ...Rule[S]) *Machine[S] {
 
 // From begins a transition declaration:
 //
-//	fsm.From(recStopped).On(evRecFinish).To(recFinished)
+//	fsm.From(recStopped).On(evRecFinish).To(recFinished).
+//		Guard("all chunks and tracks uploaded", uploadsSettled)
 //
 // The source and target states are named by separate calls rather than passed
 // as two adjacent arguments of the same type, so they cannot be swapped by
@@ -76,9 +89,9 @@ type FromStep[S comparable] struct{ from S }
 
 // On names the event that triggers the transition.
 //
-// On is a generic method: A is inferred from ev and carried through to
-// [OnStep.To], so an option whose payload type does not match the event is a
-// compile error rather than a runtime surprise.
+// On is a generic method: A is inferred from ev and carried through to the
+// rest of the chain, so a guard or action whose payload type does not match
+// the event is a compile error rather than a runtime surprise.
 func (f FromStep[S]) On[A any](ev Event[A]) OnStep[S, A] {
 	return OnStep[S, A]{from: f.from, ev: ev}
 }
@@ -90,68 +103,31 @@ type OnStep[S comparable, A any] struct {
 	ev   Event[A]
 }
 
-// To completes the transition and returns it as a [Rule].
+// To completes the transition. The result is a [Rule] ready for [New], and
+// also the place to hang guards and actions:
 //
-// The payload type is erased here, after the options have been checked
-// against it, so the resulting Rule is an ordinary Rule[S] that [New] can take
-// alongside transitions carrying any other payload.
-func (o OnStep[S, A]) To(to S, opts ...Option[A]) Rule[S] {
-	return func(b *builder[S]) { b.add(o.ev, o.from, to, opts...) }
+//	fsm.From(a).On(ev).To(b).Guard("...", g).Action(f)
+func (o OnStep[S, A]) To(to S) *ToStep[S, A] {
+	return &ToStep[S, A]{from: o.from, ev: o.ev, to: to}
 }
 
-// OnEnter declares a hook that runs just after the machine enters s.
-// Hooks run in declaration order.
-func OnEnter[S comparable](s S, h Hook[S]) Rule[S] {
-	return func(b *builder[S]) {
-		if h == nil {
-			b.errs = append(b.errs, fmt.Errorf("nil OnEnter hook for state %v", s))
-			return
-		}
-		b.m.onEnter[s] = append(b.m.onEnter[s], h)
-		b.declare(s)
-	}
-}
-
-// OnExit declares a hook that runs just before the machine leaves s.
-func OnExit[S comparable](s S, h Hook[S]) Rule[S] {
-	return func(b *builder[S]) {
-		if h == nil {
-			b.errs = append(b.errs, fmt.Errorf("nil OnExit hook for state %v", s))
-			return
-		}
-		b.m.onExit[s] = append(b.m.onExit[s], h)
-		b.declare(s)
-	}
-}
-
-// Gauge pairs an increment on entering s with a decrement on leaving it.
+// ToStep is a complete transition, optionally carrying guards and actions.
+// It satisfies [Rule].
 //
-// This is the hook pattern worth having a name for: a counter that tracks
-// "how many things are currently in state s" is otherwise maintained by hand
-// at every call site that changes the state, and drifts the moment one of them
-// is missed.
-func Gauge[S comparable](s S, inc, dec func(context.Context)) Rule[S] {
-	return func(b *builder[S]) {
-		if inc == nil || dec == nil {
-			b.errs = append(b.errs, fmt.Errorf("Gauge for state %v needs both inc and dec", s))
-			return
-		}
-		b.m.onEnter[s] = append(b.m.onEnter[s], func(ctx context.Context, _ Transition[S]) { inc(ctx) })
-		b.m.onExit[s] = append(b.m.onExit[s], func(ctx context.Context, _ Transition[S]) { dec(ctx) })
-		b.declare(s)
-	}
+// Its methods mutate and return the same value, so a guard attached to a
+// stored ToStep takes effect whether or not the result is reassigned.
+type ToStep[S comparable, A any] struct {
+	from, to S
+	ev       Event[A]
+	guards   []func(context.Context, A) error
+	descs    []string
+	actions  []func(context.Context, A) error
+	errs     []error
 }
 
-// Option configures a single transition. See [WithGuard] and [WithAction].
-type Option[A any] struct {
-	guard     func(context.Context, A) error
-	guardDesc string
-	action    func(context.Context, A) error
-}
-
-// WithGuard rejects the transition when f returns a non-nil error. The error
-// is wrapped in a [GuardError], which unwraps to it, so a guard can reject
-// with a sentinel the caller matches using errors.Is.
+// Guard rejects the transition when f returns a non-nil error. The error is
+// wrapped in a [GuardError], which unwraps to it, so a guard can reject with
+// a sentinel the caller matches using errors.Is.
 //
 // desc is the guard's static description: it labels the edge in DOT output
 // and appears in the error, so it should read as the condition being
@@ -159,63 +135,56 @@ type Option[A any] struct {
 // dynamic reason the condition did not hold this time.
 //
 // A guard must be pure: it is also evaluated by [Machine.Check] and
-// [Machine.Can].
-func WithGuard[A any](desc string, f func(context.Context, A) error) Option[A] {
-	return Option[A]{guard: f, guardDesc: desc}
+// [Machine.Can]. Guards run in the order they are attached and the first
+// rejection wins.
+func (t *ToStep[S, A]) Guard(desc string, f func(context.Context, A) error) *ToStep[S, A] {
+	if f == nil {
+		t.errs = append(t.errs, fmt.Errorf("guard %q is nil", desc))
+		return t
+	}
+	t.guards = append(t.guards, f)
+	t.descs = append(t.descs, desc)
+	return t
 }
 
-// WithAction runs f as part of the transition. If f returns an error the
-// transition is aborted and the state is left unchanged.
-func WithAction[A any](f func(context.Context, A) error) Option[A] {
-	return Option[A]{action: f}
+// Action runs f as part of the transition. If f returns an error the
+// transition is aborted and the state is left unchanged. Actions run in the
+// order they are attached, after every guard has passed.
+func (t *ToStep[S, A]) Action(f func(context.Context, A) error) *ToStep[S, A] {
+	if f == nil {
+		t.errs = append(t.errs, errors.New("action is nil"))
+		return t
+	}
+	t.actions = append(t.actions, f)
+	return t
 }
 
-// Edge is a registered transition, reported by [Machine.Edges].
-type Edge[S comparable] struct {
-	From  S
-	To    S
-	Event string
-	Guard string // guard description, empty when unguarded
-}
+func (t *ToStep[S, A]) applyTo(b *builder[S]) {
+	where := fmt.Sprintf("transition %v -> %v", t.from, t.to)
+	for _, err := range t.errs {
+		b.errs = append(b.errs, fmt.Errorf("%s: %w", where, err))
+	}
 
-// add records a transition from --ev--> to.
-func (b *builder[S]) add[A any](ev Event[A], from, to S, opts ...Option[A]) {
-	if ev.def == nil {
-		b.errs = append(b.errs, fmt.Errorf("transition %v -> %v: zero Event; declare it with fsm.Define or fsm.Signal", from, to))
+	if t.ev.def == nil {
+		b.errs = append(b.errs, fmt.Errorf("%s: zero Event; declare it with fsm.Define or fsm.Signal", where))
 		return
 	}
 
-	e := edge[S]{from: from, ev: ev.def}
+	e := edge[S]{from: t.from, ev: t.ev.def}
 	if prev, dup := b.m.table[e]; dup {
 		b.errs = append(b.errs, fmt.Errorf("duplicate transition from %v on %s: already goes to %v, redeclared to %v",
-			from, ev.def.name, prev, to))
+			t.from, t.ev.def.name, prev, t.to))
 		return
 	}
 
-	var (
-		guards  []func(context.Context, A) error
-		descs   []string
-		actions []func(context.Context, A) error
-	)
-	for _, o := range opts {
-		if o.guard != nil {
-			guards = append(guards, o.guard)
-			descs = append(descs, o.guardDesc)
-		}
-		if o.action != nil {
-			actions = append(actions, o.action)
-		}
-	}
+	b.m.table[e] = t.to
+	b.declare(t.from)
+	b.declare(t.to)
 
-	b.m.table[e] = to
-	b.declare(from)
-	b.declare(to)
-
-	if len(guards) > 0 {
-		// Combined here, where A is still known, so Fire needs a single
-		// assertion to a concrete func type and never boxes the payload.
-		// Guards are evaluated in declaration order and the first rejection
-		// wins, reported together with the description it was declared under.
+	// Combined here, where A is still known, so Fire needs a single assertion
+	// to a concrete func type and never boxes the payload.
+	if len(t.guards) > 0 {
+		guards, descs := t.guards, t.descs
 		b.m.guards[e] = func(ctx context.Context, a A) (string, error) {
 			for i, g := range guards {
 				if err := g(ctx, a); err != nil {
@@ -225,7 +194,8 @@ func (b *builder[S]) add[A any](ev Event[A], from, to S, opts ...Option[A]) {
 			return "", nil
 		}
 	}
-	if len(actions) > 0 {
+	if len(t.actions) > 0 {
+		actions := t.actions
 		b.m.actions[e] = func(ctx context.Context, a A) error {
 			for _, act := range actions {
 				if err := act(ctx, a); err != nil {
@@ -236,7 +206,60 @@ func (b *builder[S]) add[A any](ev Event[A], from, to S, opts ...Option[A]) {
 		}
 	}
 
-	b.m.edges = append(b.m.edges, Edge[S]{From: from, To: to, Event: ev.def.name, Guard: joinDescs(descs)})
+	b.m.edges = append(b.m.edges, Edge[S]{
+		From: t.from, To: t.to, Event: t.ev.def.name, Guard: joinDescs(t.descs),
+	})
+}
+
+// OnEnter declares a hook that runs just after the machine enters s.
+// Hooks run in declaration order.
+func OnEnter[S comparable](s S, h Hook[S]) Rule[S] {
+	return ruleFunc[S](func(b *builder[S]) {
+		if h == nil {
+			b.errs = append(b.errs, fmt.Errorf("nil OnEnter hook for state %v", s))
+			return
+		}
+		b.m.onEnter[s] = append(b.m.onEnter[s], h)
+		b.declare(s)
+	})
+}
+
+// OnExit declares a hook that runs just before the machine leaves s.
+func OnExit[S comparable](s S, h Hook[S]) Rule[S] {
+	return ruleFunc[S](func(b *builder[S]) {
+		if h == nil {
+			b.errs = append(b.errs, fmt.Errorf("nil OnExit hook for state %v", s))
+			return
+		}
+		b.m.onExit[s] = append(b.m.onExit[s], h)
+		b.declare(s)
+	})
+}
+
+// Gauge pairs an increment on entering s with a decrement on leaving it.
+//
+// This is the hook pattern worth having a name for: a counter that tracks
+// "how many things are currently in state s" is otherwise maintained by hand
+// at every call site that changes the state, and drifts the moment one of them
+// is missed.
+func Gauge[S comparable](s S, inc, dec func(context.Context)) Rule[S] {
+	return ruleFunc[S](func(b *builder[S]) {
+		if inc == nil || dec == nil {
+			b.errs = append(b.errs, fmt.Errorf("Gauge for state %v needs both inc and dec", s))
+			return
+		}
+		b.m.onEnter[s] = append(b.m.onEnter[s], func(ctx context.Context, _ Transition[S]) { inc(ctx) })
+		b.m.onExit[s] = append(b.m.onExit[s], func(ctx context.Context, _ Transition[S]) { dec(ctx) })
+		b.declare(s)
+	})
+}
+
+// Edge is a registered transition, reported by [Machine.Edges].
+type Edge[S comparable] struct {
+	From  S
+	To    S
+	Event string
+	Guard string // guard description, empty when unguarded
 }
 
 // declare records a state in first-seen order, so that introspection output is

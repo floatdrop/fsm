@@ -101,7 +101,7 @@ func TestPayloadReachesAction(t *testing.T) {
 	}
 	m, err := fsm.New("job",
 		fsm.From(idle).On(evStart).To(running),
-		fsm.From(running).On(evFinish).To(done, fsm.WithAction(record)),
+		fsm.From(running).On(evFinish).To(done).Action(record),
 	)
 	if err != nil {
 		t.Fatalf("build: %v", err)
@@ -129,7 +129,7 @@ func guarded(t *testing.T) *fsm.Machine[state] {
 	t.Helper()
 	m, err := fsm.New("job",
 		fsm.From(idle).On(evStart).To(running),
-		fsm.From(running).On(evFinish).To(done, fsm.WithGuard("exit code is zero", zeroExit)),
+		fsm.From(running).On(evFinish).To(done).Guard("exit code is zero", zeroExit),
 	)
 	if err != nil {
 		t.Fatalf("build: %v", err)
@@ -212,11 +212,10 @@ func TestCheckReportsReasonWithoutFiring(t *testing.T) {
 // A guard that rejects must not run the action behind it.
 func TestGuardRunsBeforeAction(t *testing.T) {
 	acted := false
-	never := fsm.WithGuard("never", func(context.Context, int) error { return errNonZeroExit })
-	act := fsm.WithAction(func(context.Context, int) error { acted = true; return nil })
-
 	m, err := fsm.New("job",
-		fsm.From(running).On(evFinish).To(done, never, act),
+		fsm.From(running).On(evFinish).To(done).
+			Guard("never", func(context.Context, int) error { return errNonZeroExit }).
+			Action(func(context.Context, int) error { acted = true; return nil }),
 	)
 	if err != nil {
 		t.Fatalf("build: %v", err)
@@ -235,16 +234,15 @@ func TestGuardRunsBeforeAction(t *testing.T) {
 // description it was registered with.
 func TestFirstRejectingGuardWins(t *testing.T) {
 	errSecond := errors.New("second")
-	first := fsm.WithGuard("first", func(_ context.Context, code int) error {
-		if code < 0 {
-			return errNonZeroExit
-		}
-		return nil
-	})
-	second := fsm.WithGuard("second", func(context.Context, int) error { return errSecond })
-
 	m, err := fsm.New("job",
-		fsm.From(running).On(evFinish).To(done, first, second),
+		fsm.From(running).On(evFinish).To(done).
+			Guard("first", func(_ context.Context, code int) error {
+				if code < 0 {
+					return errNonZeroExit
+				}
+				return nil
+			}).
+			Guard("second", func(context.Context, int) error { return errSecond }),
 	)
 	if err != nil {
 		t.Fatalf("build: %v", err)
@@ -278,7 +276,7 @@ func TestActionErrorAbortsTransition(t *testing.T) {
 	m, err := fsm.New("job",
 		fsm.OnExit(running, func(context.Context, fsm.Transition[state]) { hooks = append(hooks, "exit") }),
 		fsm.OnEnter(done, func(context.Context, fsm.Transition[state]) { hooks = append(hooks, "enter") }),
-		fsm.From(running).On(evFinish).To(done, fsm.WithAction(func(context.Context, int) error { return boom })),
+		fsm.From(running).On(evFinish).To(done).Action(func(context.Context, int) error { return boom }),
 	)
 	if err != nil {
 		t.Fatalf("build: %v", err)
@@ -428,6 +426,75 @@ func TestBuildRejectsZeroEvent(t *testing.T) {
 	}
 }
 
+// A nil guard used to be dropped in silence, taking its description out of
+// the DOT label with it: the machine read as guarded and ran unguarded.
+func TestBuildRejectsNilGuard(t *testing.T) {
+	var nilGuard func(context.Context, int) error
+
+	_, err := fsm.New("job",
+		fsm.From(running).On(evFinish).To(done).Guard("never runs", nilGuard),
+	)
+	if err == nil {
+		t.Fatal("expected an error for a nil guard")
+	}
+	for _, want := range []string{"never runs", "nil", "running -> done"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error %q does not mention %q", err, want)
+		}
+	}
+}
+
+func TestBuildRejectsNilAction(t *testing.T) {
+	var nilAction func(context.Context, int) error
+
+	_, err := fsm.New("job",
+		fsm.From(running).On(evFinish).To(done).Action(nilAction),
+	)
+	if err == nil {
+		t.Fatal("expected an error for a nil action")
+	}
+	if !strings.Contains(err.Error(), "action is nil") {
+		t.Errorf("error %q does not explain the problem", err)
+	}
+}
+
+func TestBuildRejectsNilRule(t *testing.T) {
+	_, err := fsm.New[state]("job",
+		fsm.From(idle).On(evStart).To(running),
+		nil,
+	)
+	if err == nil {
+		t.Fatal("expected an error for a nil rule")
+	}
+	if !strings.Contains(err.Error(), "rule 1 is nil") {
+		t.Errorf("error %q does not say which rule", err)
+	}
+}
+
+// Guards and actions attach to the value To returns, so a stored transition
+// picks them up whether or not the result is reassigned.
+func TestChainedOptionsMutateInPlace(t *testing.T) {
+	blocked := false
+	tr := fsm.From(running).On(evFinish).To(done)
+	tr.Guard("blocked", func(context.Context, int) error {
+		blocked = true
+		return errNonZeroExit
+	})
+
+	m, err := fsm.New("job", tr) // note: tr, not the result of Guard
+	if err != nil {
+		t.Fatalf("build: %v", err)
+	}
+
+	st := running
+	if err := m.Fire(t.Context(), &st, evFinish, 0); !errors.Is(err, errNonZeroExit) {
+		t.Fatalf("got %v, want the guard to reject", err)
+	}
+	if !blocked {
+		t.Error("the guard attached to a stored transition never ran")
+	}
+}
+
 func TestBuildRejectsEmptyMachine(t *testing.T) {
 	if _, err := fsm.New[state]("job"); err == nil {
 		t.Fatal("expected an error for a machine with no transitions")
@@ -484,8 +551,8 @@ func TestDOTIsDeterministic(t *testing.T) {
 // known — is what keeps the payload off the heap.
 func TestFireDoesNotAllocate(t *testing.T) {
 	m, err := fsm.New("job",
-		fsm.From(idle).On(evStart).To(running, fsm.WithGuard("always", func(context.Context, fsm.Unit) error { return nil })),
-		fsm.From(running).On(evFinish).To(idle, fsm.WithAction(func(context.Context, int) error { return nil })),
+		fsm.From(idle).On(evStart).To(running).Guard("always", func(context.Context, fsm.Unit) error { return nil }),
+		fsm.From(running).On(evFinish).To(idle).Action(func(context.Context, int) error { return nil }),
 		fsm.OnEnter(running, func(context.Context, fsm.Transition[state]) {}),
 		fsm.OnExit(running, func(context.Context, fsm.Transition[state]) {}),
 	)
@@ -507,7 +574,7 @@ func TestFireDoesNotAllocate(t *testing.T) {
 func BenchmarkFire(b *testing.B) {
 	m, err := fsm.New("job",
 		fsm.From(idle).On(evStart).To(running),
-		fsm.From(running).On(evFinish).To(idle, fsm.WithAction(func(context.Context, int) error { return nil })),
+		fsm.From(running).On(evFinish).To(idle).Action(func(context.Context, int) error { return nil }),
 	)
 	if err != nil {
 		b.Fatal(err)

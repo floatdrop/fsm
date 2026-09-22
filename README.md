@@ -34,9 +34,9 @@ var recordingFSM = fsm.MustNew("recording",
     fsm.Gauge(recActive, metrics.Inc(recActive), metrics.Dec(recActive)),
     fsm.Gauge(recStopped, metrics.Inc(recStopped), metrics.Dec(recStopped)),
 
-    fsm.From(recActive).On(evRecStop).To(recStopped, fsm.WithAction(markStopped)),
-    fsm.From(recStopped).On(evRecFinish).To(recFinished,
-        fsm.WithGuard("all chunks and tracks uploaded", uploadsSettled)),
+    fsm.From(recActive).On(evRecStop).To(recStopped).Action(markStopped),
+    fsm.From(recStopped).On(evRecFinish).To(recFinished).
+        Guard("all chunks and tracks uploaded", uploadsSettled),
     fsm.From(recFinished).On(evRecUpload).To(recUploaded),
 )
 
@@ -51,7 +51,7 @@ err := recordingFSM.Send(ctx, &r.state, evRecUpload)
 // fsm recording: no transition from active on uploaded
 ```
 
-**Why the API is shaped this way** — state ownership, typed payloads, `Rule` versus `Option`, guard semantics, and the known limitations — is in [docs/DESIGN.md](docs/DESIGN.md).
+**Why the API is shaped this way** — state ownership, typed payloads, `Rule` as the single option type, guard semantics, and the known limitations — is in [docs/DESIGN.md](docs/DESIGN.md).
 
 ## Introspection
 
