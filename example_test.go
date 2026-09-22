@@ -72,6 +72,7 @@ func decr(s recState) func(context.Context) { return func(context.Context) { gau
 // separate calls, so the two states cannot be swapped the way two adjacent
 // arguments can.
 var recordingFSM = fsm.MustNew("recording",
+	fsm.Initial(recActive),
 	fsm.Gauge(recActive, incr(recActive), decr(recActive)),
 	fsm.Gauge(recStopped, incr(recStopped), decr(recStopped)),
 	fsm.Gauge(recFinished, incr(recFinished), decr(recFinished)),
@@ -168,6 +169,7 @@ var pcpLive = fsm.NewGroup("live", pcpConnected, pcpReconnecting)
 // than "absent from the map", so the last transition is expressible and can
 // carry a reason.
 var participantFSM = fsm.MustNew("participant",
+	fsm.Initial(pcpConnected),
 	fsm.From(pcpConnected).On(evPcpDrop).To(pcpReconnecting).
 		Guard("disconnect was not intentional", unintentional),
 	fsm.From(pcpReconnecting).On(evPcpReconnect).To(pcpConnected),
@@ -223,6 +225,7 @@ func ExampleMachine_DOT_group() {
 	// digraph "participant" {
 	// 	rankdir=LR;
 	// 	compound=true;
+	// 	"__start" [shape=point];
 	// 	subgraph "cluster_live" {
 	// 		label="live";
 	// 		style=rounded;
@@ -230,6 +233,7 @@ func ExampleMachine_DOT_group() {
 	// 		"reconnecting" [shape=box];
 	// 	}
 	// 	"deleted" [shape=doublecircle];
+	// 	"__start" -> "connected";
 	// 	"connected" -> "reconnecting" [label="disconnect\n[disconnect was not intentional]"];
 	// 	"reconnecting" -> "connected" [label="reconnect"];
 	// 	"connected" -> "deleted" [label="kick", ltail="cluster_live"];
@@ -244,10 +248,12 @@ func ExampleMachine_DOT() {
 	// Output:
 	// digraph "recording" {
 	// 	rankdir=LR;
+	// 	"__start" [shape=point];
 	// 	"active" [shape=box];
 	// 	"stopped" [shape=box];
 	// 	"finished" [shape=box];
 	// 	"uploaded" [shape=doublecircle];
+	// 	"__start" -> "active";
 	// 	"active" -> "stopped" [label="stop"];
 	// 	"stopped" -> "finished" [label="finish\n[all chunks and tracks uploaded]"];
 	// 	"finished" -> "uploaded" [label="uploaded"];

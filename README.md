@@ -30,6 +30,7 @@ var (
 )
 
 var recordingFSM = fsm.MustNew("recording",
+    fsm.Initial(recActive),
     fsm.Gauge(recActive, metrics.Inc(recActive), metrics.Dec(recActive)),
     fsm.Gauge(recStopped, metrics.Inc(recStopped), metrics.Dec(recStopped)),
 
@@ -89,6 +90,7 @@ var (
 var pcpLive = fsm.NewGroup("live", pcpConnected, pcpReconnecting)
 
 var participantFSM = fsm.MustNew("participant",
+    fsm.Initial(pcpConnected),
     fsm.From(pcpConnected).On(evPcpDrop).To(pcpReconnecting).
         Guard("disconnect was not intentional", unintentional),
     fsm.From(pcpReconnecting).On(evPcpReconnect).To(pcpConnected),
@@ -101,7 +103,7 @@ var participantFSM = fsm.MustNew("participant",
 In the diagram the group is a cluster, and `kick` leaves the cluster rather than any one state inside it:
 
 <p align="center">
-  <img src="docs/assets/participant.svg" alt="connected and reconnecting inside a cluster labelled live, with kick leaving the cluster boundary for deleted" width="560">
+  <img src="docs/assets/participant.svg" alt="a start dot pointing at connected, which sits with reconnecting inside a cluster labelled live, with kick leaving the cluster boundary for deleted" width="560">
 </p>
 
 A member that declares the event itself overrides the group rule. The other members keep the inherited one:
@@ -161,7 +163,7 @@ func TestRecordingShape(t *testing.T) {
 
 An unintended terminal state is somewhere a value can get stuck, and an unreachable state usually means a missing transition. Both are cheap to test.
 
-`Initial` declares where a fresh instance starts. The machine still holds no state, but `New` then rejects a state nothing reaches from the start, or a start with no way out, so the reachability check above becomes a build error:
+`Initial` declares where a fresh instance starts, as both machines above do. The machine still holds no state, but `New` then rejects a state nothing reaches from the start, or a start with no way out, so the reachability check above is already a build error:
 
 ```go
 fsm.MustNew("recording",
@@ -187,7 +189,7 @@ for _, e := range recordingFSM.Edges() {
 
 ### DOT
 
-`DOT` renders the machine as a Graphviz digraph. Terminal states are double circles and guards appear in edge labels:
+`DOT` renders the machine as a Graphviz digraph. The initial state is pointed at from a dot, terminal states are double circles, and guards appear in edge labels:
 
 ```go
 fmt.Print(recordingFSM.DOT())
@@ -196,10 +198,12 @@ fmt.Print(recordingFSM.DOT())
 ```dot
 digraph "recording" {
 	rankdir=LR;
+	"__start" [shape=point];
 	"active" [shape=box];
 	"stopped" [shape=box];
 	"finished" [shape=box];
 	"uploaded" [shape=doublecircle];
+	"__start" -> "active";
 	"active" -> "stopped" [label="stop"];
 	"stopped" -> "finished" [label="finish\n[all chunks and tracks uploaded]"];
 	"finished" -> "uploaded" [label="uploaded"];
@@ -211,7 +215,7 @@ go run ./yourcmd | dot -Tsvg -o machine.svg
 ```
 
 <p align="center">
-  <img src="docs/assets/recording.svg" alt="active to stopped on stop, stopped to finished on finish guarded by all chunks and tracks uploaded, finished to uploaded" width="720">
+  <img src="docs/assets/recording.svg" alt="a start dot pointing at active, active to stopped on stop, stopped to finished on finish guarded by all chunks and tracks uploaded, finished to uploaded" width="720">
 </p>
 
 A [group](#groups) becomes a cluster, and a transition every member inherited is drawn once from the cluster boundary:
@@ -228,13 +232,6 @@ subgraph "cluster_live" {
 ```
 
 Per-member arrows are used when a boundary arrow would be wrong: a member overrides the event, the group overlaps another and cannot hold all its members in one cluster, or the target is itself a member.
-
-A declared `Initial` state is pointed at from a dot:
-
-```dot
-"__start" [shape=point];
-"__start" -> "active";
-```
 
 Output follows declaration order, so the DOT can be committed next to the code and diffed when the machine changes.
 
