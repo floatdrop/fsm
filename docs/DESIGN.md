@@ -142,6 +142,34 @@ currently in state *s*" is otherwise a `+= 1` and a `-= 1` at every call site
 that changes the state, and it drifts the first time a site is missed.
 `Gauge(s, inc, dec)` binds the pair to the state itself.
 
+`Gauge`'s closures are fixed when the machine is built, which is no good for
+the common case where the counter belongs to whatever the transition is
+*about* — a per-instance metric, labelled by a tenant or a service. That
+instance is in the payload, so `GaugeWith` takes it from there:
+
+```go
+fsm.GaugeWith(recStopped,
+    func(_ context.Context, s recStep) { s.r.metrics.Add(recStopped, 1) },
+    func(_ context.Context, s recStep) { s.r.metrics.Add(recStopped, -1) },
+)
+```
+
+It is still one declaration per state, so the increment and decrement cannot
+come apart. It expands to an entry hook on every event entering the state and
+an exit hook on every event leaving it, which means every such event has to
+carry the same payload type. Rather than let a mismatched event silently skip
+the counter, `New` reports it:
+
+```
+GaugeWith for state running: transition done --other--> running carries a
+different payload type, so the counter cannot be kept paired
+```
+
+So a machine whose events carry different payloads can still use `GaugeWith`
+on the states where they agree, and is told precisely where they do not. The
+expansion happens in a second pass over the finished transition table, so a
+`GaugeWith` can be declared before the edges it applies to.
+
 ### Hooks that need the payload name their event
 
 A plain `Hook` gets a `Transition[S]` and no payload, because a state can be

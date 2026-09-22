@@ -89,6 +89,15 @@ cannot fail, so an increment and its decrement cannot come apart. Changing this
 order breaks `TestHooksBracketTheAssignment` and `TestGaugeStaysPaired`, which
 is the point of both.
 
+**`GaugeWith` expands in a second pass and validates payload types.** It is
+declared per state but needs the whole transition table, so it defers through
+`builder.deferred` and runs after every rule has applied — which is why
+declaration order does not matter. It compares payload types with
+`payloadToken[A]()`, two typed nil pointers being equal exactly when the types
+match, so no reflect is involved. A state reachable by events of differing
+payload types is an error, never a silently skipped edge: that silence would
+be the drift the gauge exists to prevent.
+
 **A plain `Hook` cannot see the payload, and that is structural.** A state can
 be entered by events carrying different `A`, so there is no single type to
 hand it. `OnEnterVia`/`OnExitVia` name the event, which fixes `A`; that is the

@@ -606,6 +606,159 @@ func TestSelfTransitionRunsExitAndEntry(t *testing.T) {
 	}
 }
 
+// A counter labelled by the thing the transition is about cannot be closed
+// over when the machine is built. GaugeWith takes it from the payload and is
+// still declared once per state, so the pair stays bound together.
+func TestGaugeWithCountsPerPayload(t *testing.T) {
+	type tally struct{ n map[state]int }
+	ev := fsm.Define[*tally]("go")
+	back := fsm.Define[*tally]("back")
+
+	m, err := fsm.New("job",
+		fsm.GaugeWith(running,
+			func(_ context.Context, x *tally) { x.n[running]++ },
+			func(_ context.Context, x *tally) { x.n[running]-- },
+		),
+		fsm.From(idle).On(ev).To(running),
+		fsm.From(running).On(back).To(idle),
+	)
+	if err != nil {
+		t.Fatalf("build: %v", err)
+	}
+
+	ctx := t.Context()
+	// Two independent instances share one machine and keep separate counts.
+	a, b := &tally{n: map[state]int{}}, &tally{n: map[state]int{}}
+	sa, sb := idle, idle
+
+	for range 3 {
+		if err := m.Fire(ctx, &sa, ev, a); err != nil {
+			t.Fatal(err)
+		}
+		if err := m.Fire(ctx, &sa, back, a); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := m.Fire(ctx, &sb, ev, b); err != nil {
+		t.Fatal(err)
+	}
+
+	if a.n[running] != 0 {
+		t.Errorf("a settled at %d after balanced trips, want 0", a.n[running])
+	}
+	if b.n[running] != 1 {
+		t.Errorf("b is %d while in running, want 1", b.n[running])
+	}
+}
+
+// The increment and decrement come from one declaration, so no call site can
+// supply one without the other.
+func TestGaugeWithStaysPairedAcrossEveryEdge(t *testing.T) {
+	type tally struct{ n int }
+	in1 := fsm.Define[*tally]("in1")
+	in2 := fsm.Define[*tally]("in2")
+	out := fsm.Define[*tally]("out")
+
+	m, err := fsm.New("job",
+		fsm.GaugeWith(running,
+			func(_ context.Context, x *tally) { x.n++ },
+			func(_ context.Context, x *tally) { x.n-- },
+		),
+		fsm.From(idle).On(in1).To(running),
+		fsm.From(done).On(in2).To(running), // a second way in
+		fsm.From(running).On(out).To(done),
+	)
+	if err != nil {
+		t.Fatalf("build: %v", err)
+	}
+
+	ctx := t.Context()
+	x := &tally{}
+	st := idle
+	for _, step := range []struct {
+		ev   fsm.Event[*tally]
+		want int
+	}{{in1, 1}, {out, 0}, {in2, 1}, {out, 0}} {
+		if err := m.Fire(ctx, &st, step.ev, x); err != nil {
+			t.Fatalf("fire %s: %v", step.ev.Name(), err)
+		}
+		if x.n != step.want {
+			t.Errorf("after %s count is %d, want %d", step.ev.Name(), x.n, step.want)
+		}
+	}
+}
+
+// A state reached by events carrying different payloads cannot have its
+// counter kept paired, so New says so instead of skipping an edge.
+func TestGaugeWithRejectsMixedPayloads(t *testing.T) {
+	type tally struct{}
+	typed := fsm.Define[*tally]("typed")
+	other := fsm.Define[int]("other")
+
+	_, err := fsm.New("job",
+		fsm.GaugeWith(running,
+			func(context.Context, *tally) {},
+			func(context.Context, *tally) {},
+		),
+		fsm.From(idle).On(typed).To(running),
+		fsm.From(done).On(other).To(running), // different payload type
+	)
+	if err == nil {
+		t.Fatal("expected an error for a state entered by two payload types")
+	}
+	for _, want := range []string{"GaugeWith for state running", "other", "different payload type"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error %q does not mention %q", err, want)
+		}
+	}
+}
+
+func TestGaugeWithRejectsAnIsolatedState(t *testing.T) {
+	_, err := fsm.New("job",
+		fsm.GaugeWith(cancelled,
+			func(context.Context, int) {},
+			func(context.Context, int) {},
+		),
+		fsm.From(idle).On(evFinish).To(running),
+	)
+	if err == nil || !strings.Contains(err.Error(), "no transition enters or leaves it") {
+		t.Fatalf("got %v, want a complaint about an isolated state", err)
+	}
+}
+
+// Declaration order must not matter: the edges are read in a second pass.
+func TestGaugeWithMayBeDeclaredBeforeItsEdges(t *testing.T) {
+	type tally struct{ n int }
+	ev := fsm.Define[*tally]("go")
+
+	first, err := fsm.New("first",
+		fsm.GaugeWith(running, func(_ context.Context, x *tally) { x.n++ }, func(_ context.Context, x *tally) { x.n-- }),
+		fsm.From(idle).On(ev).To(running),
+	)
+	if err != nil {
+		t.Fatalf("gauge first: %v", err)
+	}
+	last, err := fsm.New("last",
+		fsm.From(idle).On(ev).To(running),
+		fsm.GaugeWith(running, func(_ context.Context, x *tally) { x.n++ }, func(_ context.Context, x *tally) { x.n-- }),
+	)
+	if err != nil {
+		t.Fatalf("gauge last: %v", err)
+	}
+
+	ctx := t.Context()
+	for _, m := range []*fsm.Machine[state]{first, last} {
+		x := &tally{}
+		st := idle
+		if err := m.Fire(ctx, &st, ev, x); err != nil {
+			t.Fatal(err)
+		}
+		if x.n != 1 {
+			t.Errorf("%s: count %d, want 1", m.Name(), x.n)
+		}
+	}
+}
+
 // A nil guard used to be dropped in silence, taking its description out of
 // the DOT label with it: the machine read as guarded and ran unguarded.
 func TestBuildRejectsNilGuard(t *testing.T) {

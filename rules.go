@@ -27,7 +27,25 @@ type builder[S comparable] struct {
 	m    *Machine[S]
 	errs []error
 	seen map[S]bool
+
+	// Every declared transition in order, with the payload type its event
+	// carries. [GaugeWith] needs to see the whole table, so it is recorded
+	// here and read in a second pass.
+	decls []decl[S]
+
+	// Rules that must run once every transition is known.
+	deferred []func(*builder[S])
 }
+
+type decl[S comparable] struct {
+	key     edge[S]
+	to      S
+	payload any // (*A)(nil) for the event's payload type A
+}
+
+// payloadToken identifies a payload type without reflect: two typed nil
+// pointers compare equal exactly when their types match.
+func payloadToken[A any]() any { return (*A)(nil) }
 
 // New builds a machine from its rules. name appears in errors and DOT output.
 //
@@ -54,6 +72,12 @@ func New[S comparable](name string, rules ...Rule[S]) (*Machine[S], error) {
 			continue
 		}
 		r.applyTo(b)
+	}
+
+	// Rules that need the whole transition table run once it exists, so a
+	// GaugeWith can be declared before the edges it applies to.
+	for _, d := range b.deferred {
+		d(b)
 	}
 
 	if len(b.m.table) == 0 {
@@ -188,6 +212,7 @@ func (t *ToStep[S, A]) applyTo(b *builder[S]) {
 	}
 
 	b.m.table[e] = t.to
+	b.decls = append(b.decls, decl[S]{key: e, to: t.to, payload: payloadToken[A]()})
 	b.declare(t.from)
 	b.declare(t.to)
 
@@ -313,6 +338,70 @@ func Gauge[S comparable](s S, inc, dec func(context.Context)) Rule[S] {
 		b.m.onEnter[s] = append(b.m.onEnter[s], func(ctx context.Context, _ Transition[S]) { inc(ctx) })
 		b.m.onExit[s] = append(b.m.onExit[s], func(ctx context.Context, _ Transition[S]) { dec(ctx) })
 		b.declare(s)
+	})
+}
+
+// GaugeWith is [Gauge] for a counter that needs something from the event's
+// payload — the instance the count is labelled by, typically:
+//
+//	fsm.GaugeWith(recStopped,
+//		func(_ context.Context, s recStep) { s.r.metrics.Add(recStopped, 1) },
+//		func(_ context.Context, s recStep) { s.r.metrics.Add(recStopped, -1) },
+//	)
+//
+// Gauge's closures are fixed when the machine is built, which is no good when
+// the counter belongs to whatever the transition is about. GaugeWith is still
+// declared once per state, so the increment and its decrement stay bound
+// together: it expands to an entry hook on every event that enters s and an
+// exit hook on every event that leaves s.
+//
+// That requires every event touching s to carry the same payload type A.
+// [New] checks it and reports the offending transition rather than letting a
+// mismatched event silently skip the counter, so a machine whose events carry
+// different payloads can still use GaugeWith on the states where they agree.
+//
+// Entering the initial state is not a transition, so the first increment is
+// the caller's, exactly as with [Gauge].
+func GaugeWith[S comparable, A any](s S, inc, dec func(context.Context, A)) Rule[S] {
+	return ruleFunc[S](func(b *builder[S]) {
+		if inc == nil || dec == nil {
+			b.errs = append(b.errs, fmt.Errorf("GaugeWith for state %v needs both inc and dec", s))
+			return
+		}
+		b.declare(s)
+
+		b.deferred = append(b.deferred, func(b *builder[S]) {
+			want := payloadToken[A]()
+			var touched int
+			for _, d := range b.decls {
+				entering := d.to == s
+				leaving := d.key.from == s
+				if !entering && !leaving {
+					continue
+				}
+				if d.payload != want {
+					b.errs = append(b.errs, fmt.Errorf(
+						"GaugeWith for state %v: transition %v --%s--> %v carries a different payload type, so the counter cannot be kept paired",
+						s, d.key.from, d.key.ev.name, d.to))
+					continue
+				}
+				touched++
+				if entering {
+					b.m.onEnterVia[edge[S]{from: s, ev: d.key.ev}] = append(
+						b.m.onEnterVia[edge[S]{from: s, ev: d.key.ev}],
+						func(ctx context.Context, _ Transition[S], a A) { inc(ctx, a) })
+				}
+				if leaving {
+					b.m.onExitVia[edge[S]{from: s, ev: d.key.ev}] = append(
+						b.m.onExitVia[edge[S]{from: s, ev: d.key.ev}],
+						func(ctx context.Context, _ Transition[S], a A) { dec(ctx, a) })
+				}
+			}
+			if touched == 0 {
+				b.errs = append(b.errs, fmt.Errorf(
+					"GaugeWith for state %v: no transition enters or leaves it, so the counter would never move", s))
+			}
+		})
 	})
 }
 
