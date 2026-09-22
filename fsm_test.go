@@ -1,0 +1,354 @@
+package fsm_test
+
+import (
+	"context"
+	"errors"
+	"strings"
+	"testing"
+
+	"github.com/floatdrop/fsm"
+)
+
+type state int
+
+const (
+	idle state = iota
+	running
+	done
+	cancelled
+)
+
+func (s state) String() string {
+	switch s {
+	case idle:
+		return "idle"
+	case running:
+		return "running"
+	case done:
+		return "done"
+	case cancelled:
+		return "cancelled"
+	}
+	return "unknown"
+}
+
+var (
+	evStart  = fsm.Signal("start")
+	evFinish = fsm.Define[int]("finish")
+	evCancel = fsm.Signal("cancel")
+)
+
+func linear(t *testing.T) *fsm.Machine[state] {
+	t.Helper()
+	m, err := fsm.New[state]("job").
+		On(evStart, idle, running).
+		On(evFinish, running, done).
+		On(evCancel, running, cancelled).
+		Build()
+	if err != nil {
+		t.Fatalf("build: %v", err)
+	}
+	return m
+}
+
+func TestFireAdvancesState(t *testing.T) {
+	m := linear(t)
+	ctx := context.Background()
+
+	st := idle
+	if err := m.Send(ctx, &st, evStart); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	if st != running {
+		t.Fatalf("after start: got %v, want running", st)
+	}
+	if err := m.Fire(ctx, &st, evFinish, 0); err != nil {
+		t.Fatalf("finish: %v", err)
+	}
+	if st != done {
+		t.Fatalf("after finish: got %v, want done", st)
+	}
+}
+
+func TestFireRejectsUnknownTransition(t *testing.T) {
+	m := linear(t)
+	st := idle
+
+	err := m.Fire(context.Background(), &st, evFinish, 0)
+	if err == nil {
+		t.Fatal("expected an error firing finish from idle")
+	}
+
+	var nte *fsm.NoTransitionError[state]
+	if !errors.As(err, &nte) {
+		t.Fatalf("got %T, want *fsm.NoTransitionError", err)
+	}
+	if nte.From != idle || nte.Event != "finish" {
+		t.Errorf("error describes %v on %q, want idle on \"finish\"", nte.From, nte.Event)
+	}
+	if st != idle {
+		t.Errorf("state changed to %v on a failed transition", st)
+	}
+}
+
+func TestPayloadReachesAction(t *testing.T) {
+	var got int
+	m, err := fsm.New[state]("job").
+		On(evStart, idle, running).
+		On(evFinish, running, done, fsm.WithAction(func(_ context.Context, code int) error {
+			got = code
+			return nil
+		})).
+		Build()
+	if err != nil {
+		t.Fatalf("build: %v", err)
+	}
+
+	st := running
+	if err := m.Fire(context.Background(), &st, evFinish, 42); err != nil {
+		t.Fatalf("finish: %v", err)
+	}
+	if got != 42 {
+		t.Errorf("action saw %d, want 42", got)
+	}
+}
+
+func TestGuardBlocksTransition(t *testing.T) {
+	m, err := fsm.New[state]("job").
+		On(evStart, idle, running).
+		On(evFinish, running, done, fsm.WithGuard("exit code is zero", func(_ context.Context, code int) bool {
+			return code == 0
+		})).
+		Build()
+	if err != nil {
+		t.Fatalf("build: %v", err)
+	}
+	ctx := context.Background()
+
+	st := running
+	err = m.Fire(ctx, &st, evFinish, 1)
+	var ge *fsm.GuardError[state]
+	if !errors.As(err, &ge) {
+		t.Fatalf("got %v (%T), want *fsm.GuardError", err, err)
+	}
+	if ge.Reason != "exit code is zero" {
+		t.Errorf("reason %q, want %q", ge.Reason, "exit code is zero")
+	}
+	if st != running {
+		t.Errorf("state changed to %v despite a failed guard", st)
+	}
+
+	if m.Can(ctx, running, evFinish, 1) {
+		t.Error("Can reported true for a guard that rejects")
+	}
+	if !m.Can(ctx, running, evFinish, 0) {
+		t.Error("Can reported false for a guard that accepts")
+	}
+
+	if err := m.Fire(ctx, &st, evFinish, 0); err != nil {
+		t.Fatalf("finish with passing guard: %v", err)
+	}
+	if st != done {
+		t.Errorf("got %v, want done", st)
+	}
+}
+
+func TestActionErrorAbortsTransition(t *testing.T) {
+	boom := errors.New("boom")
+	var hooks []string
+
+	m, err := fsm.New[state]("job").
+		OnExit(running, func(context.Context, fsm.Transition[state]) { hooks = append(hooks, "exit") }).
+		OnEnter(done, func(context.Context, fsm.Transition[state]) { hooks = append(hooks, "enter") }).
+		On(evFinish, running, done, fsm.WithAction(func(context.Context, int) error { return boom })).
+		Build()
+	if err != nil {
+		t.Fatalf("build: %v", err)
+	}
+
+	st := running
+	err = m.Fire(context.Background(), &st, evFinish, 0)
+	if !errors.Is(err, boom) {
+		t.Fatalf("got %v, want it to wrap boom", err)
+	}
+	if st != running {
+		t.Errorf("state changed to %v after a failing action", st)
+	}
+	if len(hooks) != 0 {
+		t.Errorf("hooks ran despite a failing action: %v", hooks)
+	}
+}
+
+// Hooks must bracket the assignment: exit sees the old state, enter sees the
+// new one. Anything that pairs an increment with a decrement depends on it.
+func TestHooksBracketTheAssignment(t *testing.T) {
+	var order []string
+
+	m, err := fsm.New[state]("job").
+		OnExit(running, func(_ context.Context, tr fsm.Transition[state]) {
+			order = append(order, "exit:"+tr.From.String()+"->"+tr.To.String())
+		}).
+		OnEnter(done, func(_ context.Context, tr fsm.Transition[state]) {
+			order = append(order, "enter:"+tr.From.String()+"->"+tr.To.String())
+		}).
+		On(evFinish, running, done).
+		Build()
+	if err != nil {
+		t.Fatalf("build: %v", err)
+	}
+
+	st := running
+	if err := m.Fire(context.Background(), &st, evFinish, 0); err != nil {
+		t.Fatalf("finish: %v", err)
+	}
+
+	want := []string{"exit:running->done", "enter:running->done"}
+	if strings.Join(order, ",") != strings.Join(want, ",") {
+		t.Errorf("hook order %v, want %v", order, want)
+	}
+}
+
+// The bug class this package exists to remove: a gauge maintained by hand at
+// every call site that changes the state.
+func TestGaugeStaysPaired(t *testing.T) {
+	counts := map[state]int{}
+	inc := func(s state) func(context.Context) { return func(context.Context) { counts[s]++ } }
+	dec := func(s state) func(context.Context) { return func(context.Context) { counts[s]-- } }
+
+	m, err := fsm.New[state]("job").
+		Gauge(running, inc(running), dec(running)).
+		Gauge(done, inc(done), dec(done)).
+		On(evStart, idle, running).
+		On(evFinish, running, done).
+		Build()
+	if err != nil {
+		t.Fatalf("build: %v", err)
+	}
+	ctx := context.Background()
+
+	for range 100 {
+		st := idle
+		if err := m.Send(ctx, &st, evStart); err != nil {
+			t.Fatal(err)
+		}
+		// Firing an event the state does not accept must not move a gauge.
+		_ = m.Send(ctx, &st, evStart)
+		if err := m.Fire(ctx, &st, evFinish, 0); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	if counts[running] != 0 {
+		t.Errorf("running gauge drifted to %d, want 0", counts[running])
+	}
+	if counts[done] != 100 {
+		t.Errorf("done gauge is %d, want 100", counts[done])
+	}
+}
+
+func TestBuildRejectsDuplicateTransition(t *testing.T) {
+	_, err := fsm.New[state]("job").
+		On(evStart, idle, running).
+		On(evStart, idle, cancelled).
+		Build()
+	if err == nil {
+		t.Fatal("expected a duplicate-transition error")
+	}
+	if !strings.Contains(err.Error(), "duplicate transition") {
+		t.Errorf("error %q does not mention the duplicate", err)
+	}
+}
+
+func TestBuildRejectsEmptyMachine(t *testing.T) {
+	if _, err := fsm.New[state]("job").Build(); err == nil {
+		t.Fatal("expected an error for a machine with no transitions")
+	}
+}
+
+func TestZeroEventIsAnErrorNotAPanic(t *testing.T) {
+	m := linear(t)
+	var zero fsm.Event[int]
+
+	st := idle
+	err := m.Fire(context.Background(), &st, zero, 0)
+	if err == nil {
+		t.Fatal("expected an error for the zero Event")
+	}
+	if !strings.Contains(err.Error(), "zero Event") {
+		t.Errorf("error %q does not explain the problem", err)
+	}
+}
+
+func TestTerminalsAndReachability(t *testing.T) {
+	m := linear(t)
+
+	terminals := m.Terminals()
+	if len(terminals) != 2 || terminals[0] != done || terminals[1] != cancelled {
+		t.Errorf("terminals %v, want [done cancelled]", terminals)
+	}
+	if got := m.Unreachable(idle); len(got) != 0 {
+		t.Errorf("unreachable from idle: %v, want none", got)
+	}
+	if got := m.Unreachable(done); len(got) != 3 {
+		t.Errorf("unreachable from done: %v, want 3 states", got)
+	}
+}
+
+func TestDOTIsDeterministic(t *testing.T) {
+	m := linear(t)
+
+	first := m.DOT()
+	for range 50 {
+		if got := m.DOT(); got != first {
+			t.Fatal("DOT output varies between calls")
+		}
+	}
+	for _, want := range []string{`digraph "job"`, `"idle" -> "running"`, `"done" [shape=doublecircle]`} {
+		if !strings.Contains(first, want) {
+			t.Errorf("DOT output missing %q:\n%s", want, first)
+		}
+	}
+}
+
+// Fire is on the hot path of whatever owns the state, so it must not allocate.
+// Combining guards and actions at build time — where the payload type is still
+// known — is what keeps the payload off the heap.
+func TestFireDoesNotAllocate(t *testing.T) {
+	m, err := fsm.New[state]("job").
+		On(evStart, idle, running, fsm.WithGuard("always", func(context.Context, fsm.Unit) bool { return true })).
+		On(evFinish, running, idle, fsm.WithAction(func(context.Context, int) error { return nil })).
+		OnEnter(running, func(context.Context, fsm.Transition[state]) {}).
+		OnExit(running, func(context.Context, fsm.Transition[state]) {}).
+		Build()
+	if err != nil {
+		t.Fatalf("build: %v", err)
+	}
+	ctx := context.Background()
+	st := idle
+
+	avg := testing.AllocsPerRun(1000, func() {
+		_ = m.Send(ctx, &st, evStart)
+		_ = m.Fire(ctx, &st, evFinish, 7)
+	})
+	if avg != 0 {
+		t.Errorf("Fire allocates %.1f times per round trip, want 0", avg)
+	}
+}
+
+func BenchmarkFire(b *testing.B) {
+	m, err := fsm.New[state]("job").
+		On(evStart, idle, running).
+		On(evFinish, running, idle, fsm.WithAction(func(context.Context, int) error { return nil })).
+		Build()
+	if err != nil {
+		b.Fatal(err)
+	}
+	ctx := context.Background()
+	st := idle
+
+	b.ReportAllocs()
+	for b.Loop() {
+		_ = m.Send(ctx, &st, evStart)
+		_ = m.Fire(ctx, &st, evFinish, 1)
+	}
+}
