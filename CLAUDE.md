@@ -9,8 +9,9 @@ that way. This file is the working detail behind it; the two are edited
 together.
 
 Library: `fsm.go` (package doc, `Event`, `Machine`, `Fire`, `Send`, `Check`,
-`Can`, `To`, the error types), `builder.go` (`New`, `On`, hooks, `Gauge`,
-`Build`, and the `WithGuard`/`WithAction` options), `introspect.go` (`States`,
+`Can`, `To`, the error types), `builder.go` (`New`, the
+`From`/`On`/`To` chain, hooks, `Gauge`, `Build`, and the
+`WithGuard`/`WithAction` options), `introspect.go` (`States`,
 `Edges`, `Terminals`, `Unreachable`, `DOT`). Tests are `fsm_test.go` and the
 worked machines in `example_test.go`.
 
@@ -111,6 +112,20 @@ committed-and-diffable only as long as that holds.
   carries the two machines the design was drawn from, a recording lifecycle and
   a participant connection. They are tests, not prose: changing the API means
   changing them, and `ExampleMachine_DOT` pins the exact rendering.
+- **Events are prefixed `ev`; states take the plain domain prefix.** The rule
+  exists because the natural names collide by tense — `recStop` the event
+  beside `recStopped` the state, `pcpReconnect` beside `pcpReconnecting`. A
+  reader scanning a transition table cannot be asked to tell those apart.
+- **A transition is declared as `From(a).On(ev).To(b)`**, never as one call
+  taking both states. Two adjacent parameters of the same state type are
+  indistinguishable and a swap silently reverses the edge. If a shorthand for
+  bulk declarations is ever added, it must keep the roles distinguishable in
+  the same way — a `[]Edge{{From: …, To: …}}` literal qualifies, a positional
+  pair does not.
+- **Guards and actions longer than one line get a named function.** `gofmt`
+  indents a multi-line closure inside a method chain badly, and the chain is
+  the readable part. `example_test.go` shows the shape: `markStopped`,
+  `uploadsSettled`, `unintentional`.
 - **Tests take their context from `t.Context()`, benchmarks from `b.Context()`.**
   The two `context.Background()` calls left in `example_test.go` are not an
   oversight: an `Example` function has no `testing.TB`, so there is nothing to

@@ -65,12 +65,50 @@ func New[S comparable](name string) *Builder[S] {
 	}
 }
 
-// On registers a transition from --ev--> to.
+// From begins a transition declaration:
 //
-// On is a generic method: A is inferred from ev, and every option must carry
-// the same payload type, so a guard or action with the wrong signature is a
+//	b.From(recStopped).On(evRecFinish).To(recFinished)
+//
+// The source and target states are named by separate calls rather than
+// passed as two adjacent arguments of the same type, so they cannot be
+// swapped by mistake.
+func (b *Builder[S]) From(s S) FromStep[S] {
+	return FromStep[S]{b: b, from: s}
+}
+
+// FromStep is a transition with its source state fixed. It is a transient
+// value in a [Builder.From] chain; call [FromStep.On] to continue.
+type FromStep[S comparable] struct {
+	b    *Builder[S]
+	from S
+}
+
+// On names the event that triggers the transition.
+//
+// On is a generic method: A is inferred from ev and carried through to
+// [OnStep.To], so an option whose payload type does not match the event is a
 // compile error rather than a runtime surprise.
-func (b *Builder[S]) On[A any](ev Event[A], from, to S, opts ...Option[A]) *Builder[S] {
+func (f FromStep[S]) On[A any](ev Event[A]) OnStep[S, A] {
+	return OnStep[S, A]{b: f.b, from: f.from, ev: ev}
+}
+
+// OnStep is a transition with its source state and event fixed. It is a
+// transient value in a [Builder.From] chain; call [OnStep.To] to complete the
+// transition.
+type OnStep[S comparable, A any] struct {
+	b    *Builder[S]
+	from S
+	ev   Event[A]
+}
+
+// To completes the transition and returns the builder, so the next one can be
+// chained onto it.
+func (o OnStep[S, A]) To(to S, opts ...Option[A]) *Builder[S] {
+	return o.b.add(o.ev, o.from, to, opts...)
+}
+
+// add records a transition from --ev--> to.
+func (b *Builder[S]) add[A any](ev Event[A], from, to S, opts ...Option[A]) *Builder[S] {
 	if ev.def == nil {
 		b.errs = append(b.errs, fmt.Errorf("transition %v -> %v: zero Event; declare it with fsm.Define or fsm.Signal", from, to))
 		return b

@@ -31,46 +31,54 @@ type recording struct {
 	inProgressTracks int
 }
 
+// Events are prefixed ev so they never read as states. Without it the pair
+// "stop" and "stopped" is one tense apart, which is not a difference worth
+// relying on.
+//
 // The payload is the aggregate itself, so guards and actions read the same
 // data the caller has, with no package-level state and no type assertions.
 var (
-	recStop   = fsm.Define[*recording]("stop")
-	recFinish = fsm.Define[*recording]("finish")
-	recUpload = fsm.Signal("uploaded")
+	evRecStop   = fsm.Define[*recording]("stop")
+	evRecFinish = fsm.Define[*recording]("finish")
+	evRecUpload = fsm.Signal("uploaded")
 )
 
 // A guard rejects with a sentinel, so a caller can tell "not finishable yet,
 // retry later" apart from "not finishable at all" without parsing strings.
 var errUploadPending = errors.New("still uploading")
 
+func markStopped(_ context.Context, r *recording) error {
+	r.stoppedAt = time.Unix(1700000000, 0).UTC()
+	return nil
+}
+
+func uploadsSettled(_ context.Context, r *recording) error {
+	if r.inProgressChunks != 0 || r.inProgressTracks != 0 {
+		return fmt.Errorf("%w: %d chunks, %d tracks",
+			errUploadPending, r.inProgressChunks, r.inProgressTracks)
+	}
+	return nil
+}
+
 // Gauges tracking how many recordings sit in each state. In hand-written form
 // these are a += and a -= at every site that changes the state, and they drift
 // as soon as one site is missed.
 var gauge = map[recState]int{}
 
+func incr(s recState) func(context.Context) { return func(context.Context) { gauge[s]++ } }
+func decr(s recState) func(context.Context) { return func(context.Context) { gauge[s]-- } }
+
+// Each transition names its source and target in separate calls, so the two
+// states cannot be swapped the way two adjacent arguments can.
 var recordingFSM = fsm.New[recState]("recording").
 	Gauge(recActive, incr(recActive), decr(recActive)).
 	Gauge(recStopped, incr(recStopped), decr(recStopped)).
 	Gauge(recFinished, incr(recFinished), decr(recFinished)).
 	Gauge(recUploaded, incr(recUploaded), decr(recUploaded)).
-	On(recStop, recActive, recStopped, fsm.WithAction(func(_ context.Context, r *recording) error {
-		r.stoppedAt = time.Unix(1700000000, 0).UTC()
-		return nil
-	})).
-	On(recFinish, recStopped, recFinished,
-		fsm.WithGuard("all chunks and tracks uploaded", func(_ context.Context, r *recording) error {
-			if r.inProgressChunks != 0 || r.inProgressTracks != 0 {
-				return fmt.Errorf("%w: %d chunks, %d tracks",
-					errUploadPending, r.inProgressChunks, r.inProgressTracks)
-			}
-			return nil
-		}),
-	).
-	On(recUpload, recFinished, recUploaded).
+	From(recActive).On(evRecStop).To(recStopped, fsm.WithAction(markStopped)).
+	From(recStopped).On(evRecFinish).To(recFinished, fsm.WithGuard("all chunks and tracks uploaded", uploadsSettled)).
+	From(recFinished).On(evRecUpload).To(recUploaded).
 	MustBuild()
-
-func incr(s recState) func(context.Context) { return func(context.Context) { gauge[s]++ } }
-func decr(s recState) func(context.Context) { return func(context.Context) { gauge[s]-- } }
 
 // A recording moves active -> stopped -> finished -> uploaded. The order is
 // declared once; every caller goes through Fire, so no call site can skip a
@@ -82,23 +90,23 @@ func Example_recording() {
 
 	fmt.Println("state:", r.state)
 
-	if err := recordingFSM.Fire(ctx, &r.state, recStop, r); err != nil {
+	if err := recordingFSM.Fire(ctx, &r.state, evRecStop, r); err != nil {
 		fmt.Println("unexpected:", err)
 	}
 	fmt.Println("after stop:", r.state, "at", r.stoppedAt.Format(time.RFC3339))
 
 	// Finishing early is refused by the guard, and the state does not move.
-	err := recordingFSM.Fire(ctx, &r.state, recFinish, r)
+	err := recordingFSM.Fire(ctx, &r.state, evRecFinish, r)
 	if ge, ok := errors.AsType[*fsm.GuardError[recState]](err); ok {
 		fmt.Printf("finish refused by %q: %v\n", ge.Guard, ge.Err)
 		fmt.Println("is upload pending?", errors.Is(err, errUploadPending), "| state still", r.state)
 	}
 
 	r.inProgressChunks = 0
-	if err := recordingFSM.Fire(ctx, &r.state, recFinish, r); err != nil {
+	if err := recordingFSM.Fire(ctx, &r.state, evRecFinish, r); err != nil {
 		fmt.Println("unexpected:", err)
 	}
-	if err := recordingFSM.Send(ctx, &r.state, recUpload); err != nil {
+	if err := recordingFSM.Send(ctx, &r.state, evRecUpload); err != nil {
 		fmt.Println("unexpected:", err)
 	}
 	fmt.Println("final:", r.state)
@@ -135,44 +143,44 @@ type disconnect struct {
 }
 
 var (
-	pcpDrop      = fsm.Define[disconnect]("disconnect")
-	pcpReconnect = fsm.Signal("reconnect")
-	pcpKick      = fsm.Define[disconnect]("kick")
+	evPcpDrop      = fsm.Define[disconnect]("disconnect")
+	evPcpReconnect = fsm.Signal("reconnect")
+	evPcpKick      = fsm.Define[disconnect]("kick")
 )
+
+func unintentional(_ context.Context, d disconnect) error {
+	if d.intentional {
+		return fmt.Errorf("intentional disconnect (%s) must be a kick, not a drop", d.reason)
+	}
+	return nil
+}
 
 // Modelling a participant makes deletion an explicit terminal state rather
 // than "absent from the map", so the last transition is expressible and can
 // carry a reason.
 var participantFSM = fsm.New[pcpState]("participant").
-	On(pcpDrop, pcpConnected, pcpReconnecting,
-		fsm.WithGuard("disconnect was not intentional", func(_ context.Context, d disconnect) error {
-			if d.intentional {
-				return fmt.Errorf("intentional disconnect (%s) must be a kick, not a drop", d.reason)
-			}
-			return nil
-		}),
-	).
-	On(pcpReconnect, pcpReconnecting, pcpConnected).
-	On(pcpKick, pcpConnected, pcpDeleted).
-	On(pcpKick, pcpReconnecting, pcpDeleted).
+	From(pcpConnected).On(evPcpDrop).To(pcpReconnecting, fsm.WithGuard("disconnect was not intentional", unintentional)).
+	From(pcpReconnecting).On(evPcpReconnect).To(pcpConnected).
+	From(pcpConnected).On(evPcpKick).To(pcpDeleted).
+	From(pcpReconnecting).On(evPcpKick).To(pcpDeleted).
 	MustBuild()
 
 func Example_participant() {
 	ctx := context.Background()
 	st := pcpConnected
 
-	_ = participantFSM.Fire(ctx, &st, pcpDrop, disconnect{reason: "ice failed"})
+	_ = participantFSM.Fire(ctx, &st, evPcpDrop, disconnect{reason: "ice failed"})
 	fmt.Println("after drop:", st)
 
-	_ = participantFSM.Send(ctx, &st, pcpReconnect)
+	_ = participantFSM.Send(ctx, &st, evPcpReconnect)
 	fmt.Println("after reconnect:", st)
 
-	_ = participantFSM.Fire(ctx, &st, pcpKick, disconnect{intentional: true, reason: "left the call"})
+	_ = participantFSM.Fire(ctx, &st, evPcpKick, disconnect{intentional: true, reason: "left the call"})
 	fmt.Println("after kick:", st)
 
 	// Nothing leaves a terminal state, so a kicked participant cannot be
 	// resurrected by a late event arriving out of order.
-	err := participantFSM.Send(ctx, &st, pcpReconnect)
+	err := participantFSM.Send(ctx, &st, evPcpReconnect)
 	fmt.Println("late reconnect:", err)
 	fmt.Println("terminals:", participantFSM.Terminals())
 

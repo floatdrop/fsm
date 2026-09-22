@@ -1,6 +1,6 @@
 # fsm
 
-A small finite state machine for Go, built around two ideas: **the caller owns the state**, and **events carry typed payloads**.
+A small finite state machine for Go, built around three ideas: **the caller owns the state**, **events carry typed payloads**, and **a transition names its source and target separately** so they cannot be swapped.
 
 Requires **Go 1.27** — the API uses generic methods, which earlier versions reject with `method must have no type parameters`.
 
@@ -14,32 +14,25 @@ const (
     recUploaded
 )
 
+// Events are prefixed ev so they never read as states: "stop" and "stopped"
+// are one tense apart, which is not a difference worth relying on.
 var (
-    recStop   = fsm.Define[*recording]("stop")
-    recFinish = fsm.Define[*recording]("finish")
-    recUpload = fsm.Signal("uploaded")
+    evRecStop   = fsm.Define[*recording]("stop")
+    evRecFinish = fsm.Define[*recording]("finish")
+    evRecUpload = fsm.Signal("uploaded")
 )
 
 var recordingFSM = fsm.New[recState]("recording").
     Gauge(recActive, metrics.Inc(recActive), metrics.Dec(recActive)).
     Gauge(recStopped, metrics.Inc(recStopped), metrics.Dec(recStopped)).
-    On(recStop, recActive, recStopped, fsm.WithAction(func(_ context.Context, r *recording) error {
-        r.stoppedAt = time.Now()
-        return nil
-    })).
-    On(recFinish, recStopped, recFinished,
-        fsm.WithGuard("all chunks and tracks uploaded", func(_ context.Context, r *recording) error {
-            if r.inProgressChunks != 0 || r.inProgressTracks != 0 {
-                return fmt.Errorf("%w: %d chunks", ErrUploadPending, r.inProgressChunks)
-            }
-            return nil
-        }),
-    ).
-    On(recUpload, recFinished, recUploaded).
+    From(recActive).On(evRecStop).To(recStopped, fsm.WithAction(markStopped)).
+    From(recStopped).On(evRecFinish).To(recFinished,
+        fsm.WithGuard("all chunks and tracks uploaded", uploadsSettled)).
+    From(recFinished).On(evRecUpload).To(recUploaded).
     MustBuild()
 
 // The state lives in your struct. Fire mutates it in place.
-err := recordingFSM.Fire(ctx, &r.state, recStop, r)
+err := recordingFSM.Fire(ctx, &r.state, evRecStop, r)
 ```
 
 ## Design
@@ -49,18 +42,28 @@ err := recordingFSM.Fire(ctx, &r.state, recStop, r)
 **Events carry typed payloads.** `fsm.Define[*recording]("finish")` can only be fired with a `*recording`, and its guards and actions only ever see a `*recording`. There is no `...any` in the public API and no type assertions in user code:
 
 ```go
-m.Fire(ctx, &st, recFinish, "nope")
+m.Fire(ctx, &st, evRecFinish, "nope")
 // compile error: cannot use "nope" (untyped string constant) as *recording value
 ```
 
 This is what generic methods buy. `Fire[A any](ctx, *S, Event[A], A)` is a method on `Machine[S]`, which knows nothing about `A` — before Go 1.27 this had to be a package-level `fsm.Fire(m, ctx, &st, ev, arg)`, or `A` had to be erased to `any` and checked at runtime.
+
+**A transition names its source and target in separate calls.** `From(a).On(ev).To(b)` rather than `On(ev, a, b)`. Two adjacent parameters of the same state type are indistinguishable to the compiler and to a reader, and swapping them silently reverses the edge. Splitting them into three calls means there is nothing to swap:
+
+```go
+From(recStopped).On(evRecFinish).To(recFinished)
+```
+
+The chain is also what carries the payload type: `From` knows `S`, `On[A]` picks up `A` from the event, and `To` takes options that must match it. A `WithGuard` written for the wrong payload is a compile error at the point it is declared.
+
+**States and events are named so they cannot be confused.** Events take an `ev` prefix; states take the plain domain prefix. Without that rule a machine ends up with `recStop` the event next to `recStopped` the state, and `pcpReconnect` next to `pcpReconnecting` — one tense apart, which is not a difference worth relying on when reading a transition table.
 
 **Nothing panics at fire time.** Configuration mistakes come back from `Build`; unknown transitions come back from `Fire` as `*NoTransitionError`. `MustBuild` panics, but only at construction, so a bad definition fails at process start. This matters when a machine is driven by a replicated log: a panic on a malformed event takes down every replica replaying it, not just one.
 
 **Guards reject with an error, not a bool.** A refusal usually has a reason the caller needs to act on — retry later, or give up. The guard's error is wrapped in a `*GuardError[S]`, which unwraps to it, so both the structure and the reason are available:
 
 ```go
-err := recordingFSM.Fire(ctx, &r.state, recFinish, r)
+err := recordingFSM.Fire(ctx, &r.state, evRecFinish, r)
 
 errors.Is(err, ErrUploadPending)   // the guard's own reason — retry later
 
