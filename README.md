@@ -8,9 +8,9 @@
 [![Go Reference](https://pkg.go.dev/badge/github.com/floatdrop/fsm.svg)](https://pkg.go.dev/github.com/floatdrop/fsm)
 [![License](https://img.shields.io/github/license/floatdrop/fsm)](LICENSE)
 
-A small finite state machine for Go, built around three ideas: **the caller owns the state**, **events carry typed payloads**, and **a machine is a set of rules** whose source and target are named separately so they cannot be swapped.
+A small finite state machine for Go. The caller owns the state, events carry typed payloads, and a machine is a set of rules whose source and target are named in separate calls so they cannot be swapped.
 
-Requires **Go 1.27** — the API uses generic methods, which earlier versions reject with `method must have no type parameters`.
+Requires Go 1.27. The API uses generic methods, which earlier versions reject with `method must have no type parameters`.
 
 ```go
 type recState int32
@@ -22,8 +22,7 @@ const (
     recUploaded
 )
 
-// Events are prefixed ev so they never read as states: "stop" and "stopped"
-// are one tense apart, which is not a difference worth relying on.
+// Events are prefixed ev so an event and a state never differ by tense alone.
 var (
     evRecStop   = fsm.Define[*recording]("stop")
     evRecFinish = fsm.Define[*recording]("finish")
@@ -44,28 +43,28 @@ var recordingFSM = fsm.MustNew("recording",
 err := recordingFSM.Fire(ctx, &r.state, evRecStop, r)
 ```
 
-Firing an event the current state does not accept is an error, not a panic, and leaves the state untouched:
+An event the current state does not accept returns an error, never panics, and leaves the state untouched:
 
 ```go
 err := recordingFSM.Send(ctx, &r.state, evRecUpload)
 // fsm recording: no transition from active on uploaded
 ```
 
-**Why the API is shaped this way** — state ownership, typed payloads, `Rule` as the single option type, guard semantics, and the known limitations — is in [docs/DESIGN.md](docs/DESIGN.md).
+The reasoning behind the API (state ownership, typed payloads, `Rule` as the single option type, guard semantics, known limitations) is in [docs/DESIGN.md](docs/DESIGN.md).
 
 ## Shared transitions
 
-`FromEach` declares one transition per source. It is a fan-in shorthand and nothing else:
+`FromEach` declares the same transition from several sources:
 
 ```go
 fsm.FromEach(pcpConnected, pcpReconnecting).On(evPcpKick).To(pcpDeleted)
 ```
 
-The sources are enumerated here and the machine learns nothing that relates them. When they really are related, name the set instead.
+The machine records one edge per source and nothing that relates them. When the sources are related, use a group.
 
 ## Groups
 
-`NewGroup` names a set of states, and the machine keeps the name. One transition declared against the group belongs to every member:
+`NewGroup` names a set of states. A transition declared on the group applies to every member:
 
 ```go
 type pcpState int32
@@ -91,26 +90,26 @@ var participantFSM = fsm.MustNew("participant",
         Guard("disconnect was not intentional", unintentional),
     fsm.From(pcpReconnecting).On(evPcpReconnect).To(pcpConnected),
 
-    // One rule for every live state. A third live state would inherit it.
+    // One rule for every live state, including any added later.
     fsm.FromGroup(pcpLive).On(evPcpKick).To(pcpDeleted),
 )
 ```
 
-The group is a cluster in the diagram, and `kick` leaves the cluster itself rather than any one state inside it:
+In the diagram the group is a cluster, and `kick` leaves the cluster rather than any one state inside it:
 
 <p align="center">
   <img src="docs/assets/participant.svg" alt="connected and reconnecting inside a cluster labelled live, with kick leaving the cluster boundary for deleted" width="560">
 </p>
 
-**A member that declares the event itself wins**, and the group still covers the rest:
+A member that declares the event itself overrides the group rule. The other members keep the inherited one:
 
 ```go
 fsm.From(pcpReconnecting).On(evPcpKick).To(pcpAbandoned) // overrides the group
 ```
 
-That override is the difference from `FromEach`. Enumerating sources at each transition means there is nothing to override and a new member silently inherits nothing — and nothing tells you which sites you forgot to update.
+This override is what `FromEach` cannot do. With enumerated sources there is nothing to override, and a state added later has to be added to every `FromEach` call by hand.
 
-A group is *not* a state: it never appears in `States()`, a `*S` never holds one, and it expands to ordinary rows before `New` returns, so `Fire` neither knows about groups nor pays for them. Each row remembers where it came from:
+A group is not a state. It never appears in `States()`, a `*S` never holds one, and it expands into ordinary rows before `New` returns, so `Fire` does not know about groups and pays nothing for them. Each expanded row records its group:
 
 ```go
 for _, e := range participantFSM.Edges() {
@@ -124,28 +123,28 @@ for _, e := range participantFSM.Edges() {
 
 `New` rejects a member that is not a state of the machine, two groups claiming one event for the same state, a group transition every member overrides, a repeated member, and a name reused for a different set of members.
 
-Groups are most of what substates are used for and deliberately not all of it: no group hooks or `Gauge`, no nesting, no initial member. [docs/DESIGN.md](docs/DESIGN.md#groups-are-a-build-time-expansion) has the reasoning.
+Groups cover most of what substates are used for, but not all of it: there are no group hooks or `Gauge`, no nesting, and no initial member. The reasons are in [docs/DESIGN.md](docs/DESIGN.md#groups-are-a-build-time-expansion).
 
 ## Introspection
 
-A machine can describe its own shape. `States`, `Edges`, `Terminals` and `Unreachable` report in declaration order — never map order — so they are stable enough to assert on:
+`States`, `Edges`, `Terminals` and `Unreachable` report the machine's shape in declaration order, so tests can assert on them:
 
 ```go
 func TestRecordingShape(t *testing.T) {
-    // Exactly one state should be a dead end.
+    // Only uploaded is a dead end.
     if got := recordingFSM.Terminals(); len(got) != 1 || got[0] != recUploaded {
         t.Errorf("terminals %v, want [uploaded]", got)
     }
-    // Every state should be reachable from the initial one.
+    // Every state is reachable from active.
     if got := recordingFSM.Unreachable(recActive); len(got) != 0 {
         t.Errorf("unreachable states: %v", got)
     }
 }
 ```
 
-An unintended terminal state is a state something can get stuck in, and an unreachable state is a transition someone forgot to wire — both are worth a test rather than a re-read.
+An unintended terminal state is somewhere a value can get stuck, and an unreachable state usually means a missing transition. Both are cheap to test.
 
-`Edges` returns the transition table itself, including each guard's description:
+`Edges` returns the transition table, including guard descriptions:
 
 ```go
 for _, e := range recordingFSM.Edges() {
@@ -156,11 +155,11 @@ for _, e := range recordingFSM.Edges() {
 // finished --uploaded--> uploaded
 ```
 
-`Edge.Event` is the trigger's name, for display. Two events can share a name, so use `e.Is(evRecStop)` to identify one.
+`Edge.Event` is the trigger's name and is meant for display. Names are not unique, so identify a trigger with `e.Is(evRecStop)`.
 
 ### DOT
 
-`DOT()` renders the machine as a Graphviz digraph, with terminal states drawn as double circles and guards on the edge labels:
+`DOT` renders the machine as a Graphviz digraph. Terminal states are double circles and guards appear in edge labels:
 
 ```go
 fmt.Print(recordingFSM.DOT())
@@ -179,17 +178,15 @@ digraph "recording" {
 }
 ```
 
-Piped through Graphviz, that is:
+```sh
+go run ./yourcmd | dot -Tsvg -o machine.svg
+```
 
 <p align="center">
   <img src="docs/assets/recording.svg" alt="active to stopped on stop, stopped to finished on finish guarded by all chunks and tracks uploaded, finished to uploaded" width="720">
 </p>
 
-```sh
-go run ./yourcmd | dot -Tsvg -o machine.svg
-```
-
-A [group](#groups) becomes a `subgraph cluster_…`, and a transition the whole group inherited becomes one arrow out of it instead of one per member:
+A [group](#groups) becomes a cluster, and a transition every member inherited is drawn once from the cluster boundary:
 
 ```dot
 compound=true;
@@ -202,13 +199,13 @@ subgraph "cluster_live" {
 "connected" -> "deleted" [label="kick", ltail="cluster_live"];
 ```
 
-Per-member arrows are drawn instead wherever one boundary arrow would be a lie: a member that overrides the event, a group overlapping another so it cannot hold all its members in one cluster, or a target that is itself a member.
+Per-member arrows are used when a boundary arrow would be wrong: a member overrides the event, the group overlaps another and cannot hold all its members in one cluster, or the target is itself a member.
 
-Output is deterministic — states, edges and groups are emitted in declaration order, never map order — so the DOT can be committed next to the code and reviewed in a diff when the machine changes.
+Output follows declaration order, so the DOT can be committed next to the code and diffed when the machine changes.
 
 ## Benchmark
 
-`Fire` does not allocate. Guards and actions are combined at construction, where the payload type is still known, and stored as a concrete `func(context.Context, A) error`; `Fire` asserts to that type and calls it with the payload directly, so nothing is boxed.
+`Fire` does not allocate. Guards and actions are combined at construction, where the payload type is known, and stored as a concrete `func(context.Context, A) error`. `Fire` asserts back to that type and passes the payload directly, so nothing is boxed.
 
 ```sh
 go test -bench Fire -benchmem -run '^$' ./...
@@ -222,12 +219,12 @@ BenchmarkFire-12             35204294    33.74 ns/op    0 B/op    0 allocs/op
 BenchmarkFireWithHooks-12    17826518    67.18 ns/op    0 B/op    0 allocs/op
 ```
 
-One iteration is a round trip of two fires, one of them carrying an action, so a single `Fire` is roughly 17 ns. `FireWithHooks` is the same round trip on a machine declaring an entry hook, an exit hook and both payload hooks — that is what hooks cost, and a machine that declares none does not pay it: one flag checked at the top of `Fire` skips the hook block entirely.
+One iteration is a round trip of two fires, one with an action, so a single `Fire` is about 17 ns. `BenchmarkFireWithHooks` runs the same round trip on a machine with an entry hook, an exit hook and both payload hooks. A machine that declares no hooks skips the hook block on one flag check and pays none of that.
 
-The zero is the part that matters and is pinned by `TestFireDoesNotAllocate`; it runs without `-race`, which changes the allocation profile.
+`TestFireDoesNotAllocate` pins the zero allocations. It runs without `-race`, which changes the allocation profile.
 
-Single runs vary by around 10%, so re-measure with `-count=6` before quoting a different number.
+Single runs vary by about 10%. Re-measure with `-count=6` before updating these numbers.
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+MIT, see [LICENSE](LICENSE).
