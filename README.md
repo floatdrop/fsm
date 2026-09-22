@@ -53,6 +53,41 @@ err := recordingFSM.Send(ctx, &r.state, evRecUpload)
 
 **Why the API is shaped this way** — state ownership, typed payloads, `Rule` as the single option type, guard semantics, and the known limitations — is in [docs/DESIGN.md](docs/DESIGN.md).
 
+## Shared transitions
+
+Several states often accept an event the same way. `FromEach` declares that fan-in once:
+
+```go
+fsm.FromEach(pcpConnected, pcpReconnecting).On(evPcpKick).To(pcpDeleted)
+```
+
+It is a shorthand and nothing more — the sources are enumerated here, and the machine learns nothing that relates them. When they *are* related, name the set:
+
+```go
+var pcpLive = fsm.NewGroup("live", pcpConnected, pcpReconnecting)
+
+fsm.FromGroup(pcpLive).On(evPcpKick).To(pcpDeleted)        // both members
+fsm.From(pcpReconnecting).On(evPcpKick).To(pcpAbandoned)   // this one differs
+```
+
+A `Group` transition applies to every member that does not declare the event itself, so a member can specialise one and a new member inherits the rest — which is the difference that matters. With `FromEach` you would have to find and edit every site that enumerated the old set, and nothing would tell you that you had missed one.
+
+A group is *not* a state. It never appears in `States()`, a `*S` never holds one, and it expands to ordinary rows in the transition table before `New` returns — so `Fire` neither knows about groups nor pays for them. Each row remembers where it came from:
+
+```go
+for _, e := range participantFSM.Edges() {
+    if e.Group != "" {
+        fmt.Printf("%v --%s--> %v inherited from %q\n", e.From, e.Event, e.To, e.Group)
+    }
+}
+// connected --kick--> deleted inherited from "live"
+// reconnecting --kick--> deleted inherited from "live"
+```
+
+`New` reports the mistakes this makes possible: a member that is not a state of the machine, two groups claiming the same event for one state, a group transition every member overrides, and a name reused for a different set of members.
+
+This is most of what substates are used for, and deliberately not all of it. Groups have no entry/exit hooks and no `Gauge`, because the reason to want those is the one thing a flat expansion cannot reproduce — in a real hierarchy, moving between two substates of the same superstate does not run the superstate's hooks. Groups also do not nest, and entering one does not select an initial member. See [docs/DESIGN.md](docs/DESIGN.md#groups-are-a-build-time-expansion).
+
 ## Introspection
 
 A machine can describe its own shape. `States`, `Edges`, `Terminals` and `Unreachable` report in declaration order — never map order — so they are stable enough to assert on:
@@ -82,6 +117,8 @@ for _, e := range recordingFSM.Edges() {
 // stopped --finish--> finished  all chunks and tracks uploaded
 // finished --uploaded--> uploaded
 ```
+
+`Edge.Event` is the trigger's name, for display. Two events can share a name, so use `e.Is(evRecStop)` to identify one.
 
 ### DOT
 
@@ -114,7 +151,28 @@ Piped through Graphviz, that is:
 go run ./yourcmd | dot -Tsvg -o machine.svg
 ```
 
-Output is deterministic — states and edges are emitted in declaration order, never map order — so the DOT can be committed next to the code and reviewed in a diff when the machine changes.
+A `Group` is drawn as a cluster, and a transition every member inherited becomes *one* arrow from the cluster boundary rather than one per member:
+
+```dot
+digraph "participant" {
+	rankdir=LR;
+	compound=true;
+	subgraph "cluster_live" {
+		label="live";
+		style=rounded;
+		"connected" [shape=box];
+		"reconnecting" [shape=box];
+	}
+	"deleted" [shape=doublecircle];
+	"connected" -> "reconnecting" [label="disconnect\n[disconnect was not intentional]"];
+	"reconnecting" -> "connected" [label="reconnect"];
+	"connected" -> "deleted" [label="kick", ltail="cluster_live"];
+}
+```
+
+The arrows are drawn per member instead whenever a single boundary arrow would be a lie: a member that overrides the event, a group that overlaps another and so cannot hold all its members in one cluster, or a target that is itself a member.
+
+Output is deterministic — states, edges and groups are emitted in declaration order, never map order — so the DOT can be committed next to the code and reviewed in a diff when the machine changes.
 
 ## Benchmark
 

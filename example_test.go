@@ -158,6 +158,12 @@ func unintentional(_ context.Context, d disconnect) error {
 	return nil
 }
 
+// A participant is kicked the same way whether it is connected or
+// reconnecting. Naming the two as a group says that once: a third live state
+// inherits the kick instead of needing the rule copied, and the group is still
+// the place to look for what "live" means.
+var pcpLive = fsm.NewGroup("live", pcpConnected, pcpReconnecting)
+
 // Modelling a participant makes deletion an explicit terminal state rather
 // than "absent from the map", so the last transition is expressible and can
 // carry a reason.
@@ -165,8 +171,7 @@ var participantFSM = fsm.MustNew("participant",
 	fsm.From(pcpConnected).On(evPcpDrop).To(pcpReconnecting).
 		Guard("disconnect was not intentional", unintentional),
 	fsm.From(pcpReconnecting).On(evPcpReconnect).To(pcpConnected),
-	fsm.From(pcpConnected).On(evPcpKick).To(pcpDeleted),
-	fsm.From(pcpReconnecting).On(evPcpKick).To(pcpDeleted),
+	fsm.FromGroup(pcpLive).On(evPcpKick).To(pcpDeleted),
 )
 
 func Example_participant() {
@@ -188,12 +193,47 @@ func Example_participant() {
 	fmt.Println("late reconnect:", err)
 	fmt.Println("terminals:", participantFSM.Terminals())
 
+	// A group is a build-time grouping, so the kick is two ordinary rows in
+	// the table — but each remembers where it came from.
+	for _, e := range participantFSM.Edges() {
+		if e.Group != "" {
+			fmt.Printf("%v --%s--> %v inherited from %q\n", e.From, e.Event, e.To, e.Group)
+		}
+	}
+	fmt.Println("is reconnecting live?", pcpLive.Has(pcpReconnecting))
+
 	// Output:
 	// after drop: reconnecting
 	// after reconnect: connected
 	// after kick: deleted
 	// late reconnect: fsm participant: no transition from deleted on reconnect
 	// terminals: [deleted]
+	// connected --kick--> deleted inherited from "live"
+	// reconnecting --kick--> deleted inherited from "live"
+	// is reconnecting live? true
+}
+
+// A group is drawn as a cluster, and a transition every member inherited is
+// drawn once from the cluster boundary rather than once per member — which is
+// the whole visual point of grouping the states in the first place.
+func ExampleMachine_DOT_group() {
+	fmt.Print(participantFSM.DOT())
+
+	// Output:
+	// digraph "participant" {
+	// 	rankdir=LR;
+	// 	compound=true;
+	// 	subgraph "cluster_live" {
+	// 		label="live";
+	// 		style=rounded;
+	// 		"connected" [shape=box];
+	// 		"reconnecting" [shape=box];
+	// 	}
+	// 	"deleted" [shape=doublecircle];
+	// 	"connected" -> "reconnecting" [label="disconnect\n[disconnect was not intentional]"];
+	// 	"reconnecting" -> "connected" [label="reconnect"];
+	// 	"connected" -> "deleted" [label="kick", ltail="cluster_live"];
+	// }
 }
 
 // DOT output is stable across runs, so it can be committed next to the code

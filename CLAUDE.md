@@ -10,11 +10,11 @@ together.
 
 Library: `fsm.go` (package doc, `Event`, `Machine`, `Fire`, `Send`, `Check`,
 `Can`, `To`, the error types), `rules.go` (`New`/`MustNew`, the `Rule`
-interface and everything that produces one — the `From`/`On`/`To` chain with
-its `Guard`/`Action` methods, plus `Gauge`, `OnEnter`, `OnExit`),
-`introspect.go` (`States`,
-`Edges`, `Terminals`, `Unreachable`, `DOT`). Tests are `fsm_test.go` and the
-worked machines in `example_test.go`.
+interface and everything that produces one — the `From`/`FromEach`/`FromGroup`
+chain through `On`/`To` with its `Guard`/`Action` methods, plus `Group`,
+`Gauge`, `OnEnter`, `OnExit`), `introspect.go` (`States`,
+`Edges`, `Groups`, `Terminals`, `Unreachable`, `DOT`). Tests are `fsm_test.go`
+and the worked machines in `example_test.go`.
 
 ## Working rules
 
@@ -89,6 +89,74 @@ cannot fail, so an increment and its decrement cannot come apart. Changing this
 order breaks `TestHooksBracketTheAssignment` and `TestGaugeStaysPaired`, which
 is the point of both.
 
+**`builder` has two deferred phases, and the order is load-bearing.**
+`b.expand` runs group transitions, which *add* edges; `b.deferred` runs the
+rules that *read* the finished table, currently `GaugeWith`. Expansion must go
+first or a gauge silently misses every edge a group contributed
+(`TestGaugeWithSeesGroupInheritedEdges`). They cannot be one slice: `New`
+ranges over it, and Go evaluates a range expression once, so work appended
+during the loop is never visited. Group member validation sits between the
+first pass and expansion, while `b.seen` still holds only explicitly declared
+states — that is what makes a mistyped member an error instead of a state
+that quietly gets edges of its own. A group transition's *target* is declared
+eagerly in the first pass for the same reason.
+
+**A group member that declares the event itself overrides the inherited edge,
+and that is the whole point of `Group` over `FromEach`.** Expansion skips such
+a member; it does not report a duplicate. Two *groups* claiming the same
+(state, event) is a different thing and is an error — `b.inherited` records
+which group owns each inherited row so the two cases can be told apart. With
+no nesting there is no specificity rule to fall back on.
+
+**Groups are not states and `Fire` knows nothing about them.** They expand to
+ordinary rows before `New` returns. Do not add group entry/exit hooks or a
+group `Gauge`: the only reason to want them is superstate hook suppression,
+which a flat table cannot express, and a group gauge would dip on an
+intra-group move. `docs/DESIGN.md` has the argument and the sum-the-members
+answer. `TestGroupFireDoesNotAllocate` pins that the expansion produces rows
+indistinguishable from hand-written ones.
+
+**`ToStep.combine` builds the guard/action closures once and every expanded
+row shares them.** This is what keeps the one-directional type erasure intact
+across expansion — the closure is still built where `A` is known, and a nil
+result means "store nothing", since a nil `func` boxed into `any` is not a nil
+interface.
+
+**`row[S]` is a named struct because `register` would otherwise take three
+states and three `any` values positionally.** That is the same argument as
+`From`/`To`: transposable parameters of the same type do not belong in this
+package.
+
+**`DOT` collapses a group edge to the cluster boundary only when all three
+conditions in `collapsible` hold.** `ltail` plus `compound=true` draws one
+arrow from the cluster and skips the sibling rows, so a wrong `yes` does not
+just mislabel — Graphviz drops the `ltail` with a warning and the skipped rows
+vanish from the diagram. The three: every member inherited it (otherwise the
+arrow claims to cover the member that overrode it); the group holds all its
+members in its own cluster (an overlapping group loses members to whichever
+cluster is emitted first, and a cluster cannot be the tail of an edge whose
+tail node is elsewhere); and the target is not itself a member (that is a
+self-loop out of its own cluster, which Graphviz also refuses). Each has a
+regression test, and the outputs were checked against real `dot`.
+
+**The collapse is keyed on `(group, *eventDef)`, never on the event name.**
+Two events can share a name, so counting rows by name merges two group
+transitions and can collapse an arrow that covers neither. `Edge` therefore
+carries an unexported `trigger`, with `Edge.Is` as the accessor, exactly
+mirroring `Transition.Event`/`Transition.trigger`/`Transition.Is`.
+`compound=true` is only emitted when the machine has groups, which keeps the
+existing `ExampleMachine_DOT` output byte-identical.
+
+**A broken group reports one error, not a cascade.** `declareGroup` returns a
+bool and `expandGroup` bails on false, so an unnamed group, an empty one, or
+one listing a member twice does not also get reported as "every member
+overrides it". Same for a member lost to another group: the clash is reported
+and the `inherited == 0` branch is suppressed, because that member did not
+override anything. `TestGroupWithNoMembersReportsOneError` and
+`TestGroupClashDoesNotAlsoReportUnreachable` are the guards. Duplicate members
+are rejected rather than deduplicated — silently accepting them inflates the
+group size so no boundary arrow can ever be drawn.
+
 **`GaugeWith` expands in a second pass and validates payload types.** It is
 declared per state but needs the whole transition table, so it defers through
 `builder.deferred` and runs after every rule has applied — which is why
@@ -104,9 +172,11 @@ hand it. `OnEnterVia`/`OnExitVia` name the event, which fixes `A`; that is the
 only way to get a typed hook, so do not widen `Hook` to carry `any`. They run
 after the plain hooks of the same state.
 
-**`Transition.Event` is a name, for logging; `Transition.Is` is identity.**
-Two events can share a name, so anything branching on the trigger uses `Is`.
-Do not add logic keyed on the string.
+**`Transition.Event` and `Edge.Event` are names, for display; `.Is` is
+identity.** Two events can share a name, so anything branching on the trigger
+uses `Is`. Do not add logic keyed on the string — this package broke that rule
+once already, in `DOT`'s group-edge collapse, and produced an arrow that
+described a machine nobody had declared.
 
 **A machine with no hooks must not pay for hooks.** `Machine.hasHooks` is set
 at construction and short-circuits the whole block in `Fire`, including the
@@ -150,10 +220,11 @@ committed-and-diffable only as long as that holds.
   reader scanning a transition table cannot be asked to tell those apart.
 - **A transition is declared as `fsm.From(a).On(ev).To(b)`**, never as one
   call taking both states. Two adjacent parameters of the same state type are
-  indistinguishable and a swap silently reverses the edge. If a shorthand for
-  bulk declarations is ever added, it must keep the roles distinguishable in
-  the same way — a `[]Edge{{From: …, To: …}}` literal qualifies, a positional
-  pair does not.
+  indistinguishable and a swap silently reverses the edge. Bulk sources are
+  `FromEach(a, b, c)` and not `From(s S, more ...S)`, which keeps that rule:
+  sources live in one call, the target in another. The variadic form is also
+  unusable in practice — Go rejects `From(xs...)` when a fixed parameter
+  precedes the variadic one, so a computed source set could not be spread.
 - **Inline multi-line guards and actions are fine now.** They format correctly
   inside `New`'s argument list; it was the old method chain that made `gofmt`
   dedent them. Named callbacks in `example_test.go` (`markStopped`,
