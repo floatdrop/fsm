@@ -55,24 +55,62 @@ err := recordingFSM.Send(ctx, &r.state, evRecUpload)
 
 ## Shared transitions
 
-Several states often accept an event the same way. `FromEach` declares that fan-in once:
+`FromEach` declares one transition per source. It is a fan-in shorthand and nothing else:
 
 ```go
 fsm.FromEach(pcpConnected, pcpReconnecting).On(evPcpKick).To(pcpDeleted)
 ```
 
-It is a shorthand and nothing more — the sources are enumerated here, and the machine learns nothing that relates them. When they *are* related, name the set:
+The sources are enumerated here and the machine learns nothing that relates them. When they really are related, name the set instead.
+
+## Groups
+
+`NewGroup` names a set of states, and the machine keeps the name. One transition declared against the group belongs to every member:
 
 ```go
+type pcpState int32
+
+const (
+    pcpConnected pcpState = iota
+    pcpReconnecting
+    pcpDeleted
+)
+
+// A disconnect carries whether it was intentional, and why.
+var (
+    evPcpDrop      = fsm.Define[disconnect]("disconnect")
+    evPcpReconnect = fsm.Signal("reconnect")
+    evPcpKick      = fsm.Define[disconnect]("kick")
+)
+
+// Connected and reconnecting are both live, and both are kicked the same way.
 var pcpLive = fsm.NewGroup("live", pcpConnected, pcpReconnecting)
 
-fsm.FromGroup(pcpLive).On(evPcpKick).To(pcpDeleted)        // both members
-fsm.From(pcpReconnecting).On(evPcpKick).To(pcpAbandoned)   // this one differs
+var participantFSM = fsm.MustNew("participant",
+    fsm.From(pcpConnected).On(evPcpDrop).To(pcpReconnecting).
+        Guard("disconnect was not intentional", unintentional),
+    fsm.From(pcpReconnecting).On(evPcpReconnect).To(pcpConnected),
+
+    // One rule for every live state. A third live state would inherit it.
+    fsm.FromGroup(pcpLive).On(evPcpKick).To(pcpDeleted),
+)
 ```
 
-A `Group` transition applies to every member that does not declare the event itself, so a member can specialise one and a new member inherits the rest — which is the difference that matters. With `FromEach` you would have to find and edit every site that enumerated the old set, and nothing would tell you that you had missed one.
+The group is a cluster in the diagram, and `kick` leaves the cluster itself rather than any one state inside it:
 
-A group is *not* a state. It never appears in `States()`, a `*S` never holds one, and it expands to ordinary rows in the transition table before `New` returns — so `Fire` neither knows about groups nor pays for them. Each row remembers where it came from:
+<p align="center">
+  <img src="docs/assets/participant.svg" alt="connected and reconnecting inside a cluster labelled live, with kick leaving the cluster boundary for deleted" width="560">
+</p>
+
+**A member that declares the event itself wins**, and the group still covers the rest:
+
+```go
+fsm.From(pcpReconnecting).On(evPcpKick).To(pcpAbandoned) // overrides the group
+```
+
+That override is the difference from `FromEach`. Enumerating sources at each transition means there is nothing to override and a new member silently inherits nothing — and nothing tells you which sites you forgot to update.
+
+A group is *not* a state: it never appears in `States()`, a `*S` never holds one, and it expands to ordinary rows before `New` returns, so `Fire` neither knows about groups nor pays for them. Each row remembers where it came from:
 
 ```go
 for _, e := range participantFSM.Edges() {
@@ -84,9 +122,9 @@ for _, e := range participantFSM.Edges() {
 // reconnecting --kick--> deleted inherited from "live"
 ```
 
-`New` reports the mistakes this makes possible: a member that is not a state of the machine, two groups claiming the same event for one state, a group transition every member overrides, and a name reused for a different set of members.
+`New` rejects a member that is not a state of the machine, two groups claiming one event for the same state, a group transition every member overrides, a repeated member, and a name reused for a different set of members.
 
-This is most of what substates are used for, and deliberately not all of it. Groups have no entry/exit hooks and no `Gauge`, because the reason to want those is the one thing a flat expansion cannot reproduce — in a real hierarchy, moving between two substates of the same superstate does not run the superstate's hooks. Groups also do not nest, and entering one does not select an initial member. See [docs/DESIGN.md](docs/DESIGN.md#groups-are-a-build-time-expansion).
+Groups are most of what substates are used for and deliberately not all of it: no group hooks or `Gauge`, no nesting, no initial member. [docs/DESIGN.md](docs/DESIGN.md#groups-are-a-build-time-expansion) has the reasoning.
 
 ## Introspection
 
@@ -151,26 +189,20 @@ Piped through Graphviz, that is:
 go run ./yourcmd | dot -Tsvg -o machine.svg
 ```
 
-A `Group` is drawn as a cluster, and a transition every member inherited becomes *one* arrow from the cluster boundary rather than one per member:
+A [group](#groups) becomes a `subgraph cluster_…`, and a transition the whole group inherited becomes one arrow out of it instead of one per member:
 
 ```dot
-digraph "participant" {
-	rankdir=LR;
-	compound=true;
-	subgraph "cluster_live" {
-		label="live";
-		style=rounded;
-		"connected" [shape=box];
-		"reconnecting" [shape=box];
-	}
-	"deleted" [shape=doublecircle];
-	"connected" -> "reconnecting" [label="disconnect\n[disconnect was not intentional]"];
-	"reconnecting" -> "connected" [label="reconnect"];
-	"connected" -> "deleted" [label="kick", ltail="cluster_live"];
+compound=true;
+subgraph "cluster_live" {
+	label="live";
+	style=rounded;
+	"connected" [shape=box];
+	"reconnecting" [shape=box];
 }
+"connected" -> "deleted" [label="kick", ltail="cluster_live"];
 ```
 
-The arrows are drawn per member instead whenever a single boundary arrow would be a lie: a member that overrides the event, a group that overlaps another and so cannot hold all its members in one cluster, or a target that is itself a member.
+Per-member arrows are drawn instead wherever one boundary arrow would be a lie: a member that overrides the event, a group overlapping another so it cannot hold all its members in one cluster, or a target that is itself a member.
 
 Output is deterministic — states, edges and groups are emitted in declaration order, never map order — so the DOT can be committed next to the code and reviewed in a diff when the machine changes.
 
