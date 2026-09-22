@@ -11,6 +11,16 @@ field, written to a snapshot, or replayed from a log cannot also live inside a
 machine object, because the two copies drift. A `Machine` is immutable after
 `New` and safe for concurrent use with no lock.
 
+`Fire` returns the `Transition` it made, so a caller that logs or publishes
+the change does not have to read the state before and after.
+
+`Initial` is the one thing about a starting point the machine does record,
+and it is configuration, not state: a machine with an initial state declared
+still holds nothing at fire time. What it buys is a build-time check that
+every state can be reached from the start and that the start has a way out,
+and a marker in the diagram. A machine shared by aggregates that start in
+different states leaves it undeclared.
+
 ## Events carry typed payloads
 
 `fsm.Define[*recording]("finish")` can only be fired with a `*recording`, and
@@ -41,10 +51,11 @@ shared := []fsm.Rule[state]{
 }
 
 short := fsm.MustNew("short", shared...)
-long  := fsm.MustNew("long", slices.Concat(shared, []fsm.Rule[state]{
-    fsm.From(running).On(evFinish).To(done),
-})...)
+long  := fsm.MustNew("long", fsm.Rules(shared...), fsm.From(running).On(evFinish).To(done))
 ```
+
+`Rules` bundles a set into one `Rule`, so a shared set sits beside the rules
+that extend it without splicing slices.
 
 `S` is inferred from the rules, so `fsm.New("recording", …)` needs no explicit
 type argument.
@@ -166,11 +177,20 @@ difference worth relying on when reading a transition table.
 
 ## Nothing panics at fire time
 
-Configuration mistakes come back from `New`; unknown transitions come back from
-`Fire` as `*NoTransitionError`. `MustNew` panics, but only at construction, so a
-bad definition fails at process start. This matters when a machine is driven by
-a replicated log: a panic on a malformed event takes down every replica
-replaying it, not just one.
+Configuration mistakes come back from `New`; fire-time failures come back from
+`Fire` as `*NoTransitionError`, `*GuardError`, `*ActionError` or
+`*StateChangedError`, each carrying the edge it happened on. `MustNew` panics,
+but only at construction, so a bad definition fails at process start. This
+matters when a machine is driven by a replicated log: a panic on a malformed
+event takes down every replica replaying it, not just one.
+
+`StateChangedError` covers the one way user code can reach past the API: the
+payload is usually the aggregate that holds the state, so a guard or action can
+write the field `Fire` is working on. `Fire` reads the state once, and if a
+guard or action changed it, assigns nothing, runs no hook and reports it,
+rather than overwriting the write and running the hooks of an edge that was
+never taken. Writing the target is no exception: a nested fire that landed
+there would otherwise run every hook twice.
 
 ## Guards reject with an error, not a bool
 
@@ -179,7 +199,7 @@ give up. The guard's error is wrapped in a `*GuardError[S]`, which unwraps to
 it, so both the structure and the reason are available:
 
 ```go
-err := recordingFSM.Fire(ctx, &r.state, evRecFinish, r)
+_, err := recordingFSM.Fire(ctx, &r.state, evRecFinish, r)
 
 errors.Is(err, ErrUploadPending)   // the guard's own reason — retry later
 
@@ -203,11 +223,16 @@ that can fail goes in `Action`, which runs *before* the state changes and
 aborts the transition on error. The ordering is fixed:
 
 ```
-lookup → guards → action → exit(from) → *st = to → enter(to)
+lookup → guards → action → exit(from) → *st = to → transition hooks → enter(to)
 ```
 
 If the lookup, a guard, or the action fails, the state is untouched and no hook
-runs.
+runs. `OnTransition` hooks run for every edge, just after the assignment; they
+are where an audit log or a trace goes, instead of one `OnEnter` per state
+that a new state would silently escape. They run before the entry hooks so
+that an entry hook which fires the machine again is logged after the
+transition that caused it, which is also why a transition hook must not fire
+the machine itself: the new state is not yet fully entered.
 
 `Gauge` is that pattern with a name. A counter of "how many things are
 currently in state *s*" is otherwise a `+= 1` and a `-= 1` at every call site
@@ -266,7 +291,7 @@ hook block, including the lookups the plain hooks would do.
 
 ### Branch on the trigger, not on its name
 
-`Transition.Event` is the trigger's name, for logging. Names are not unique —
+`Transition.Event()` is the trigger's name, for logging. Names are not unique —
 two events declared with the same name are different triggers — so a hook that
 needs to know what fired should ask:
 
@@ -305,9 +330,11 @@ boxed. See [Benchmark](../README.md#benchmark).
   hierarchy: no group entry/exit hooks or gauges, no nesting, no initial
   transition into a group, no orthogonal regions.
 - **No built-in async.** No trigger queue, no run-to-completion mode. `Fire` is
-  synchronous and reentrant-unsafe by design: if your state is already
-  serialized behind a queue or a mutex, a second one inside the machine is pure
-  overhead.
+  synchronous: if your state is already serialized behind a queue or a mutex,
+  a second one inside the machine is pure overhead. A nested fire on the same
+  state from a guard or action is caught as `*StateChangedError`, because it
+  leaves the state somewhere the outer transition did not expect. One from an
+  exit hook is not caught: the outer assignment overwrites it.
 - **`S` must be `comparable`.** Integer-backed enums are the intended shape;
   that keeps states usable as protobuf fields.
 - **Guards must be pure.** They are also evaluated by `Check` and `Can`.

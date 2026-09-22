@@ -93,23 +93,23 @@ func Example_recording() {
 
 	fmt.Println("state:", r.state)
 
-	if err := recordingFSM.Fire(ctx, &r.state, evRecStop, r); err != nil {
+	if _, err := recordingFSM.Fire(ctx, &r.state, evRecStop, r); err != nil {
 		fmt.Println("unexpected:", err)
 	}
 	fmt.Println("after stop:", r.state, "at", r.stoppedAt.Format(time.RFC3339))
 
 	// Finishing early is refused by the guard, and the state does not move.
-	err := recordingFSM.Fire(ctx, &r.state, evRecFinish, r)
+	_, err := recordingFSM.Fire(ctx, &r.state, evRecFinish, r)
 	if ge, ok := errors.AsType[*fsm.GuardError[recState]](err); ok {
 		fmt.Printf("finish refused by %q: %v\n", ge.Guard, ge.Err)
 		fmt.Println("is upload pending?", errors.Is(err, errUploadPending), "| state still", r.state)
 	}
 
 	r.inProgressChunks = 0
-	if err := recordingFSM.Fire(ctx, &r.state, evRecFinish, r); err != nil {
+	if _, err := recordingFSM.Fire(ctx, &r.state, evRecFinish, r); err != nil {
 		fmt.Println("unexpected:", err)
 	}
-	if err := recordingFSM.Send(ctx, &r.state, evRecUpload); err != nil {
+	if _, err := recordingFSM.Send(ctx, &r.state, evRecUpload); err != nil {
 		fmt.Println("unexpected:", err)
 	}
 	fmt.Println("final:", r.state)
@@ -178,18 +178,18 @@ func Example_participant() {
 	ctx := context.Background()
 	st := pcpConnected
 
-	_ = participantFSM.Fire(ctx, &st, evPcpDrop, disconnect{reason: "ice failed"})
+	_, _ = participantFSM.Fire(ctx, &st, evPcpDrop, disconnect{reason: "ice failed"})
 	fmt.Println("after drop:", st)
 
-	_ = participantFSM.Send(ctx, &st, evPcpReconnect)
+	_, _ = participantFSM.Send(ctx, &st, evPcpReconnect)
 	fmt.Println("after reconnect:", st)
 
-	_ = participantFSM.Fire(ctx, &st, evPcpKick, disconnect{intentional: true, reason: "left the call"})
+	_, _ = participantFSM.Fire(ctx, &st, evPcpKick, disconnect{intentional: true, reason: "left the call"})
 	fmt.Println("after kick:", st)
 
 	// Nothing leaves a terminal state, so a kicked participant cannot be
 	// resurrected by a late event arriving out of order.
-	err := participantFSM.Send(ctx, &st, evPcpReconnect)
+	_, err := participantFSM.Send(ctx, &st, evPcpReconnect)
 	fmt.Println("late reconnect:", err)
 	fmt.Println("terminals:", participantFSM.Terminals())
 
@@ -197,7 +197,7 @@ func Example_participant() {
 	// the table — but each remembers where it came from.
 	for _, e := range participantFSM.Edges() {
 		if e.Group != "" {
-			fmt.Printf("%v --%s--> %v inherited from %q\n", e.From, e.Event, e.To, e.Group)
+			fmt.Printf("%v --%s--> %v inherited from %q\n", e.From, e.Event(), e.To, e.Group)
 		}
 	}
 	fmt.Println("is reconnecting live?", pcpLive.Has(pcpReconnecting))

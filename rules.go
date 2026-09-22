@@ -13,9 +13,27 @@ import (
 // and shared between machines.
 //
 // Only this package implements Rule. Declare one with [From], [Gauge],
-// [OnEnter] or [OnExit].
+// [OnEnter], [OnExit], [OnTransition], [Initial] or [Rules].
 type Rule[S comparable] interface {
 	applyTo(*builder[S])
+}
+
+// Rules bundles several rules into one, so a set shared between machines can
+// be passed to [New] beside other rules without splicing slices.
+func Rules[S comparable](rules ...Rule[S]) Rule[S] {
+	rules = slices.Clone(rules)
+	return ruleFunc[S](func(b *builder[S]) { b.apply("bundled rule", rules) })
+}
+
+// apply runs each rule, reporting a nil one as "<what> <index> is nil".
+func (b *builder[S]) apply(what string, rules []Rule[S]) {
+	for i, r := range rules {
+		if r == nil {
+			b.errs = append(b.errs, fmt.Errorf("%s %d is nil", what, i))
+			continue
+		}
+		r.applyTo(b)
+	}
 }
 
 // ruleFunc adapts a plain closure to [Rule], for the declarations that need
@@ -89,13 +107,7 @@ func New[S comparable](name string, rules ...Rule[S]) (*Machine[S], error) {
 		groupEdges: make(map[groupEdge]S),
 	}
 
-	for i, r := range rules {
-		if r == nil {
-			b.errs = append(b.errs, fmt.Errorf("rule %d is nil", i))
-			continue
-		}
-		r.applyTo(b)
-	}
+	b.apply("rule", rules)
 
 	// Checked before expansion, while seen holds only explicitly declared
 	// states, so a mistyped member is reported rather than quietly given
@@ -123,7 +135,7 @@ func New[S comparable](name string, rules ...Rule[S]) (*Machine[S], error) {
 		b.errs = append(b.errs, errors.New("no transitions declared"))
 	}
 	b.m.hasHooks = len(b.m.onEnter) > 0 || len(b.m.onExit) > 0 ||
-		len(b.m.onEnterVia) > 0 || len(b.m.onExitVia) > 0
+		len(b.m.onEnterVia) > 0 || len(b.m.onExitVia) > 0 || len(b.m.onAll) > 0
 	if len(b.errs) > 0 {
 		return nil, fmt.Errorf("fsm %s: %w", name, errors.Join(b.errs...))
 	}
@@ -423,8 +435,7 @@ func (b *builder[S]) register(r row[S]) {
 		b.m.actions[e] = r.action
 	}
 	b.m.edges = append(b.m.edges, Edge[S]{
-		From: r.from, To: r.to, Event: r.ev.name, Guard: r.desc, Group: r.group,
-		trigger: r.ev,
+		From: r.from, To: r.to, Guard: r.desc, Group: r.group, trigger: r.ev,
 	})
 }
 
@@ -450,6 +461,59 @@ func OnExit[S comparable](s S, h Hook[S]) Rule[S] {
 		}
 		b.m.onExit[s] = append(b.m.onExit[s], h)
 		b.declare(s)
+	})
+}
+
+// OnTransition declares a hook that runs after every transition, just after
+// the assignment and before the entry hooks of the new state, so an entry
+// hook that fires the machine again is logged after the transition that
+// caused it. It is where an audit log or a trace that must see every change
+// goes, instead of one [OnEnter] per state.
+//
+// A transition hook observes. It must not fire the machine on the same
+// state: the entry hooks of the new state have not run yet, so a nested
+// transition would leave that state before entering it.
+func OnTransition[S comparable](h Hook[S]) Rule[S] {
+	return ruleFunc[S](func(b *builder[S]) {
+		if h == nil {
+			b.errs = append(b.errs, errors.New("nil OnTransition hook"))
+			return
+		}
+		b.m.onAll = append(b.m.onAll, h)
+	})
+}
+
+// Initial declares the state a fresh instance starts in. The machine still
+// holds no state, so nothing changes at fire time; it lets [New] reject a
+// machine in which some state cannot be reached from the start, or whose
+// start has no way out, and lets [Machine.DOT] mark where the machine begins.
+//
+// Entering the initial state is not a transition, so no hook runs for it and
+// the first increment of a [Gauge] is the caller's.
+func Initial[S comparable](s S) Rule[S] {
+	return ruleFunc[S](func(b *builder[S]) {
+		if b.m.hasInitial {
+			b.errs = append(b.errs, fmt.Errorf("initial state declared twice: %v and %v", b.m.initial, s))
+			return
+		}
+		b.m.initial, b.m.hasInitial = s, true
+		b.declare(s)
+
+		b.deferred = append(b.deferred, func(b *builder[S]) {
+			// A definition with mistakes has states that exist only because of
+			// them; reachability is assessed once it builds.
+			if len(b.errs) > 0 || len(b.m.table) == 0 {
+				return
+			}
+			// A dead start makes every other state unreachable; report the cause.
+			if slices.Contains(b.m.Terminals(), s) {
+				b.errs = append(b.errs, fmt.Errorf("initial state %v has no outgoing transition", s))
+				return
+			}
+			if u := b.m.Unreachable(s); len(u) > 0 {
+				b.errs = append(b.errs, fmt.Errorf("states %v cannot be reached from initial state %v", u, s))
+			}
+		})
 	})
 }
 
@@ -670,10 +734,6 @@ type Edge[S comparable] struct {
 	From S
 	To   S
 
-	// Event is the trigger's name, for display. Names are not unique —
-	// compare with [Edge.Is] to identify the trigger.
-	Event string
-
 	Guard string // guard description, empty when unguarded
 
 	// Group names the group this edge was inherited from, and is empty for a
@@ -683,6 +743,15 @@ type Edge[S comparable] struct {
 	Group string
 
 	trigger *eventDef
+}
+
+// Event returns the trigger's name, for display. Names are not unique;
+// compare with [Edge.Is] to identify the trigger.
+func (e Edge[S]) Event() string {
+	if e.trigger == nil {
+		return ""
+	}
+	return e.trigger.name
 }
 
 // Is reports whether ev is the trigger of this edge.

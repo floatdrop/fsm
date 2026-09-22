@@ -9,12 +9,13 @@ that way. This file is the working detail behind it; the two are edited
 together.
 
 Library: `fsm.go` (package doc, `Event`, `Machine`, `Fire`, `Send`, `Check`,
-`Can`, `To`, the error types), `rules.go` (`New`/`MustNew`, the `Rule`
+`Can`, `To`, the four error types), `rules.go` (`New`/`MustNew`, the `Rule`
 interface and everything that produces one — the `From`/`FromEach`/`FromGroup`
-chain through `On`/`To` with its `Guard`/`Action` methods, plus `Group`,
-`Gauge`, `OnEnter`, `OnExit`), `introspect.go` (`States`,
-`Edges`, `Groups`, `Terminals`, `Unreachable`, `DOT`). Tests are `fsm_test.go`
-and the worked machines in `example_test.go`.
+chain through `On`/`To` with its `Guard`/`Action` methods, plus `Rules`,
+`Group`, `Gauge`, `GaugeWith`, `OnEnter`, `OnExit`, `OnEnterVia`, `OnExitVia`,
+`OnTransition`, `Initial`), `introspect.go` (`States`, `Events`, `Edges`,
+`Groups`, `Initial`, `Terminals`, `Unreachable`, `DOT`). Tests are
+`fsm_test.go` and the worked machines in `example_test.go`.
 
 ## Working rules
 
@@ -82,16 +83,41 @@ for the same reason: the combining closure is built where `A` is still known.
 Guards run in registration order and the first rejection wins, reported under
 the description it was declared with.
 
-**The order inside `Fire` is fixed** — lookup, guards, action, `OnExit(from)`,
-assign, `OnEnter(to)`. A failure anywhere before the assignment leaves the
-state untouched and runs no hook, which is what makes `Gauge` safe: hooks
-cannot fail, so an increment and its decrement cannot come apart. Changing this
-order breaks `TestHooksBracketTheAssignment` and `TestGaugeStaysPaired`, which
-is the point of both.
+**The order inside `Fire` is fixed** — lookup, guards, action, the
+state-changed check, `OnExit(from)`, assign, `OnTransition`, `OnEnter(to)`.
+`OnTransition` precedes the entry hooks so an entry hook that fires again is
+logged after its cause (`TestOnTransitionKeepsCausalOrder`); the price is that
+a transition hook is an observer and must not fire, or the new state's exit
+would run before its entry. Do not move it after the entry hooks to lift that
+rule without giving up the ordering.
+A failure anywhere before the assignment leaves the state untouched and runs
+no hook, which is what makes `Gauge` safe: hooks cannot fail, so an increment
+and its decrement cannot come apart. Changing this order breaks
+`TestHooksBracketTheAssignment` and `TestGaugeStaysPaired`, which is the point
+of both. `Fire` reads `*st` once, before any callback: the payload is usually
+the aggregate holding the state, and a guard or action that writes it is
+reported as `*StateChangedError` with nothing assigned. Writing `to` is not
+exempt: a nested fire landing there would run every hook twice. The check
+runs after the guards and again after the action, and always before the exit
+hooks, because after an exit hook has run an error would leave a gauge
+decremented with no assignment (`TestActionWritingTheStateIsAnError`).
+`Fire` returns the `Transition` it
+made. `Transition` holds only the two states and the trigger, and `Event()`
+is a method: an `Event string` field made the result two words wider and cost
+`BenchmarkFire` six nanoseconds a round trip, so do not add fields to it
+without measuring.
+
+**`Initial` is configuration, not state.** It records where a fresh instance
+starts so that `New` can reject an unreachable state or a dead start, and so
+`DOT` can draw the `__start` point. It must not grow into a `Machine.State()`;
+see the first paragraph. The check runs in `b.deferred`, after group
+expansion, so inherited edges count as reachability, and is skipped when the
+definition already has errors, since a mistyped group member is a state that
+exists only because of the mistake (`TestInitialDoesNotReportAMistakeTwice`).
 
 **`builder` has two deferred phases, and the order is load-bearing.**
 `b.expand` runs group transitions, which *add* edges; `b.deferred` runs the
-rules that *read* the finished table, currently `GaugeWith`. Expansion must go
+rules that *read* the finished table, `GaugeWith` and `Initial`. Expansion must go
 first or a gauge silently misses every edge a group contributed
 (`TestGaugeWithSeesGroupInheritedEdges`). They cannot be one slice: `New`
 ranges over it, and Go evaluates a range expression once, so work appended
@@ -143,7 +169,7 @@ regression test, and the outputs were checked against real `dot`.
 Two events can share a name, so counting rows by name merges two group
 transitions and can collapse an arrow that covers neither. `Edge` therefore
 carries an unexported `trigger`, with `Edge.Is` as the accessor, exactly
-mirroring `Transition.Event`/`Transition.trigger`/`Transition.Is`.
+mirroring `Transition.Event()`/`Transition.trigger`/`Transition.Is`.
 `compound=true` is only emitted when the machine has groups, which keeps the
 existing `ExampleMachine_DOT` output byte-identical.
 
@@ -172,9 +198,9 @@ hand it. `OnEnterVia`/`OnExitVia` name the event, which fixes `A`; that is the
 only way to get a typed hook, so do not widen `Hook` to carry `any`. They run
 after the plain hooks of the same state.
 
-**`Transition.Event` and `Edge.Event` are names, for display; `.Is` is
+**`Transition.Event()` and `Edge.Event()` are names, for display; `.Is` is
 identity.** Two events can share a name, so anything branching on the trigger
-uses `Is`. Do not add logic keyed on the string — this package broke that rule
+uses `Is`. `Machine.Events()` is names too, deduplicated, for the same reason. Do not add logic keyed on the string — this package broke that rule
 once already, in `DOT`'s group-edge collapse, and produced an arrow that
 described a machine nobody had declared.
 
@@ -199,12 +225,15 @@ committed-and-diffable only as long as that holds.
 ## Repo conventions
 
 - **Errors, not panics, once the machine is built.** Configuration mistakes come
-  back from `Build`; unknown transitions and rejected guards come back from
-  `Fire` as `*NoTransitionError` / `*GuardError`. `MustNew` panics, but only
-  at construction, so a bad definition fails at process start. The motivating
-  caller drives a machine from a replicated log, where a panic on a malformed
-  event takes down every replica replaying it rather than one host. Do not
-  introduce a panic reachable from `Fire`.
+  back from `New`; fire-time failures come back from `Fire` as
+  `*NoTransitionError`, `*GuardError`, `*ActionError` or `*StateChangedError`,
+  every one carrying the edge. `MustNew` panics, but only at construction, so
+  a bad definition fails at process start. The motivating caller drives a
+  machine from a replicated log, where a panic on a malformed event takes down
+  every replica replaying it rather than one host. Do not introduce a panic
+  reachable from `Fire`. `Event` carries a zero-size `[0]*A` field for that
+  reason: without it two instantiations convert to each other and the
+  concrete-func assertion in `Fire` panics.
 - **`GuardError` unwraps to the guard's error**, so a guard can reject with a
   sentinel the caller matches with `errors.Is`. `Guard`'s `desc` is the
   *static* condition — it labels the edge in `DOT` and names the guard in the

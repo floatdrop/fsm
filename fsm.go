@@ -88,11 +88,16 @@ type Transition[S comparable] struct {
 	From S
 	To   S
 
-	// Event is the trigger's name, for logging. Names are not unique —
-	// compare with [Transition.Is] to identify the trigger.
-	Event string
-
 	trigger *eventDef
+}
+
+// Event returns the trigger's name, for logging. Names are not unique;
+// compare with [Transition.Is] to identify the trigger.
+func (t Transition[S]) Event() string {
+	if t.trigger == nil {
+		return ""
+	}
+	return t.trigger.name
 }
 
 // Is reports whether ev triggered the transition.
@@ -140,9 +145,16 @@ type Machine[S comparable] struct {
 	onEnterVia map[edge[S]][]any
 	onExitVia  map[edge[S]][]any
 
-	// True when any of the four hook maps is non-empty. A machine that
-	// declares no hooks skips building the Transition and looking any up.
+	// Hooks that run after every transition, declared with [OnTransition].
+	onAll []Hook[S]
+
+	// True when any hook is declared. A machine that declares none skips the
+	// hook block and its lookups.
 	hasHooks bool
+
+	// The state declared with [Initial], if any.
+	initial    S
+	hasInitial bool
 
 	// Declaration order, kept so that introspection and DOT output are
 	// deterministic rather than map-iteration order.
@@ -154,24 +166,31 @@ type Machine[S comparable] struct {
 // Name returns the machine's name, used in error messages and DOT output.
 func (m *Machine[S]) Name() string { return m.name }
 
-// Fire applies ev to the state pointed to by st.
+// Fire applies ev to the state pointed to by st and returns the transition
+// it made.
 //
 // The order of operations is: look up the transition, evaluate guards, run the
 // action, run the exit hooks of the old state, assign the new state, run the
-// entry hooks of the new state. If the lookup fails, a guard rejects, or the
-// action returns an error, *st is left untouched and no hook runs.
+// [OnTransition] hooks, then the entry hooks of the new state. If the lookup
+// fails, a guard rejects, or the action returns an error, Fire assigns
+// nothing, runs no hook, and returns the zero Transition.
+//
+// The payload often aliases the state. A guard or action that writes *st, or
+// fires this machine on it, is reported as a [StateChangedError], again with
+// nothing assigned and no hook run. An exit hook that does so is overwritten
+// by the assignment. A transition hook runs between the assignment and the
+// entry hooks and must not fire either, since the new state is not fully
+// entered. Entry hooks run last and may fire.
 //
 // Fire is a generic method: A is inferred from ev, so the payload is checked
 // at compile time.
-//
-// A guard, action or exit hook must not fire this machine on st: the outer
-// assignment overwrites its change. Entry hooks run after it and may.
-func (m *Machine[S]) Fire[A any](ctx context.Context, st *S, ev Event[A], arg A) error {
+func (m *Machine[S]) Fire[A any](ctx context.Context, st *S, ev Event[A], arg A) (Transition[S], error) {
+	var none Transition[S]
 	if st == nil {
-		return fmt.Errorf("fsm %s: nil state pointer", m.name)
+		return none, fmt.Errorf("fsm %s: nil state pointer", m.name)
 	}
 	if ev.def == nil {
-		return fmt.Errorf("fsm %s: fired the zero Event; declare it with fsm.Define or fsm.Signal", m.name)
+		return none, fmt.Errorf("fsm %s: fired the zero Event; declare it with fsm.Define or fsm.Signal", m.name)
 	}
 
 	// Read once: the payload may alias the state, and an action may write it.
@@ -179,30 +198,36 @@ func (m *Machine[S]) Fire[A any](ctx context.Context, st *S, ev Event[A], arg A)
 	e := edge[S]{from: from, ev: ev.def}
 	to, ok := m.table[e]
 	if !ok {
-		return &NoTransitionError[S]{Machine: m.name, From: from, Event: ev.def.name}
+		return none, &NoTransitionError[S]{Machine: m.name, From: from, Event: ev.def.name}
 	}
 
 	// The assertions below are safe by construction: an edge is only ever
 	// registered through On[A] with this same event, so the stored closure's
 	// payload type is exactly A.
 	if raw, ok := m.guards[e]; ok {
-		if desc, err := raw.(func(context.Context, A) (string, error))(ctx, arg); err != nil {
-			return &GuardError[S]{Machine: m.name, From: from, To: to, Event: ev.def.name, Guard: desc, Err: err}
+		desc, err := raw.(func(context.Context, A) (string, error))(ctx, arg)
+		if *st != from {
+			return none, &StateChangedError[S]{Machine: m.name, From: from, To: to, Found: *st, Event: ev.def.name}
+		}
+		if err != nil {
+			return none, &GuardError[S]{Machine: m.name, From: from, To: to, Event: ev.def.name, Guard: desc, Err: err}
 		}
 	}
 
 	if raw, ok := m.actions[e]; ok {
 		if err := raw.(func(context.Context, A) error)(ctx, arg); err != nil {
-			return fmt.Errorf("fsm %s: action for %v --%s--> %v: %w", m.name, from, ev.def.name, to, err)
+			return none, &ActionError[S]{Machine: m.name, From: from, To: to, Event: ev.def.name, Err: err}
+		}
+		if *st != from {
+			return none, &StateChangedError[S]{Machine: m.name, From: from, To: to, Found: *st, Event: ev.def.name}
 		}
 	}
 
+	t := Transition[S]{From: from, To: to, trigger: ev.def}
 	if !m.hasHooks {
 		*st = to
-		return nil
+		return t, nil
 	}
-
-	t := Transition[S]{From: from, To: to, Event: ev.def.name, trigger: ev.def}
 
 	for _, h := range m.onExit[from] {
 		h(ctx, t)
@@ -215,6 +240,11 @@ func (m *Machine[S]) Fire[A any](ctx context.Context, st *S, ev Event[A], arg A)
 
 	*st = to
 
+	// Before the entry hooks, so an entry hook that fires again logs after
+	// this one. That is why a transition hook must not fire itself.
+	for _, h := range m.onAll {
+		h(ctx, t)
+	}
 	for _, h := range m.onEnter[to] {
 		h(ctx, t)
 	}
@@ -223,11 +253,12 @@ func (m *Machine[S]) Fire[A any](ctx context.Context, st *S, ev Event[A], arg A)
 			raw.(func(context.Context, Transition[S], A))(ctx, t, arg)
 		}
 	}
-	return nil
+	return t, nil
 }
 
-// Send fires an event that carries no payload.
-func (m *Machine[S]) Send(ctx context.Context, st *S, ev Event[Unit]) error {
+// Send fires an event that carries no payload. It is [Machine.Fire] with the
+// payload fixed to Unit{}.
+func (m *Machine[S]) Send(ctx context.Context, st *S, ev Event[Unit]) (Transition[S], error) {
 	return m.Fire(ctx, st, ev, Unit{})
 }
 
@@ -309,3 +340,38 @@ func (e *GuardError[S]) Error() string {
 
 // Unwrap returns the error the guard rejected with.
 func (e *GuardError[S]) Unwrap() error { return e.Err }
+
+// ActionError reports a transition whose action failed. The state is
+// untouched and no hook ran.
+//
+// Err is the error the action returned, and ActionError unwraps to it.
+type ActionError[S comparable] struct {
+	Machine string
+	From    S
+	To      S
+	Event   string
+	Err     error
+}
+
+func (e *ActionError[S]) Error() string {
+	return fmt.Sprintf("fsm %s: action for %v --%s--> %v: %v", e.Machine, e.From, e.Event, e.To, e.Err)
+}
+
+// Unwrap returns the error the action failed with.
+func (e *ActionError[S]) Unwrap() error { return e.Err }
+
+// StateChangedError reports that a guard or action wrote the state, which
+// happens when the payload aliases it. The write is left in place; the
+// machine assigns nothing and runs no hook.
+type StateChangedError[S comparable] struct {
+	Machine string
+	From    S // the state the transition started from
+	To      S // the state it was going to
+	Found   S // the state the guard or action left behind
+	Event   string
+}
+
+func (e *StateChangedError[S]) Error() string {
+	return fmt.Sprintf("fsm %s: state changed to %v during %v --%s--> %v",
+		e.Machine, e.Found, e.From, e.Event, e.To)
+}

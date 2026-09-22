@@ -53,20 +53,22 @@ func linear(t *testing.T) *fsm.Machine[state] {
 	return m
 }
 
-// The payload may alias the state, so Fire reads *st once and an action that
-// writes it changes neither the exit hooks nor the reported source.
-func TestFireReadsTheStateOnce(t *testing.T) {
+// The payload may alias the state. An action that writes it is reported,
+// nothing is assigned and no hook runs.
+func TestActionWritingTheStateIsAnError(t *testing.T) {
 	st := running
 	var exited []state
-	clobber := func(context.Context, int) error { st = cancelled; return nil }
+	errBoom := errors.New("boom")
 
 	m, err := fsm.New("job",
 		fsm.OnExit(running, func(_ context.Context, tr fsm.Transition[state]) { exited = append(exited, tr.From) }),
-		fsm.OnExit(cancelled, func(_ context.Context, tr fsm.Transition[state]) { exited = append(exited, tr.From) }),
-		fsm.From(running).On(evFinish).To(done).Action(clobber),
+		fsm.From(running).On(evFinish).To(done).Action(func(context.Context, int) error {
+			st = cancelled
+			return nil
+		}),
 		fsm.From(running).On(evCancel).To(cancelled).Action(func(context.Context, fsm.Unit) error {
 			st = idle
-			return errors.New("boom")
+			return errBoom
 		}),
 	)
 	if err != nil {
@@ -74,17 +76,284 @@ func TestFireReadsTheStateOnce(t *testing.T) {
 	}
 	ctx := t.Context()
 
-	if err := m.Fire(ctx, &st, evFinish, 1); err != nil {
-		t.Fatal(err)
+	_, err = m.Fire(ctx, &st, evFinish, 1)
+	sce, ok := errors.AsType[*fsm.StateChangedError[state]](err)
+	if !ok || sce.From != running || sce.To != done || sce.Found != cancelled {
+		t.Fatalf("got %v, want a StateChangedError for running --finish--> done finding cancelled", err)
 	}
-	if st != done || !slices.Equal(exited, []state{running}) {
-		t.Errorf("state %v, exited %v; want done and [running]", st, exited)
+	if st != cancelled || len(exited) != 0 {
+		t.Errorf("state %v, exited %v; want the action's write kept and no hook run", st, exited)
 	}
 
+	// Writing the target is no exception: a nested fire that lands there would
+	// otherwise run every hook twice.
 	st = running
-	err = m.Send(ctx, &st, evCancel)
-	if err == nil || !strings.Contains(err.Error(), "running --cancel--> cancelled") {
-		t.Errorf("got %v, want the action error to name the original source", err)
+	m2, err := fsm.New("job",
+		fsm.From(running).On(evFinish).To(done).Action(func(context.Context, int) error { st = done; return nil }),
+	)
+	if err != nil {
+		t.Fatalf("build: %v", err)
+	}
+	if _, err := m2.Fire(ctx, &st, evFinish, 1); !errors.As(err, new(*fsm.StateChangedError[state])) {
+		t.Errorf("got %v, want a StateChangedError for a write of the target", err)
+	}
+
+	// A guard that writes the state is reported ahead of its own rejection.
+	st = running
+	m3, err := fsm.New("job",
+		fsm.From(running).On(evFinish).To(done).Guard("never", func(context.Context, int) error {
+			st = idle
+			return errBoom
+		}),
+	)
+	if err != nil {
+		t.Fatalf("build: %v", err)
+	}
+	if _, err := m3.Fire(ctx, &st, evFinish, 1); !strings.Contains(err.Error(), "state changed to idle during running --finish--> done") {
+		t.Errorf("got %v, want the guard's write reported", err)
+	}
+
+	// A failing action is reported as the failure, naming the original source.
+	st = running
+	_, err = m.Send(ctx, &st, evCancel)
+	ae, ok := errors.AsType[*fsm.ActionError[state]](err)
+	if !ok || ae.From != running || ae.To != cancelled || ae.Event != "cancel" {
+		t.Fatalf("got %v, want an ActionError for running --cancel--> cancelled", err)
+	}
+	if !errors.Is(err, errBoom) || !strings.Contains(err.Error(), "running --cancel--> cancelled: boom") {
+		t.Errorf("error %q does not unwrap to the action's error", err)
+	}
+}
+
+func TestFireReturnsTheTransition(t *testing.T) {
+	m := linear(t)
+	ctx := t.Context()
+	st := idle
+
+	tr, err := m.Send(ctx, &st, evStart)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tr.From != idle || tr.To != running || tr.Event() != "start" || !tr.Is(evStart) {
+		t.Errorf("transition %+v, want idle --start--> running", tr)
+	}
+
+	// A refused fire returns the zero Transition.
+	tr, err = m.Send(ctx, &st, evStart)
+	if err == nil || tr != (fsm.Transition[state]{}) {
+		t.Errorf("got %+v, %v; want the zero transition and an error", tr, err)
+	}
+}
+
+func TestOnTransitionRunsAfterEntryHooks(t *testing.T) {
+	var order []string
+	note := func(what string) fsm.Hook[state] {
+		return func(context.Context, fsm.Transition[state]) { order = append(order, what) }
+	}
+	m, err := fsm.New("job",
+		fsm.OnTransition(func(_ context.Context, tr fsm.Transition[state]) {
+			order = append(order, fmt.Sprintf("%v->%v", tr.From, tr.To))
+		}),
+		fsm.OnExit(idle, note("exit idle")),
+		fsm.OnEnter(running, note("enter running")),
+		fsm.From(idle).On(evStart).To(running),
+		fsm.From(running).On(evFinish).To(done),
+	)
+	if err != nil {
+		t.Fatalf("build: %v", err)
+	}
+	ctx := t.Context()
+	st := idle
+
+	if _, err := m.Send(ctx, &st, evStart); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := m.Fire(ctx, &st, evFinish, 1); err != nil {
+		t.Fatal(err)
+	}
+	_, _ = m.Send(ctx, &st, evStart) // refused: no hook runs
+
+	want := []string{"exit idle", "idle->running", "enter running", "running->done"}
+	if !slices.Equal(order, want) {
+		t.Errorf("order %v, want %v", order, want)
+	}
+}
+
+func TestOnTransitionRejectsNil(t *testing.T) {
+	_, err := fsm.New("job", fsm.OnTransition[state](nil), fsm.From(idle).On(evStart).To(running))
+	if err == nil || !strings.Contains(err.Error(), "nil OnTransition hook") {
+		t.Fatalf("got %v, want a nil hook error", err)
+	}
+}
+
+func TestRulesBundlesRules(t *testing.T) {
+	shared := fsm.Rules(
+		fsm.From(idle).On(evStart).To(running),
+		fsm.From(running).On(evCancel).To(cancelled),
+	)
+	m, err := fsm.New("job", shared, fsm.From(running).On(evFinish).To(done))
+	if err != nil {
+		t.Fatalf("build: %v", err)
+	}
+	if got := len(m.Edges()); got != 3 {
+		t.Errorf("%d edges, want 3", got)
+	}
+
+	_, err = fsm.New("job", fsm.Rules(fsm.From(idle).On(evStart).To(running), nil))
+	if err == nil || !strings.Contains(err.Error(), "bundled rule 1 is nil") {
+		t.Fatalf("got %v, want the nil rule reported", err)
+	}
+}
+
+func TestEventsListsEachNameOnce(t *testing.T) {
+	twin := fsm.Signal("start") // same name, different event
+	m, err := fsm.New("job",
+		fsm.From(idle).On(evStart).To(running),
+		fsm.From(running).On(evFinish).To(done),
+		fsm.From(running).On(evStart).To(running),
+		fsm.From(done).On(twin).To(idle),
+	)
+	if err != nil {
+		t.Fatalf("build: %v", err)
+	}
+	if got, want := m.Events(), []string{"start", "finish"}; !slices.Equal(got, want) {
+		t.Errorf("events %v, want %v", got, want)
+	}
+}
+
+// --- Initial ---------------------------------------------------------------
+
+func TestInitialIsReportedAndDrawn(t *testing.T) {
+	if _, ok := linear(t).Initial(); ok {
+		t.Error("a machine without Initial reports one")
+	}
+	if strings.Contains(linear(t).DOT(), "__start") {
+		t.Error("a machine without Initial draws a start marker")
+	}
+
+	m, err := fsm.New("job",
+		fsm.Initial(idle),
+		fsm.From(idle).On(evStart).To(running),
+		fsm.From(running).On(evFinish).To(done),
+		fsm.From(running).On(evCancel).To(cancelled),
+	)
+	if err != nil {
+		t.Fatalf("build: %v", err)
+	}
+	if s, ok := m.Initial(); !ok || s != idle {
+		t.Errorf("Initial() = %v, %v; want idle, true", s, ok)
+	}
+	want := `digraph "job" {
+	rankdir=LR;
+	"__start" [shape=point];
+	"idle" [shape=box];
+	"running" [shape=box];
+	"done" [shape=doublecircle];
+	"cancelled" [shape=doublecircle];
+	"__start" -> "idle";
+	"idle" -> "running" [label="start"];
+	"running" -> "done" [label="finish"];
+	"running" -> "cancelled" [label="cancel"];
+}
+`
+	if got := m.DOT(); got != want {
+		t.Errorf("DOT:\n%s\nwant:\n%s", got, want)
+	}
+}
+
+func TestInitialStartMarkerAvoidsAStateName(t *testing.T) {
+	m, err := fsm.New("job",
+		fsm.Initial("__start"),
+		fsm.From("__start").On(evStart).To("going"),
+	)
+	if err != nil {
+		t.Fatalf("build: %v", err)
+	}
+	dot := m.DOT()
+	for _, want := range []string{`"__start_" [shape=point];`, `"__start_" -> "__start";`} {
+		if !strings.Contains(dot, want) {
+			t.Errorf("DOT lacks %s:\n%s", want, dot)
+		}
+	}
+}
+
+// An entry hook that fires again is logged after the transition it came from.
+func TestOnTransitionKeepsCausalOrder(t *testing.T) {
+	var log []string
+	st := idle
+	ctx := t.Context()
+	var m *fsm.Machine[state]
+	m, err := fsm.New("job",
+		fsm.OnTransition(func(_ context.Context, tr fsm.Transition[state]) {
+			log = append(log, fmt.Sprintf("%v->%v", tr.From, tr.To))
+		}),
+		fsm.OnEnter(running, func(ctx context.Context, _ fsm.Transition[state]) { _, _ = m.Fire(ctx, &st, evFinish, 1) }),
+		fsm.From(idle).On(evStart).To(running),
+		fsm.From(running).On(evFinish).To(done),
+	)
+	if err != nil {
+		t.Fatalf("build: %v", err)
+	}
+	if _, err := m.Send(ctx, &st, evStart); err != nil {
+		t.Fatal(err)
+	}
+	if want := []string{"idle->running", "running->done"}; st != done || !slices.Equal(log, want) {
+		t.Errorf("state %v, log %v; want done and %v", st, log, want)
+	}
+}
+
+func TestInitialDoesNotReportAMistakeTwice(t *testing.T) {
+	_, err := fsm.New("job",
+		fsm.Initial(idle),
+		fsm.From(idle).On(evStart).To(running),
+		fsm.FromGroup(fsm.NewGroup("g", running, state(99))).On(evCancel).To(cancelled),
+	)
+	if err == nil || !strings.Contains(err.Error(), "member unknown is not a state") {
+		t.Fatalf("got %v, want the mistyped member reported", err)
+	}
+	if strings.Contains(err.Error(), "cannot be reached") {
+		t.Errorf("error %q also reports the typo's state as unreachable", err)
+	}
+}
+
+func TestInitialRejectsUnreachableStates(t *testing.T) {
+	_, err := fsm.New("job",
+		fsm.Initial(idle),
+		fsm.From(idle).On(evStart).To(running),
+		fsm.From(done).On(evCancel).To(cancelled), // nothing reaches done
+	)
+	if err == nil || !strings.Contains(err.Error(), "states [done cancelled] cannot be reached from initial state idle") {
+		t.Fatalf("got %v, want the unreachable states reported", err)
+	}
+}
+
+func TestInitialRejectsADeadStart(t *testing.T) {
+	_, err := fsm.New("job", fsm.Initial(done), fsm.From(idle).On(evStart).To(done))
+	if err == nil || !strings.Contains(err.Error(), "initial state done has no outgoing transition") {
+		t.Fatalf("got %v, want a dead start reported", err)
+	}
+	if strings.Contains(err.Error(), "cannot be reached") {
+		t.Errorf("error %q also reports the consequence of the dead start", err)
+	}
+}
+
+func TestInitialDeclaredTwice(t *testing.T) {
+	for _, second := range []state{idle, running} {
+		_, err := fsm.New("job", fsm.Initial(idle), fsm.Initial(second), fsm.From(idle).On(evStart).To(running))
+		want := fmt.Sprintf("initial state declared twice: idle and %v", second)
+		if err == nil || !strings.Contains(err.Error(), want) {
+			t.Errorf("got %v, want %q", err, want)
+		}
+	}
+}
+
+func TestInitialWithNoTransitionsReportsOneError(t *testing.T) {
+	_, err := fsm.New("job", fsm.Initial(idle))
+	if err == nil || !strings.Contains(err.Error(), "no transitions declared") {
+		t.Fatalf("got %v, want the empty machine reported", err)
+	}
+	if strings.Contains(err.Error(), "no outgoing transition") {
+		t.Errorf("error %q also reports the initial state as a dead start", err)
 	}
 }
 
@@ -93,13 +362,13 @@ func TestFireAdvancesState(t *testing.T) {
 	ctx := t.Context()
 
 	st := idle
-	if err := m.Send(ctx, &st, evStart); err != nil {
+	if _, err := m.Send(ctx, &st, evStart); err != nil {
 		t.Fatalf("start: %v", err)
 	}
 	if st != running {
 		t.Fatalf("after start: got %v, want running", st)
 	}
-	if err := m.Fire(ctx, &st, evFinish, 0); err != nil {
+	if _, err := m.Fire(ctx, &st, evFinish, 0); err != nil {
 		t.Fatalf("finish: %v", err)
 	}
 	if st != done {
@@ -111,7 +380,7 @@ func TestFireRejectsUnknownTransition(t *testing.T) {
 	m := linear(t)
 	st := idle
 
-	err := m.Fire(t.Context(), &st, evFinish, 0)
+	_, err := m.Fire(t.Context(), &st, evFinish, 0)
 	if err == nil {
 		t.Fatal("expected an error firing finish from idle")
 	}
@@ -143,7 +412,7 @@ func TestPayloadReachesAction(t *testing.T) {
 	}
 
 	st := running
-	if err := m.Fire(t.Context(), &st, evFinish, 42); err != nil {
+	if _, err := m.Fire(t.Context(), &st, evFinish, 42); err != nil {
 		t.Fatalf("finish: %v", err)
 	}
 	if got != 42 {
@@ -177,7 +446,7 @@ func TestGuardBlocksTransition(t *testing.T) {
 	ctx := t.Context()
 
 	st := running
-	err := m.Fire(ctx, &st, evFinish, 1)
+	_, err := m.Fire(ctx, &st, evFinish, 1)
 
 	ge, ok := errors.AsType[*fsm.GuardError[state]](err)
 	if !ok {
@@ -190,7 +459,7 @@ func TestGuardBlocksTransition(t *testing.T) {
 		t.Errorf("state changed to %v despite a failed guard", st)
 	}
 
-	if err := m.Fire(ctx, &st, evFinish, 0); err != nil {
+	if _, err := m.Fire(ctx, &st, evFinish, 0); err != nil {
 		t.Fatalf("finish with passing guard: %v", err)
 	}
 	if st != done {
@@ -205,7 +474,7 @@ func TestGuardErrorUnwrapsToTheGuardsError(t *testing.T) {
 	ctx := t.Context()
 
 	st := running
-	err := m.Fire(ctx, &st, evFinish, 3)
+	_, err := m.Fire(ctx, &st, evFinish, 3)
 
 	if !errors.Is(err, errNonZeroExit) {
 		t.Errorf("errors.Is(err, errNonZeroExit) = false for %v", err)
@@ -257,7 +526,7 @@ func TestGuardRunsBeforeAction(t *testing.T) {
 	}
 
 	st := running
-	if err := m.Fire(t.Context(), &st, evFinish, 1); !errors.Is(err, errNonZeroExit) {
+	if _, err := m.Fire(t.Context(), &st, evFinish, 1); !errors.Is(err, errNonZeroExit) {
 		t.Fatalf("got %v, want errNonZeroExit", err)
 	}
 	if acted {
@@ -285,7 +554,7 @@ func TestFirstRejectingGuardWins(t *testing.T) {
 	ctx := t.Context()
 	st := running
 
-	err = m.Fire(ctx, &st, evFinish, -1)
+	_, err = m.Fire(ctx, &st, evFinish, -1)
 	if ge, ok := errors.AsType[*fsm.GuardError[state]](err); ok {
 		if ge.Guard != "first" || !errors.Is(err, errNonZeroExit) {
 			t.Errorf("got guard %q / %v, want the first guard to reject", ge.Guard, err)
@@ -294,7 +563,7 @@ func TestFirstRejectingGuardWins(t *testing.T) {
 		t.Fatalf("got %v, want *fsm.GuardError", err)
 	}
 
-	err = m.Fire(ctx, &st, evFinish, 1)
+	_, err = m.Fire(ctx, &st, evFinish, 1)
 	if ge, ok := errors.AsType[*fsm.GuardError[state]](err); ok {
 		if ge.Guard != "second" || !errors.Is(err, errSecond) {
 			t.Errorf("got guard %q / %v, want the second guard to reject", ge.Guard, err)
@@ -318,7 +587,7 @@ func TestActionErrorAbortsTransition(t *testing.T) {
 	}
 
 	st := running
-	err = m.Fire(t.Context(), &st, evFinish, 0)
+	_, err = m.Fire(t.Context(), &st, evFinish, 0)
 	if !errors.Is(err, boom) {
 		t.Fatalf("got %v, want it to wrap boom", err)
 	}
@@ -349,7 +618,7 @@ func TestHooksBracketTheAssignment(t *testing.T) {
 	}
 
 	st := running
-	if err := m.Fire(t.Context(), &st, evFinish, 0); err != nil {
+	if _, err := m.Fire(t.Context(), &st, evFinish, 0); err != nil {
 		t.Fatalf("finish: %v", err)
 	}
 
@@ -379,12 +648,12 @@ func TestGaugeStaysPaired(t *testing.T) {
 
 	for range 100 {
 		st := idle
-		if err := m.Send(ctx, &st, evStart); err != nil {
+		if _, err := m.Send(ctx, &st, evStart); err != nil {
 			t.Fatal(err)
 		}
 		// Firing an event the state does not accept must not move a gauge.
-		_ = m.Send(ctx, &st, evStart)
-		if err := m.Fire(ctx, &st, evFinish, 0); err != nil {
+		_, _ = m.Send(ctx, &st, evStart)
+		if _, err := m.Fire(ctx, &st, evFinish, 0); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -470,7 +739,7 @@ func TestTransitionIsIdentifiesTheTrigger(t *testing.T) {
 	var matchedFirst, matchedSecond int
 	m, err := fsm.New("job",
 		fsm.OnEnter(running, func(_ context.Context, tr fsm.Transition[state]) {
-			names = append(names, tr.Event)
+			names = append(names, tr.Event())
 			if tr.Is(first) {
 				matchedFirst++
 			}
@@ -488,13 +757,13 @@ func TestTransitionIsIdentifiesTheTrigger(t *testing.T) {
 
 	ctx := t.Context()
 	st := idle
-	if err := m.Send(ctx, &st, first); err != nil { // idle -> running
+	if _, err := m.Send(ctx, &st, first); err != nil { // idle -> running
 		t.Fatal(err)
 	}
-	if err := m.Fire(ctx, &st, evFinish, 0); err != nil { // running -> done
+	if _, err := m.Fire(ctx, &st, evFinish, 0); err != nil { // running -> done
 		t.Fatal(err)
 	}
-	if err := m.Send(ctx, &st, second); err != nil { // done -> running
+	if _, err := m.Send(ctx, &st, second); err != nil { // done -> running
 		t.Fatal(err)
 	}
 
@@ -538,14 +807,14 @@ func TestOnEnterViaSeesThePayload(t *testing.T) {
 
 	ctx := t.Context()
 	st := running
-	if err := m.Fire(ctx, &st, evFinish, 7); err != nil {
+	if _, err := m.Fire(ctx, &st, evFinish, 7); err != nil {
 		t.Fatal(err)
 	}
-	if err := m.Send(ctx, &st, evStart); err != nil {
+	if _, err := m.Send(ctx, &st, evStart); err != nil {
 		t.Fatal(err)
 	}
 	// Entering done by another event must not run the evFinish hook.
-	if err := m.Send(ctx, &st, evCancel); err != nil {
+	if _, err := m.Send(ctx, &st, evCancel); err != nil {
 		t.Fatal(err)
 	}
 
@@ -571,7 +840,7 @@ func TestOnExitViaRunsBeforeTheStateChanges(t *testing.T) {
 	}
 
 	st := running
-	if err := m.Fire(t.Context(), &st, evFinish, 3); err != nil {
+	if _, err := m.Fire(t.Context(), &st, evFinish, 3); err != nil {
 		t.Fatal(err)
 	}
 	want := "plain,via:3:running->done"
@@ -619,12 +888,12 @@ func TestSelfTransitionRunsExitAndEntry(t *testing.T) {
 
 	ctx := t.Context()
 	st := idle
-	if err := m.Send(ctx, &st, evStart); err != nil {
+	if _, err := m.Send(ctx, &st, evStart); err != nil {
 		t.Fatal(err)
 	}
 	seq = nil // drop the entry from idle -> running
 
-	if err := m.Send(ctx, &st, evCancel); err != nil {
+	if _, err := m.Send(ctx, &st, evCancel); err != nil {
 		t.Fatalf("self-transition: %v", err)
 	}
 	if st != running {
@@ -667,14 +936,14 @@ func TestGaugeWithCountsPerPayload(t *testing.T) {
 	sa, sb := idle, idle
 
 	for range 3 {
-		if err := m.Fire(ctx, &sa, ev, a); err != nil {
+		if _, err := m.Fire(ctx, &sa, ev, a); err != nil {
 			t.Fatal(err)
 		}
-		if err := m.Fire(ctx, &sa, back, a); err != nil {
+		if _, err := m.Fire(ctx, &sa, back, a); err != nil {
 			t.Fatal(err)
 		}
 	}
-	if err := m.Fire(ctx, &sb, ev, b); err != nil {
+	if _, err := m.Fire(ctx, &sb, ev, b); err != nil {
 		t.Fatal(err)
 	}
 
@@ -714,7 +983,7 @@ func TestGaugeWithStaysPairedAcrossEveryEdge(t *testing.T) {
 		ev   fsm.Event[*tally]
 		want int
 	}{{in1, 1}, {out, 0}, {in2, 1}, {out, 0}} {
-		if err := m.Fire(ctx, &st, step.ev, x); err != nil {
+		if _, err := m.Fire(ctx, &st, step.ev, x); err != nil {
 			t.Fatalf("fire %s: %v", step.ev.Name(), err)
 		}
 		if x.n != step.want {
@@ -805,7 +1074,7 @@ func TestGaugeWithMayBeDeclaredBeforeItsEdges(t *testing.T) {
 	for _, m := range []*fsm.Machine[state]{first, last} {
 		x := &tally{}
 		st := idle
-		if err := m.Fire(ctx, &st, ev, x); err != nil {
+		if _, err := m.Fire(ctx, &st, ev, x); err != nil {
 			t.Fatal(err)
 		}
 		if x.n != 1 {
@@ -875,7 +1144,7 @@ func TestChainedOptionsMutateInPlace(t *testing.T) {
 	}
 
 	st := running
-	if err := m.Fire(t.Context(), &st, evFinish, 0); !errors.Is(err, errNonZeroExit) {
+	if _, err := m.Fire(t.Context(), &st, evFinish, 0); !errors.Is(err, errNonZeroExit) {
 		t.Fatalf("got %v, want the guard to reject", err)
 	}
 	if !blocked {
@@ -894,7 +1163,7 @@ func TestZeroEventIsAnErrorNotAPanic(t *testing.T) {
 	var zero fsm.Event[int]
 
 	st := idle
-	err := m.Fire(t.Context(), &st, zero, 0)
+	_, err := m.Fire(t.Context(), &st, zero, 0)
 	if err == nil {
 		t.Fatal("expected an error for the zero Event")
 	}
@@ -954,8 +1223,8 @@ func TestFireDoesNotAllocate(t *testing.T) {
 	st := idle
 
 	avg := testing.AllocsPerRun(1000, func() {
-		_ = m.Send(ctx, &st, evStart)
-		_ = m.Fire(ctx, &st, evFinish, 7)
+		_, _ = m.Send(ctx, &st, evStart)
+		_, _ = m.Fire(ctx, &st, evFinish, 7)
 	})
 	if avg != 0 {
 		t.Errorf("Fire allocates %.1f times per round trip, want 0", avg)
@@ -980,8 +1249,8 @@ func BenchmarkFireWithHooks(b *testing.B) {
 
 	b.ReportAllocs()
 	for b.Loop() {
-		_ = m.Send(ctx, &st, evStart)
-		_ = m.Fire(ctx, &st, evFinish, 1)
+		_, _ = m.Send(ctx, &st, evStart)
+		_, _ = m.Fire(ctx, &st, evFinish, 1)
 	}
 }
 
@@ -998,8 +1267,8 @@ func BenchmarkFire(b *testing.B) {
 
 	b.ReportAllocs()
 	for b.Loop() {
-		_ = m.Send(ctx, &st, evStart)
-		_ = m.Fire(ctx, &st, evFinish, 1)
+		_, _ = m.Send(ctx, &st, evStart)
+		_, _ = m.Fire(ctx, &st, evFinish, 1)
 	}
 }
 
@@ -1016,7 +1285,7 @@ func TestFromEachRegistersOneEdgePerSource(t *testing.T) {
 
 	for _, from := range []state{idle, running} {
 		st := from
-		if err := m.Send(t.Context(), &st, evCancel); err != nil {
+		if _, err := m.Send(t.Context(), &st, evCancel); err != nil {
 			t.Fatalf("cancel from %v: %v", from, err)
 		}
 		if st != cancelled {
@@ -1100,7 +1369,7 @@ func TestFromEachSharesGuardsAndActions(t *testing.T) {
 
 	for _, from := range []state{idle, running} {
 		st := from
-		if err := m.Send(t.Context(), &st, evCancel); err != nil {
+		if _, err := m.Send(t.Context(), &st, evCancel); err != nil {
 			t.Fatalf("cancel from %v: %v", from, err)
 		}
 	}
@@ -1108,7 +1377,7 @@ func TestFromEachSharesGuardsAndActions(t *testing.T) {
 		t.Errorf("action ran %d times, want 2", calls)
 	}
 	for _, e := range m.Edges() {
-		if e.Event == "cancel" && e.Guard != "cancellable" {
+		if e.Event() == "cancel" && e.Guard != "cancellable" {
 			t.Errorf("edge from %v lost its guard description", e.From)
 		}
 	}
@@ -1129,7 +1398,7 @@ func TestGroupTransitionAppliesToEveryMember(t *testing.T) {
 
 	for _, from := range live.Members() {
 		st := from
-		if err := m.Send(t.Context(), &st, evCancel); err != nil {
+		if _, err := m.Send(t.Context(), &st, evCancel); err != nil {
 			t.Fatalf("cancel from %v: %v", from, err)
 		}
 		if st != cancelled {
@@ -1185,11 +1454,11 @@ func TestGroupEdgesCarryTheirProvenance(t *testing.T) {
 
 	for _, e := range m.Edges() {
 		want := ""
-		if e.Event == "cancel" {
+		if e.Event() == "cancel" {
 			want = "live"
 		}
 		if e.Group != want {
-			t.Errorf("edge %v --%s--> %v has Group %q, want %q", e.From, e.Event, e.To, e.Group, want)
+			t.Errorf("edge %v --%s--> %v has Group %q, want %q", e.From, e.Event(), e.To, e.Group, want)
 		}
 	}
 	if groups := m.Groups(); len(groups) != 1 || groups[0].Name() != "live" {
@@ -1336,7 +1605,7 @@ func TestGaugeWithSeesGroupInheritedEdges(t *testing.T) {
 	}
 
 	st := running
-	if err := m.Fire(t.Context(), &st, evFinish, 1); err != nil {
+	if _, err := m.Fire(t.Context(), &st, evFinish, 1); err != nil {
 		t.Fatalf("finish: %v", err)
 	}
 	if delta != 1 {
@@ -1358,8 +1627,8 @@ func TestGroupFireDoesNotAllocate(t *testing.T) {
 	st := running
 
 	avg := testing.AllocsPerRun(1000, func() {
-		_ = m.Send(ctx, &st, evCancel)
-		_ = m.Send(ctx, &st, evStart)
+		_, _ = m.Send(ctx, &st, evCancel)
+		_, _ = m.Send(ctx, &st, evStart)
 	})
 	if avg != 0 {
 		t.Errorf("Fire allocates %.1f times per round trip on a grouped machine, want 0", avg)
@@ -1546,8 +1815,8 @@ func TestEdgeIsIdentifiesTheTrigger(t *testing.T) {
 	}
 
 	for _, e := range m.Edges() {
-		if e.Event != "start" {
-			t.Fatalf("unexpected event name %q", e.Event)
+		if e.Event() != "start" {
+			t.Fatalf("unexpected event name %q", e.Event())
 		}
 		switch e.From {
 		case idle:

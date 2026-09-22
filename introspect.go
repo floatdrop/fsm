@@ -17,6 +17,24 @@ func (m *Machine[S]) Edges() []Edge[S] { return slices.Clone(m.edges) }
 // Groups returns every declared group, in declaration order.
 func (m *Machine[S]) Groups() []Group[S] { return slices.Clone(m.groups) }
 
+// Events returns the distinct names of the events some transition reacts
+// to, in declaration order. Names are for display; two events sharing one
+// are listed once.
+func (m *Machine[S]) Events() []string {
+	seen := make(map[string]bool, len(m.edges))
+	out := []string{}
+	for _, e := range m.edges {
+		if name := e.Event(); !seen[name] {
+			seen[name] = true
+			out = append(out, name)
+		}
+	}
+	return out
+}
+
+// Initial returns the state declared with [Initial], and false when none was.
+func (m *Machine[S]) Initial() (S, bool) { return m.initial, m.hasInitial }
+
 // Terminals returns the states with no outgoing transition.
 //
 // A machine's terminal set is worth asserting in a test: an unintended
@@ -56,8 +74,9 @@ func (m *Machine[S]) Unreachable(initial S) []S {
 }
 
 // DOT renders the machine as a Graphviz digraph. A [Group] is drawn as a
-// cluster, and a transition every member inherited is drawn once from the
-// cluster boundary rather than once per member.
+// cluster, a transition every member inherited is drawn once from the
+// cluster boundary rather than once per member, and the [Initial] state, if
+// declared, is pointed at from a dot.
 //
 // Output is deterministic: states, edges and groups are emitted in declaration
 // order, never in map order, so the result can be committed and diffed.
@@ -67,6 +86,14 @@ func (m *Machine[S]) DOT() string {
 	b.WriteString("\trankdir=LR;\n")
 	if len(m.groups) > 0 {
 		b.WriteString("\tcompound=true;\n") // lets an edge stop at a cluster boundary
+	}
+	// The start marker's node id must not be a state's name.
+	start := "__start"
+	if m.hasInitial {
+		for slices.ContainsFunc(m.states, func(s S) bool { return fmt.Sprint(s) == start }) {
+			start += "_"
+		}
+		fmt.Fprintf(&b, "\t\"%s\" [shape=point];\n", start)
 	}
 
 	terminals := m.Terminals()
@@ -128,11 +155,14 @@ func (m *Machine[S]) DOT() string {
 		byName[g.name] = g
 	}
 
+	if m.hasInitial {
+		fmt.Fprintf(&b, "\t\"%s\" -> \"%s\";\n", start, dotEscape(fmt.Sprint(m.initial)))
+	}
 	drawn := make(map[boundary]bool)
 	for _, e := range m.edges {
 		// The guard is appended after escaping so that the \n stays a
 		// Graphviz line break rather than becoming a literal backslash-n.
-		label := dotEscape(e.Event)
+		label := dotEscape(e.Event())
 		if e.Guard != "" {
 			label += `\n[` + dotEscape(e.Guard) + `]`
 		}
