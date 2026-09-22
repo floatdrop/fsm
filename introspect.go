@@ -167,7 +167,7 @@ func collapsible[S comparable](e Edge[S], g Group[S], rows int, whole bool) bool
 	return whole && rows == len(g.members) && !g.Has(e.To)
 }
 
-// dotEscape makes s safe inside a double-quoted Graphviz string.
-func dotEscape(s string) string {
-	return strings.NewReplacer(`\`, `\\`, `"`, `\"`, "\n", `\n`).Replace(s)
-}
+// dotReplacer makes a string safe inside double quotes in Graphviz.
+var dotReplacer = strings.NewReplacer(`\`, `\\`, `"`, `\"`, "\n", `\n`)
+
+func dotEscape(s string) string { return dotReplacer.Replace(s) }

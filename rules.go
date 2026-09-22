@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"slices"
+	"strings"
 )
 
 // Rule is one declaration a machine is made of: a transition, a gauge or a
@@ -381,8 +382,8 @@ func (t *ToStep[S, A]) combine() (guard, action any) {
 	return guard, action
 }
 
-// describe names the rule in error messages. The single-source form is the
-// common one and reads as it always has.
+// describe names the rule in error messages: one source prints as a -> b,
+// several as [a b] -> c.
 func (t *ToStep[S, A]) describe() string {
 	switch {
 	case t.group != nil:
@@ -553,6 +554,8 @@ func GaugeWith[S comparable, A any](s S, inc, dec func(context.Context, A)) Rule
 
 		b.deferred = append(b.deferred, func(b *builder[S]) {
 			want := payloadToken[A]()
+			enter := func(ctx context.Context, _ Transition[S], a A) { inc(ctx, a) }
+			exit := func(ctx context.Context, _ Transition[S], a A) { dec(ctx, a) }
 			var touched int
 			for _, d := range b.decls {
 				entering := d.to == s
@@ -560,22 +563,19 @@ func GaugeWith[S comparable, A any](s S, inc, dec func(context.Context, A)) Rule
 				if !entering && !leaving {
 					continue
 				}
+				touched++
 				if d.payload != want {
 					b.errs = append(b.errs, fmt.Errorf(
 						"GaugeWith for state %v: transition %v --%s--> %v carries a different payload type, so the counter cannot be kept paired",
 						s, d.key.from, d.key.ev.name, d.to))
 					continue
 				}
-				touched++
+				k := edge[S]{from: s, ev: d.key.ev}
 				if entering {
-					b.m.onEnterVia[edge[S]{from: s, ev: d.key.ev}] = append(
-						b.m.onEnterVia[edge[S]{from: s, ev: d.key.ev}],
-						func(ctx context.Context, _ Transition[S], a A) { inc(ctx, a) })
+					b.m.onEnterVia[k] = append(b.m.onEnterVia[k], enter)
 				}
 				if leaving {
-					b.m.onExitVia[edge[S]{from: s, ev: d.key.ev}] = append(
-						b.m.onExitVia[edge[S]{from: s, ev: d.key.ev}],
-						func(ctx context.Context, _ Transition[S], a A) { dec(ctx, a) })
+					b.m.onExitVia[k] = append(b.m.onExitVia[k], exit)
 				}
 			}
 			if touched == 0 {
@@ -703,16 +703,8 @@ func (b *builder[S]) declare(s S) {
 	b.m.states = append(b.m.states, s)
 }
 
+// joinDescs is the edge's label: the non-empty guard descriptions, joined.
 func joinDescs(descs []string) string {
-	out := ""
-	for _, d := range descs {
-		if d == "" {
-			continue
-		}
-		if out != "" {
-			out += " && "
-		}
-		out += d
-	}
-	return out
+	kept := slices.DeleteFunc(slices.Clone(descs), func(d string) bool { return d == "" })
+	return strings.Join(kept, " && ")
 }

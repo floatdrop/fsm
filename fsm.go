@@ -58,7 +58,10 @@ type eventDef struct{ name string }
 //		evStop   = fsm.Define[time.Time]("stop")
 //		evFinish = fsm.Signal("finish")
 //	)
-type Event[A any] struct{ def *eventDef }
+type Event[A any] struct {
+	def *eventDef
+	_   [0]*A // makes Event[A] and Event[B] inconvertible, so Fire's assertions hold
+}
 
 // Define declares an event carrying a payload of type A.
 func Define[A any](name string) Event[A] {
@@ -160,6 +163,9 @@ func (m *Machine[S]) Name() string { return m.name }
 //
 // Fire is a generic method: A is inferred from ev, so the payload is checked
 // at compile time.
+//
+// A guard, action or exit hook must not fire this machine on st: the outer
+// assignment overwrites its change. Entry hooks run after it and may.
 func (m *Machine[S]) Fire[A any](ctx context.Context, st *S, ev Event[A], arg A) error {
 	if st == nil {
 		return fmt.Errorf("fsm %s: nil state pointer", m.name)
@@ -168,10 +174,12 @@ func (m *Machine[S]) Fire[A any](ctx context.Context, st *S, ev Event[A], arg A)
 		return fmt.Errorf("fsm %s: fired the zero Event; declare it with fsm.Define or fsm.Signal", m.name)
 	}
 
-	e := edge[S]{from: *st, ev: ev.def}
+	// Read once: the payload may alias the state, and an action may write it.
+	from := *st
+	e := edge[S]{from: from, ev: ev.def}
 	to, ok := m.table[e]
 	if !ok {
-		return &NoTransitionError[S]{Machine: m.name, From: *st, Event: ev.def.name}
+		return &NoTransitionError[S]{Machine: m.name, From: from, Event: ev.def.name}
 	}
 
 	// The assertions below are safe by construction: an edge is only ever
@@ -179,13 +187,13 @@ func (m *Machine[S]) Fire[A any](ctx context.Context, st *S, ev Event[A], arg A)
 	// payload type is exactly A.
 	if raw, ok := m.guards[e]; ok {
 		if desc, err := raw.(func(context.Context, A) (string, error))(ctx, arg); err != nil {
-			return &GuardError[S]{Machine: m.name, From: *st, To: to, Event: ev.def.name, Guard: desc, Err: err}
+			return &GuardError[S]{Machine: m.name, From: from, To: to, Event: ev.def.name, Guard: desc, Err: err}
 		}
 	}
 
 	if raw, ok := m.actions[e]; ok {
 		if err := raw.(func(context.Context, A) error)(ctx, arg); err != nil {
-			return fmt.Errorf("fsm %s: action for %v --%s--> %v: %w", m.name, *st, ev.def.name, to, err)
+			return fmt.Errorf("fsm %s: action for %v --%s--> %v: %w", m.name, from, ev.def.name, to, err)
 		}
 	}
 
@@ -194,13 +202,13 @@ func (m *Machine[S]) Fire[A any](ctx context.Context, st *S, ev Event[A], arg A)
 		return nil
 	}
 
-	t := Transition[S]{From: *st, To: to, Event: ev.def.name, trigger: ev.def}
+	t := Transition[S]{From: from, To: to, Event: ev.def.name, trigger: ev.def}
 
-	for _, h := range m.onExit[t.From] {
+	for _, h := range m.onExit[from] {
 		h(ctx, t)
 	}
 	if len(m.onExitVia) > 0 {
-		for _, raw := range m.onExitVia[edge[S]{from: t.From, ev: ev.def}] {
+		for _, raw := range m.onExitVia[e] {
 			raw.(func(context.Context, Transition[S], A))(ctx, t, arg)
 		}
 	}

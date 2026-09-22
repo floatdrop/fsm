@@ -53,6 +53,41 @@ func linear(t *testing.T) *fsm.Machine[state] {
 	return m
 }
 
+// The payload may alias the state, so Fire reads *st once and an action that
+// writes it changes neither the exit hooks nor the reported source.
+func TestFireReadsTheStateOnce(t *testing.T) {
+	st := running
+	var exited []state
+	clobber := func(context.Context, int) error { st = cancelled; return nil }
+
+	m, err := fsm.New("job",
+		fsm.OnExit(running, func(_ context.Context, tr fsm.Transition[state]) { exited = append(exited, tr.From) }),
+		fsm.OnExit(cancelled, func(_ context.Context, tr fsm.Transition[state]) { exited = append(exited, tr.From) }),
+		fsm.From(running).On(evFinish).To(done).Action(clobber),
+		fsm.From(running).On(evCancel).To(cancelled).Action(func(context.Context, fsm.Unit) error {
+			st = idle
+			return errors.New("boom")
+		}),
+	)
+	if err != nil {
+		t.Fatalf("build: %v", err)
+	}
+	ctx := t.Context()
+
+	if err := m.Fire(ctx, &st, evFinish, 1); err != nil {
+		t.Fatal(err)
+	}
+	if st != done || !slices.Equal(exited, []state{running}) {
+		t.Errorf("state %v, exited %v; want done and [running]", st, exited)
+	}
+
+	st = running
+	err = m.Send(ctx, &st, evCancel)
+	if err == nil || !strings.Contains(err.Error(), "running --cancel--> cancelled") {
+		t.Errorf("got %v, want the action error to name the original source", err)
+	}
+}
+
 func TestFireAdvancesState(t *testing.T) {
 	m := linear(t)
 	ctx := t.Context()
@@ -710,6 +745,26 @@ func TestGaugeWithRejectsMixedPayloads(t *testing.T) {
 		if !strings.Contains(err.Error(), want) {
 			t.Errorf("error %q does not mention %q", err, want)
 		}
+	}
+}
+
+// A mismatch is one error, not also "no transition enters or leaves it".
+func TestGaugeWithMismatchReportsOneError(t *testing.T) {
+	type tally struct{}
+	other := fsm.Define[int]("other")
+
+	_, err := fsm.New("job",
+		fsm.GaugeWith(running,
+			func(context.Context, *tally) {},
+			func(context.Context, *tally) {},
+		),
+		fsm.From(idle).On(other).To(running),
+	)
+	if err == nil || !strings.Contains(err.Error(), "different payload type") {
+		t.Fatalf("got %v, want a payload mismatch", err)
+	}
+	if strings.Contains(err.Error(), "no transition enters or leaves it") {
+		t.Errorf("error %q also reports the state as isolated", err)
 	}
 }
 
