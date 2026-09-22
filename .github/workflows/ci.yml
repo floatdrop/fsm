@@ -1,0 +1,40 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          check-latest: true
+      - name: gofmt
+        run: test -z "$(gofmt -l .)" || (gofmt -d . && exit 1)
+      - name: vet
+        run: go vet ./...
+      - name: lint
+        # Generic methods need v2.13.1 or newer; older releases fail to parse
+        # them and report cascading phantom errors across the package.
+        uses: golangci/golangci-lint-action@v9
+        with:
+          version: v2.13.2
+      - name: test
+        run: go test -race -count=1 -coverprofile=coverage.out ./...
+      - name: coverage
+        run: go tool cover -func=coverage.out | tail -1
+      - name: benchmarks compile and run
+        run: go test -run '^$' -bench . -benchtime=50ms ./...
+      - name: Fire stays allocation-free
+        # The zero-allocation claim is the reason guards and actions are
+        # combined at build time. -race changes the allocation profile, so this
+        # runs on its own without it.
+        run: go test -count=1 -run TestFireDoesNotAllocate ./...
