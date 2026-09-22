@@ -105,3 +105,7 @@ func TestRecordingHasOneTerminalState(t *testing.T) {
 ## Status
 
 Prototype. The API is not settled — in particular `Option[A]`, the hook signature, and whether guards should return an error instead of a `(bool, string)` pair.
+
+## License
+
+MIT — see [LICENSE](LICENSE).
