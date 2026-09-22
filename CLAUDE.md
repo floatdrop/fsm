@@ -141,6 +141,16 @@ committed-and-diffable only as long as that holds.
   a number quoted from one is noise.
 - **No dependencies.** The module requires nothing. Keep it that way — the
   package is meant to be vendorable into a monorepo without pulling a tree in.
+- **`docs/assets/logo.svg` is traced, not drawn.** It came from a painted PNG
+  via vtracer: crop to content, median-filter away the brush texture, map
+  every pixel to the three real colours (`#FBF5E8` cream, `#378ECF` blue,
+  `#393B57` pupils), then trace blue, eyes-and-teeth and pupils as three
+  separate binary layers. The background is transparent because the trace
+  omits it, not because a path was deleted — and "background" includes the
+  large cream region *inside* the ring of arms, which is enclosed and so has
+  to be excluded by area rather than by a flood fill from the border. Edit the
+  SVG directly; there is no committed script, and re-tracing from the PNG
+  would not reproduce it byte for byte.
 
 ## Tooling caveats
 

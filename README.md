@@ -1,4 +1,10 @@
+<p align="center">
+  <img src="docs/assets/logo.svg" alt="" width="420">
+</p>
+
 # fsm
+
+[![CI](https://github.com/floatdrop/fsm/actions/workflows/ci.yml/badge.svg)](https://github.com/floatdrop/fsm/actions/workflows/ci.yml)
 
 A small finite state machine for Go, built around three ideas: **the caller owns the state**, **events carry typed payloads**, and **a machine is a set of rules** whose source and target are named separately so they cannot be swapped.
 
