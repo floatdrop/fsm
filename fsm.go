@@ -128,9 +128,8 @@ func (m *Machine[S]) Fire[A any](ctx context.Context, st *S, ev Event[A], arg A)
 	// registered through On[A] with this same event, so the stored closure's
 	// payload type is exactly A.
 	if raw, ok := m.guards[e]; ok {
-		allowed, why := raw.(func(context.Context, A) (bool, string))(ctx, arg)
-		if !allowed {
-			return &GuardError[S]{Machine: m.name, From: *st, To: to, Event: ev.def.name, Reason: why}
+		if desc, err := raw.(func(context.Context, A) (string, error))(ctx, arg); err != nil {
+			return &GuardError[S]{Machine: m.name, From: *st, To: to, Event: ev.def.name, Guard: desc, Err: err}
 		}
 	}
 
@@ -156,21 +155,34 @@ func (m *Machine[S]) Send(ctx context.Context, st *S, ev Event[Unit]) error {
 	return m.Fire(ctx, st, ev, Unit{})
 }
 
-// Can reports whether firing ev from state from would succeed, evaluating
-// guards but running no action and no hook.
-func (m *Machine[S]) Can[A any](ctx context.Context, from S, ev Event[A], arg A) bool {
+// Check reports why firing ev from state from would fail, evaluating guards
+// but running no action and no hook. It returns nil when the transition would
+// be allowed, and otherwise the same error [Machine.Fire] would return.
+//
+// Use Check over [Machine.Can] when the reason matters — to report it, or to
+// match a sentinel with errors.Is.
+func (m *Machine[S]) Check[A any](ctx context.Context, from S, ev Event[A], arg A) error {
 	if ev.def == nil {
-		return false
+		return fmt.Errorf("fsm %s: checked the zero Event; declare it with fsm.Define or fsm.Signal", m.name)
 	}
+
 	e := edge[S]{from: from, ev: ev.def}
-	if _, ok := m.table[e]; !ok {
-		return false
+	to, ok := m.table[e]
+	if !ok {
+		return &NoTransitionError[S]{Machine: m.name, From: from, Event: ev.def.name}
 	}
 	if raw, ok := m.guards[e]; ok {
-		allowed, _ := raw.(func(context.Context, A) (bool, string))(ctx, arg)
-		return allowed
+		if desc, err := raw.(func(context.Context, A) (string, error))(ctx, arg); err != nil {
+			return &GuardError[S]{Machine: m.name, From: from, To: to, Event: ev.def.name, Guard: desc, Err: err}
+		}
 	}
-	return true
+	return nil
+}
+
+// Can reports whether firing ev from state from would succeed. It is
+// [Machine.Check] with the reason discarded.
+func (m *Machine[S]) Can[A any](ctx context.Context, from S, ev Event[A], arg A) bool {
+	return m.Check(ctx, from, ev, arg) == nil
 }
 
 // To returns the state that ev leads to from state from, ignoring guards.
@@ -196,15 +208,28 @@ func (e *NoTransitionError[S]) Error() string {
 }
 
 // GuardError reports a transition that exists but was rejected by a guard.
+//
+// Err is the error the guard returned. GuardError unwraps to it, so a guard
+// can reject with a sentinel and the caller can match it directly:
+//
+//	if errors.Is(err, ErrChunksPending) { ... }
 type GuardError[S comparable] struct {
 	Machine string
 	From    S
 	To      S
 	Event   string
-	Reason  string
+	Guard   string // the guard's static description, empty when unnamed
+	Err     error
 }
 
 func (e *GuardError[S]) Error() string {
-	return fmt.Sprintf("fsm %s: transition %v --%s--> %v rejected: %s",
-		e.Machine, e.From, e.Event, e.To, e.Reason)
+	if e.Guard != "" {
+		return fmt.Sprintf("fsm %s: transition %v --%s--> %v rejected by guard %q: %v",
+			e.Machine, e.From, e.Event, e.To, e.Guard, e.Err)
+	}
+	return fmt.Sprintf("fsm %s: transition %v --%s--> %v rejected: %v",
+		e.Machine, e.From, e.Event, e.To, e.Err)
 }
+
+// Unwrap returns the error the guard rejected with.
+func (e *GuardError[S]) Unwrap() error { return e.Err }

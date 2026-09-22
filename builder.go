@@ -8,17 +8,23 @@ import (
 
 // Option configures a single transition. See [WithGuard] and [WithAction].
 type Option[A any] struct {
-	guard     func(context.Context, A) bool
+	guard     func(context.Context, A) error
 	guardDesc string
 	action    func(context.Context, A) error
 }
 
-// WithGuard rejects the transition when f returns false. desc is reported in
-// the resulting [GuardError] and in DOT output, so it should read as a
-// condition: "recording has no in-progress chunks".
+// WithGuard rejects the transition when f returns a non-nil error. The error
+// is wrapped in a [GuardError], which unwraps to it, so a guard can reject
+// with a sentinel the caller matches using errors.Is.
 //
-// A guard must be pure: it is also evaluated by [Machine.Can].
-func WithGuard[A any](desc string, f func(context.Context, A) bool) Option[A] {
+// desc is the guard's static description: it labels the edge in DOT output
+// and appears in the error, so it should read as the condition being
+// enforced — "all chunks and tracks uploaded". The returned error carries the
+// dynamic reason the condition did not hold this time.
+//
+// A guard must be pure: it is also evaluated by [Machine.Check] and
+// [Machine.Can].
+func WithGuard[A any](desc string, f func(context.Context, A) error) Option[A] {
 	return Option[A]{guard: f, guardDesc: desc}
 }
 
@@ -78,7 +84,7 @@ func (b *Builder[S]) On[A any](ev Event[A], from, to S, opts ...Option[A]) *Buil
 	}
 
 	var (
-		guards  []func(context.Context, A) bool
+		guards  []func(context.Context, A) error
 		descs   []string
 		actions []func(context.Context, A) error
 	)
@@ -99,13 +105,15 @@ func (b *Builder[S]) On[A any](ev Event[A], from, to S, opts ...Option[A]) *Buil
 	if len(guards) > 0 {
 		// Combined here, where A is still known, so Fire needs a single
 		// assertion to a concrete func type and never boxes the payload.
-		b.m.guards[e] = func(ctx context.Context, a A) (bool, string) {
+		// Guards are evaluated in registration order and the first rejection
+		// wins, reported together with the description it was declared under.
+		b.m.guards[e] = func(ctx context.Context, a A) (string, error) {
 			for i, g := range guards {
-				if !g(ctx, a) {
-					return false, descs[i]
+				if err := g(ctx, a); err != nil {
+					return descs[i], err
 				}
 			}
-			return true, ""
+			return "", nil
 		}
 	}
 	if len(actions) > 0 {

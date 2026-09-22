@@ -28,8 +28,11 @@ var recordingFSM = fsm.New[recState]("recording").
         return nil
     })).
     On(recFinish, recStopped, recFinished,
-        fsm.WithGuard("all chunks and tracks uploaded", func(_ context.Context, r *recording) bool {
-            return r.inProgressChunks == 0 && r.inProgressTracks == 0
+        fsm.WithGuard("all chunks and tracks uploaded", func(_ context.Context, r *recording) error {
+            if r.inProgressChunks != 0 || r.inProgressTracks != 0 {
+                return fmt.Errorf("%w: %d chunks", ErrUploadPending, r.inProgressChunks)
+            }
+            return nil
         }),
     ).
     On(recUpload, recFinished, recUploaded).
@@ -53,6 +56,21 @@ m.Fire(ctx, &st, recFinish, "nope")
 This is what generic methods buy. `Fire[A any](ctx, *S, Event[A], A)` is a method on `Machine[S]`, which knows nothing about `A` — before Go 1.27 this had to be a package-level `fsm.Fire(m, ctx, &st, ev, arg)`, or `A` had to be erased to `any` and checked at runtime.
 
 **Nothing panics at fire time.** Configuration mistakes come back from `Build`; unknown transitions come back from `Fire` as `*NoTransitionError`. `MustBuild` panics, but only at construction, so a bad definition fails at process start. This matters when a machine is driven by a replicated log: a panic on a malformed event takes down every replica replaying it, not just one.
+
+**Guards reject with an error, not a bool.** A refusal usually has a reason the caller needs to act on — retry later, or give up. The guard's error is wrapped in a `*GuardError[S]`, which unwraps to it, so both the structure and the reason are available:
+
+```go
+err := recordingFSM.Fire(ctx, &r.state, recFinish, r)
+
+errors.Is(err, ErrUploadPending)   // the guard's own reason — retry later
+
+var ge *fsm.GuardError[recState]
+errors.As(err, &ge)                // ge.Guard, ge.From, ge.To, ge.Event
+```
+
+The `desc` passed to `WithGuard` is the *static* condition, used to label the edge in `DOT()` output and named in the error message. The returned error is the *dynamic* reason the condition did not hold this time. `Check` returns the same error without firing, when you want the reason but not the transition; `Can` is `Check(...) == nil`.
+
+When several guards are registered on one transition they run in order and the first rejection wins, reported under the description it was declared with.
 
 **Entry/exit hooks cannot fail.** They exist for bookkeeping that must stay paired with the state change. Work that can fail goes in `WithAction`, which runs *before* the state changes and aborts the transition on error. The ordering is fixed:
 
@@ -100,11 +118,11 @@ func TestRecordingHasOneTerminalState(t *testing.T) {
 - **Flat states only.** No hierarchical states, no substates, no orthogonal regions.
 - **No built-in async.** No trigger queue, no run-to-completion mode. `Fire` is synchronous and reentrant-unsafe by design: if your state is already serialized behind a queue or a mutex, a second one inside the machine is pure overhead.
 - **`S` must be `comparable`.** Integer-backed enums are the intended shape; that keeps states usable as protobuf fields.
-- **Guards must be pure.** They are also evaluated by `Can`.
+- **Guards must be pure.** They are also evaluated by `Check` and `Can`.
 
 ## Status
 
-Prototype. The API is not settled — in particular `Option[A]`, the hook signature, and whether guards should return an error instead of a `(bool, string)` pair.
+Prototype. The API is not settled — in particular `Option[A]` and the hook signature.
 
 ## License
 

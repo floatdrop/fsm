@@ -39,6 +39,10 @@ var (
 	recUpload = fsm.Signal("uploaded")
 )
 
+// A guard rejects with a sentinel, so a caller can tell "not finishable yet,
+// retry later" apart from "not finishable at all" without parsing strings.
+var errUploadPending = errors.New("still uploading")
+
 // Gauges tracking how many recordings sit in each state. In hand-written form
 // these are a += and a -= at every site that changes the state, and they drift
 // as soon as one site is missed.
@@ -54,8 +58,12 @@ var recordingFSM = fsm.New[recState]("recording").
 		return nil
 	})).
 	On(recFinish, recStopped, recFinished,
-		fsm.WithGuard("all chunks and tracks uploaded", func(_ context.Context, r *recording) bool {
-			return r.inProgressChunks == 0 && r.inProgressTracks == 0
+		fsm.WithGuard("all chunks and tracks uploaded", func(_ context.Context, r *recording) error {
+			if r.inProgressChunks != 0 || r.inProgressTracks != 0 {
+				return fmt.Errorf("%w: %d chunks, %d tracks",
+					errUploadPending, r.inProgressChunks, r.inProgressTracks)
+			}
+			return nil
 		}),
 	).
 	On(recUpload, recFinished, recUploaded).
@@ -83,7 +91,8 @@ func Example_recording() {
 	err := recordingFSM.Fire(ctx, &r.state, recFinish, r)
 	var ge *fsm.GuardError[recState]
 	if errors.As(err, &ge) {
-		fmt.Println("finish refused:", ge.Reason, "| state still", r.state)
+		fmt.Printf("finish refused by %q: %v\n", ge.Guard, ge.Err)
+		fmt.Println("is upload pending?", errors.Is(err, errUploadPending), "| state still", r.state)
 	}
 
 	r.inProgressChunks = 0
@@ -101,7 +110,8 @@ func Example_recording() {
 	// Output:
 	// state: active
 	// after stop: stopped at 2023-11-14T22:13:20Z
-	// finish refused: all chunks and tracks uploaded | state still stopped
+	// finish refused by "all chunks and tracks uploaded": still uploading: 2 chunks, 0 tracks
+	// is upload pending? true | state still stopped
 	// final: uploaded
 	// gauges: active=0 stopped=0 finished=0 uploaded=1
 }
@@ -136,8 +146,11 @@ var (
 // carry a reason.
 var participantFSM = fsm.New[pcpState]("participant").
 	On(pcpDrop, pcpConnected, pcpReconnecting,
-		fsm.WithGuard("disconnect was not intentional", func(_ context.Context, d disconnect) bool {
-			return !d.intentional
+		fsm.WithGuard("disconnect was not intentional", func(_ context.Context, d disconnect) error {
+			if d.intentional {
+				return fmt.Errorf("intentional disconnect (%s) must be a kick, not a drop", d.reason)
+			}
+			return nil
 		}),
 	).
 	On(pcpReconnect, pcpReconnecting, pcpConnected).

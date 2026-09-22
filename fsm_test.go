@@ -3,6 +3,7 @@ package fsm_test
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 
@@ -113,29 +114,88 @@ func TestPayloadReachesAction(t *testing.T) {
 	}
 }
 
-func TestGuardBlocksTransition(t *testing.T) {
+var errNonZeroExit = errors.New("exit code was not zero")
+
+func guarded(t *testing.T) *fsm.Machine[state] {
+	t.Helper()
 	m, err := fsm.New[state]("job").
 		On(evStart, idle, running).
-		On(evFinish, running, done, fsm.WithGuard("exit code is zero", func(_ context.Context, code int) bool {
-			return code == 0
+		On(evFinish, running, done, fsm.WithGuard("exit code is zero", func(_ context.Context, code int) error {
+			if code != 0 {
+				return fmt.Errorf("%w: got %d", errNonZeroExit, code)
+			}
+			return nil
 		})).
 		Build()
 	if err != nil {
 		t.Fatalf("build: %v", err)
 	}
+	return m
+}
+
+func TestGuardBlocksTransition(t *testing.T) {
+	m := guarded(t)
 	ctx := context.Background()
 
 	st := running
-	err = m.Fire(ctx, &st, evFinish, 1)
+	err := m.Fire(ctx, &st, evFinish, 1)
+
 	var ge *fsm.GuardError[state]
 	if !errors.As(err, &ge) {
 		t.Fatalf("got %v (%T), want *fsm.GuardError", err, err)
 	}
-	if ge.Reason != "exit code is zero" {
-		t.Errorf("reason %q, want %q", ge.Reason, "exit code is zero")
+	if ge.Guard != "exit code is zero" {
+		t.Errorf("guard description %q, want %q", ge.Guard, "exit code is zero")
 	}
 	if st != running {
 		t.Errorf("state changed to %v despite a failed guard", st)
+	}
+
+	if err := m.Fire(ctx, &st, evFinish, 0); err != nil {
+		t.Fatalf("finish with passing guard: %v", err)
+	}
+	if st != done {
+		t.Errorf("got %v, want done", st)
+	}
+}
+
+// The point of returning an error rather than a bool: the caller can match
+// the guard's own reason, not just learn that something was refused.
+func TestGuardErrorUnwrapsToTheGuardsError(t *testing.T) {
+	m := guarded(t)
+	ctx := context.Background()
+
+	st := running
+	err := m.Fire(ctx, &st, evFinish, 3)
+
+	if !errors.Is(err, errNonZeroExit) {
+		t.Errorf("errors.Is(err, errNonZeroExit) = false for %v", err)
+	}
+	if !strings.Contains(err.Error(), "got 3") {
+		t.Errorf("error %q lost the guard's dynamic detail", err)
+	}
+
+	var ge *fsm.GuardError[state]
+	if errors.As(err, &ge) && !errors.Is(ge.Unwrap(), errNonZeroExit) {
+		t.Error("GuardError.Unwrap did not return the guard's error")
+	}
+}
+
+func TestCheckReportsReasonWithoutFiring(t *testing.T) {
+	m := guarded(t)
+	ctx := context.Background()
+
+	if err := m.Check(ctx, running, evFinish, 1); !errors.Is(err, errNonZeroExit) {
+		t.Errorf("Check returned %v, want it to wrap errNonZeroExit", err)
+	}
+	if err := m.Check(ctx, running, evFinish, 0); err != nil {
+		t.Errorf("Check on a passing guard returned %v, want nil", err)
+	}
+
+	// Check reports a missing transition the same way Fire does.
+	var nte *fsm.NoTransitionError[state]
+	if err := m.Check(ctx, idle, evFinish, 0); !errors.As(err, &nte) {
+		t.Errorf("Check from idle returned %v, want *fsm.NoTransitionError", err)
 	}
 
 	if m.Can(ctx, running, evFinish, 1) {
@@ -144,12 +204,66 @@ func TestGuardBlocksTransition(t *testing.T) {
 	if !m.Can(ctx, running, evFinish, 0) {
 		t.Error("Can reported false for a guard that accepts")
 	}
+}
 
-	if err := m.Fire(ctx, &st, evFinish, 0); err != nil {
-		t.Fatalf("finish with passing guard: %v", err)
+// A guard that rejects must not run the action behind it.
+func TestGuardRunsBeforeAction(t *testing.T) {
+	acted := false
+	m, err := fsm.New[state]("job").
+		On(evFinish, running, done,
+			fsm.WithGuard("never", func(context.Context, int) error { return errNonZeroExit }),
+			fsm.WithAction(func(context.Context, int) error { acted = true; return nil }),
+		).
+		Build()
+	if err != nil {
+		t.Fatalf("build: %v", err)
 	}
-	if st != done {
-		t.Errorf("got %v, want done", st)
+
+	st := running
+	if err := m.Fire(context.Background(), &st, evFinish, 1); !errors.Is(err, errNonZeroExit) {
+		t.Fatalf("got %v, want errNonZeroExit", err)
+	}
+	if acted {
+		t.Error("action ran behind a rejecting guard")
+	}
+}
+
+// With several guards the first rejection wins, and it is reported under the
+// description it was registered with.
+func TestFirstRejectingGuardWins(t *testing.T) {
+	errSecond := errors.New("second")
+	m, err := fsm.New[state]("job").
+		On(evFinish, running, done,
+			fsm.WithGuard("first", func(_ context.Context, code int) error {
+				if code < 0 {
+					return errNonZeroExit
+				}
+				return nil
+			}),
+			fsm.WithGuard("second", func(context.Context, int) error { return errSecond }),
+		).
+		Build()
+	if err != nil {
+		t.Fatalf("build: %v", err)
+	}
+	ctx := context.Background()
+	st := running
+
+	var ge *fsm.GuardError[state]
+	if err := m.Fire(ctx, &st, evFinish, -1); errors.As(err, &ge) {
+		if ge.Guard != "first" || !errors.Is(err, errNonZeroExit) {
+			t.Errorf("got guard %q / %v, want the first guard to reject", ge.Guard, err)
+		}
+	} else {
+		t.Fatalf("got %v, want *fsm.GuardError", err)
+	}
+
+	if err := m.Fire(ctx, &st, evFinish, 1); errors.As(err, &ge) {
+		if ge.Guard != "second" || !errors.Is(err, errSecond) {
+			t.Errorf("got guard %q / %v, want the second guard to reject", ge.Guard, err)
+		}
+	} else {
+		t.Fatalf("got %v, want *fsm.GuardError", err)
 	}
 }
 
@@ -315,7 +429,7 @@ func TestDOTIsDeterministic(t *testing.T) {
 // known — is what keeps the payload off the heap.
 func TestFireDoesNotAllocate(t *testing.T) {
 	m, err := fsm.New[state]("job").
-		On(evStart, idle, running, fsm.WithGuard("always", func(context.Context, fsm.Unit) bool { return true })).
+		On(evStart, idle, running, fsm.WithGuard("always", func(context.Context, fsm.Unit) error { return nil })).
 		On(evFinish, running, idle, fsm.WithAction(func(context.Context, int) error { return nil })).
 		OnEnter(running, func(context.Context, fsm.Transition[state]) {}).
 		OnExit(running, func(context.Context, fsm.Transition[state]) {}).
