@@ -135,10 +135,6 @@ One iteration is a round trip of two fires, one of them carrying an action, so a
 
 Single runs vary by around 10%, so re-measure with `-count=6` before quoting a different number.
 
-## Status
-
-Prototype. The API is not settled — in particular `Option[A]` and the hook signature.
-
 ## License
 
 MIT — see [LICENSE](LICENSE).
