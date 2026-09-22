@@ -68,17 +68,20 @@ var gauge = map[recState]int{}
 func incr(s recState) func(context.Context) { return func(context.Context) { gauge[s]++ } }
 func decr(s recState) func(context.Context) { return func(context.Context) { gauge[s]-- } }
 
-// Each transition names its source and target in separate calls, so the two
-// states cannot be swapped the way two adjacent arguments can.
-var recordingFSM = fsm.New[recState]("recording").
-	Gauge(recActive, incr(recActive), decr(recActive)).
-	Gauge(recStopped, incr(recStopped), decr(recStopped)).
-	Gauge(recFinished, incr(recFinished), decr(recFinished)).
-	Gauge(recUploaded, incr(recUploaded), decr(recUploaded)).
-	From(recActive).On(evRecStop).To(recStopped, fsm.WithAction(markStopped)).
-	From(recStopped).On(evRecFinish).To(recFinished, fsm.WithGuard("all chunks and tracks uploaded", uploadsSettled)).
-	From(recFinished).On(evRecUpload).To(recUploaded).
-	MustBuild()
+// A machine is a set of rules. Each transition names its source and target in
+// separate calls, so the two states cannot be swapped the way two adjacent
+// arguments can.
+var recordingFSM = fsm.MustNew("recording",
+	fsm.Gauge(recActive, incr(recActive), decr(recActive)),
+	fsm.Gauge(recStopped, incr(recStopped), decr(recStopped)),
+	fsm.Gauge(recFinished, incr(recFinished), decr(recFinished)),
+	fsm.Gauge(recUploaded, incr(recUploaded), decr(recUploaded)),
+
+	fsm.From(recActive).On(evRecStop).To(recStopped, fsm.WithAction(markStopped)),
+	fsm.From(recStopped).On(evRecFinish).To(recFinished,
+		fsm.WithGuard("all chunks and tracks uploaded", uploadsSettled)),
+	fsm.From(recFinished).On(evRecUpload).To(recUploaded),
+)
 
 // A recording moves active -> stopped -> finished -> uploaded. The order is
 // declared once; every caller goes through Fire, so no call site can skip a
@@ -158,12 +161,13 @@ func unintentional(_ context.Context, d disconnect) error {
 // Modelling a participant makes deletion an explicit terminal state rather
 // than "absent from the map", so the last transition is expressible and can
 // carry a reason.
-var participantFSM = fsm.New[pcpState]("participant").
-	From(pcpConnected).On(evPcpDrop).To(pcpReconnecting, fsm.WithGuard("disconnect was not intentional", unintentional)).
-	From(pcpReconnecting).On(evPcpReconnect).To(pcpConnected).
-	From(pcpConnected).On(evPcpKick).To(pcpDeleted).
-	From(pcpReconnecting).On(evPcpKick).To(pcpDeleted).
-	MustBuild()
+var participantFSM = fsm.MustNew("participant",
+	fsm.From(pcpConnected).On(evPcpDrop).To(pcpReconnecting,
+		fsm.WithGuard("disconnect was not intentional", unintentional)),
+	fsm.From(pcpReconnecting).On(evPcpReconnect).To(pcpConnected),
+	fsm.From(pcpConnected).On(evPcpKick).To(pcpDeleted),
+	fsm.From(pcpReconnecting).On(evPcpKick).To(pcpDeleted),
+)
 
 func Example_participant() {
 	ctx := context.Background()

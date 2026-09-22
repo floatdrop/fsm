@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"strings"
 	"testing"
 
@@ -41,11 +42,11 @@ var (
 
 func linear(t *testing.T) *fsm.Machine[state] {
 	t.Helper()
-	m, err := fsm.New[state]("job").
-		From(idle).On(evStart).To(running).
-		From(running).On(evFinish).To(done).
-		From(running).On(evCancel).To(cancelled).
-		Build()
+	m, err := fsm.New("job",
+		fsm.From(idle).On(evStart).To(running),
+		fsm.From(running).On(evFinish).To(done),
+		fsm.From(running).On(evCancel).To(cancelled),
+	)
 	if err != nil {
 		t.Fatalf("build: %v", err)
 	}
@@ -98,10 +99,10 @@ func TestPayloadReachesAction(t *testing.T) {
 		got = code
 		return nil
 	}
-	m, err := fsm.New[state]("job").
-		From(idle).On(evStart).To(running).
-		From(running).On(evFinish).To(done, fsm.WithAction(record)).
-		Build()
+	m, err := fsm.New("job",
+		fsm.From(idle).On(evStart).To(running),
+		fsm.From(running).On(evFinish).To(done, fsm.WithAction(record)),
+	)
 	if err != nil {
 		t.Fatalf("build: %v", err)
 	}
@@ -126,10 +127,10 @@ func zeroExit(_ context.Context, code int) error {
 
 func guarded(t *testing.T) *fsm.Machine[state] {
 	t.Helper()
-	m, err := fsm.New[state]("job").
-		From(idle).On(evStart).To(running).
-		From(running).On(evFinish).To(done, fsm.WithGuard("exit code is zero", zeroExit)).
-		Build()
+	m, err := fsm.New("job",
+		fsm.From(idle).On(evStart).To(running),
+		fsm.From(running).On(evFinish).To(done, fsm.WithGuard("exit code is zero", zeroExit)),
+	)
 	if err != nil {
 		t.Fatalf("build: %v", err)
 	}
@@ -214,9 +215,9 @@ func TestGuardRunsBeforeAction(t *testing.T) {
 	never := fsm.WithGuard("never", func(context.Context, int) error { return errNonZeroExit })
 	act := fsm.WithAction(func(context.Context, int) error { acted = true; return nil })
 
-	m, err := fsm.New[state]("job").
-		From(running).On(evFinish).To(done, never, act).
-		Build()
+	m, err := fsm.New("job",
+		fsm.From(running).On(evFinish).To(done, never, act),
+	)
 	if err != nil {
 		t.Fatalf("build: %v", err)
 	}
@@ -242,9 +243,9 @@ func TestFirstRejectingGuardWins(t *testing.T) {
 	})
 	second := fsm.WithGuard("second", func(context.Context, int) error { return errSecond })
 
-	m, err := fsm.New[state]("job").
-		From(running).On(evFinish).To(done, first, second).
-		Build()
+	m, err := fsm.New("job",
+		fsm.From(running).On(evFinish).To(done, first, second),
+	)
 	if err != nil {
 		t.Fatalf("build: %v", err)
 	}
@@ -274,11 +275,11 @@ func TestActionErrorAbortsTransition(t *testing.T) {
 	boom := errors.New("boom")
 	var hooks []string
 
-	m, err := fsm.New[state]("job").
-		OnExit(running, func(context.Context, fsm.Transition[state]) { hooks = append(hooks, "exit") }).
-		OnEnter(done, func(context.Context, fsm.Transition[state]) { hooks = append(hooks, "enter") }).
-		From(running).On(evFinish).To(done, fsm.WithAction(func(context.Context, int) error { return boom })).
-		Build()
+	m, err := fsm.New("job",
+		fsm.OnExit(running, func(context.Context, fsm.Transition[state]) { hooks = append(hooks, "exit") }),
+		fsm.OnEnter(done, func(context.Context, fsm.Transition[state]) { hooks = append(hooks, "enter") }),
+		fsm.From(running).On(evFinish).To(done, fsm.WithAction(func(context.Context, int) error { return boom })),
+	)
 	if err != nil {
 		t.Fatalf("build: %v", err)
 	}
@@ -301,15 +302,15 @@ func TestActionErrorAbortsTransition(t *testing.T) {
 func TestHooksBracketTheAssignment(t *testing.T) {
 	var order []string
 
-	m, err := fsm.New[state]("job").
-		OnExit(running, func(_ context.Context, tr fsm.Transition[state]) {
+	m, err := fsm.New("job",
+		fsm.OnExit(running, func(_ context.Context, tr fsm.Transition[state]) {
 			order = append(order, "exit:"+tr.From.String()+"->"+tr.To.String())
-		}).
-		OnEnter(done, func(_ context.Context, tr fsm.Transition[state]) {
+		}),
+		fsm.OnEnter(done, func(_ context.Context, tr fsm.Transition[state]) {
 			order = append(order, "enter:"+tr.From.String()+"->"+tr.To.String())
-		}).
-		From(running).On(evFinish).To(done).
-		Build()
+		}),
+		fsm.From(running).On(evFinish).To(done),
+	)
 	if err != nil {
 		t.Fatalf("build: %v", err)
 	}
@@ -332,12 +333,12 @@ func TestGaugeStaysPaired(t *testing.T) {
 	inc := func(s state) func(context.Context) { return func(context.Context) { counts[s]++ } }
 	dec := func(s state) func(context.Context) { return func(context.Context) { counts[s]-- } }
 
-	m, err := fsm.New[state]("job").
-		Gauge(running, inc(running), dec(running)).
-		Gauge(done, inc(done), dec(done)).
-		From(idle).On(evStart).To(running).
-		From(running).On(evFinish).To(done).
-		Build()
+	m, err := fsm.New("job",
+		fsm.Gauge(running, inc(running), dec(running)),
+		fsm.Gauge(done, inc(done), dec(done)),
+		fsm.From(idle).On(evStart).To(running),
+		fsm.From(running).On(evFinish).To(done),
+	)
 	if err != nil {
 		t.Fatalf("build: %v", err)
 	}
@@ -364,10 +365,10 @@ func TestGaugeStaysPaired(t *testing.T) {
 }
 
 func TestBuildRejectsDuplicateTransition(t *testing.T) {
-	_, err := fsm.New[state]("job").
-		From(idle).On(evStart).To(running).
-		From(idle).On(evStart).To(cancelled).
-		Build()
+	_, err := fsm.New("job",
+		fsm.From(idle).On(evStart).To(running),
+		fsm.From(idle).On(evStart).To(cancelled),
+	)
 	if err == nil {
 		t.Fatal("expected a duplicate-transition error")
 	}
@@ -376,13 +377,49 @@ func TestBuildRejectsDuplicateTransition(t *testing.T) {
 	}
 }
 
+// Rules are plain values, so a set shared by several machines can be declared
+// once and reused. Applying the same rule twice must not let one machine see
+// the other's edges.
+func TestRulesAreReusableValues(t *testing.T) {
+	shared := []fsm.Rule[state]{
+		fsm.From(idle).On(evStart).To(running),
+		fsm.From(running).On(evCancel).To(cancelled),
+	}
+
+	short, err := fsm.New("short", shared...)
+	if err != nil {
+		t.Fatalf("build short: %v", err)
+	}
+	long, err := fsm.New("long", slices.Concat(shared, []fsm.Rule[state]{
+		fsm.From(running).On(evFinish).To(done),
+	})...)
+	if err != nil {
+		t.Fatalf("build long: %v", err)
+	}
+
+	if got := len(short.Edges()); got != 2 {
+		t.Errorf("short has %d edges, want 2", got)
+	}
+	if got := len(long.Edges()); got != 3 {
+		t.Errorf("long has %d edges, want 3", got)
+	}
+
+	// The extra edge belongs to long alone.
+	if _, ok := short.To(running, evFinish); ok {
+		t.Error("short picked up an edge declared only for long")
+	}
+	if _, ok := long.To(running, evFinish); !ok {
+		t.Error("long is missing its own edge")
+	}
+}
+
 func TestBuildRejectsZeroEvent(t *testing.T) {
 	var zero fsm.Event[int]
 
-	_, err := fsm.New[state]("job").
-		From(idle).On(evStart).To(running).
-		From(running).On(zero).To(done).
-		Build()
+	_, err := fsm.New("job",
+		fsm.From(idle).On(evStart).To(running),
+		fsm.From(running).On(zero).To(done),
+	)
 	if err == nil {
 		t.Fatal("expected an error for a transition on the zero Event")
 	}
@@ -392,7 +429,7 @@ func TestBuildRejectsZeroEvent(t *testing.T) {
 }
 
 func TestBuildRejectsEmptyMachine(t *testing.T) {
-	if _, err := fsm.New[state]("job").Build(); err == nil {
+	if _, err := fsm.New[state]("job"); err == nil {
 		t.Fatal("expected an error for a machine with no transitions")
 	}
 }
@@ -446,12 +483,12 @@ func TestDOTIsDeterministic(t *testing.T) {
 // Combining guards and actions at build time — where the payload type is still
 // known — is what keeps the payload off the heap.
 func TestFireDoesNotAllocate(t *testing.T) {
-	m, err := fsm.New[state]("job").
-		From(idle).On(evStart).To(running, fsm.WithGuard("always", func(context.Context, fsm.Unit) error { return nil })).
-		From(running).On(evFinish).To(idle, fsm.WithAction(func(context.Context, int) error { return nil })).
-		OnEnter(running, func(context.Context, fsm.Transition[state]) {}).
-		OnExit(running, func(context.Context, fsm.Transition[state]) {}).
-		Build()
+	m, err := fsm.New("job",
+		fsm.From(idle).On(evStart).To(running, fsm.WithGuard("always", func(context.Context, fsm.Unit) error { return nil })),
+		fsm.From(running).On(evFinish).To(idle, fsm.WithAction(func(context.Context, int) error { return nil })),
+		fsm.OnEnter(running, func(context.Context, fsm.Transition[state]) {}),
+		fsm.OnExit(running, func(context.Context, fsm.Transition[state]) {}),
+	)
 	if err != nil {
 		t.Fatalf("build: %v", err)
 	}
@@ -468,10 +505,10 @@ func TestFireDoesNotAllocate(t *testing.T) {
 }
 
 func BenchmarkFire(b *testing.B) {
-	m, err := fsm.New[state]("job").
-		From(idle).On(evStart).To(running).
-		From(running).On(evFinish).To(idle, fsm.WithAction(func(context.Context, int) error { return nil })).
-		Build()
+	m, err := fsm.New("job",
+		fsm.From(idle).On(evStart).To(running),
+		fsm.From(running).On(evFinish).To(idle, fsm.WithAction(func(context.Context, int) error { return nil })),
+	)
 	if err != nil {
 		b.Fatal(err)
 	}

@@ -11,7 +11,7 @@
 // is no ...any in the public API, and no type assertions in user code.
 //
 // Nothing in this package panics at fire time. Configuration mistakes are
-// reported by [Builder.Build]; unknown transitions are reported by
+// reported by [New]; unknown transitions are reported by
 // [Machine.Fire] as errors. This matters when a machine is driven by a
 // replicated log: a panic on a malformed event would take down every replica
 // replaying it, not just one.
@@ -60,8 +60,7 @@ func (e Event[A]) Name() string {
 func (e Event[A]) String() string { return e.Name() }
 
 // Transition describes a state change that is about to happen or has just
-// happened. It is passed to the hooks registered with [Builder.OnEnter] and
-// [Builder.OnExit].
+// happened. It is passed to the hooks declared with [OnEnter] and [OnExit].
 type Transition[S comparable] struct {
 	From  S
 	To    S
@@ -81,7 +80,7 @@ type edge[S comparable] struct {
 // aborts the transition on error.
 type Hook[S comparable] func(context.Context, Transition[S])
 
-// Machine is an immutable state machine built by a [Builder].
+// Machine is an immutable state machine built by [New] from a set of [Rule]s.
 //
 // A Machine holds no state and is safe for concurrent use.
 type Machine[S comparable] struct {

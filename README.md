@@ -1,6 +1,6 @@
 # fsm
 
-A small finite state machine for Go, built around three ideas: **the caller owns the state**, **events carry typed payloads**, and **a transition names its source and target separately** so they cannot be swapped.
+A small finite state machine for Go, built around three ideas: **the caller owns the state**, **events carry typed payloads**, and **a machine is a set of rules** whose source and target are named separately so they cannot be swapped.
 
 Requires **Go 1.27** — the API uses generic methods, which earlier versions reject with `method must have no type parameters`.
 
@@ -22,14 +22,15 @@ var (
     evRecUpload = fsm.Signal("uploaded")
 )
 
-var recordingFSM = fsm.New[recState]("recording").
-    Gauge(recActive, metrics.Inc(recActive), metrics.Dec(recActive)).
-    Gauge(recStopped, metrics.Inc(recStopped), metrics.Dec(recStopped)).
-    From(recActive).On(evRecStop).To(recStopped, fsm.WithAction(markStopped)).
-    From(recStopped).On(evRecFinish).To(recFinished,
-        fsm.WithGuard("all chunks and tracks uploaded", uploadsSettled)).
-    From(recFinished).On(evRecUpload).To(recUploaded).
-    MustBuild()
+var recordingFSM = fsm.MustNew("recording",
+    fsm.Gauge(recActive, metrics.Inc(recActive), metrics.Dec(recActive)),
+    fsm.Gauge(recStopped, metrics.Inc(recStopped), metrics.Dec(recStopped)),
+
+    fsm.From(recActive).On(evRecStop).To(recStopped, fsm.WithAction(markStopped)),
+    fsm.From(recStopped).On(evRecFinish).To(recFinished,
+        fsm.WithGuard("all chunks and tracks uploaded", uploadsSettled)),
+    fsm.From(recFinished).On(evRecUpload).To(recUploaded),
+)
 
 // The state lives in your struct. Fire mutates it in place.
 err := recordingFSM.Fire(ctx, &r.state, evRecStop, r)
@@ -48,17 +49,35 @@ m.Fire(ctx, &st, evRecFinish, "nope")
 
 This is what generic methods buy. `Fire[A any](ctx, *S, Event[A], A)` is a method on `Machine[S]`, which knows nothing about `A` — before Go 1.27 this had to be a package-level `fsm.Fire(m, ctx, &st, ev, arg)`, or `A` had to be erased to `any` and checked at runtime.
 
+**A machine is a set of rules, not a builder.** `New` takes its transitions, gauges and hooks as `Rule[S]` values and returns `(*Machine[S], error)` in one call. There is no `Build()` step to forget and no mutable builder to hold half-finished. Because rules are ordinary values, a shared set can be declared once and reused:
+
+```go
+shared := []fsm.Rule[state]{
+    fsm.From(idle).On(evStart).To(running),
+    fsm.From(running).On(evCancel).To(cancelled),
+}
+
+short := fsm.MustNew("short", shared...)
+long  := fsm.MustNew("long", slices.Concat(shared, []fsm.Rule[state]{
+    fsm.From(running).On(evFinish).To(done),
+})...)
+```
+
+`S` is inferred from the rules, so `fsm.New("recording", …)` needs no explicit type argument.
+
 **A transition names its source and target in separate calls.** `From(a).On(ev).To(b)` rather than `On(ev, a, b)`. Two adjacent parameters of the same state type are indistinguishable to the compiler and to a reader, and swapping them silently reverses the edge. Splitting them into three calls means there is nothing to swap:
 
 ```go
-From(recStopped).On(evRecFinish).To(recFinished)
+fsm.From(recStopped).On(evRecFinish).To(recFinished)
 ```
 
-The chain is also what carries the payload type: `From` knows `S`, `On[A]` picks up `A` from the event, and `To` takes options that must match it. A `WithGuard` written for the wrong payload is a compile error at the point it is declared.
+The chain is also what carries the payload type: `From` knows `S`, `On[A]` picks up `A` from the event, and `To` takes options that must match it. A `WithGuard` written for the wrong payload is a compile error at the point it is declared. `To` erases `A` only after that check, which is why a `Rule[S]` can sit in the same list as transitions carrying any other payload.
+
+Two things are called options-ish, and they are not the same: a **`Rule[S]`** declares part of a machine and goes to `New`; an **`Option[A]`** configures one transition and goes to `To`.
 
 **States and events are named so they cannot be confused.** Events take an `ev` prefix; states take the plain domain prefix. Without that rule a machine ends up with `recStop` the event next to `recStopped` the state, and `pcpReconnect` next to `pcpReconnecting` — one tense apart, which is not a difference worth relying on when reading a transition table.
 
-**Nothing panics at fire time.** Configuration mistakes come back from `Build`; unknown transitions come back from `Fire` as `*NoTransitionError`. `MustBuild` panics, but only at construction, so a bad definition fails at process start. This matters when a machine is driven by a replicated log: a panic on a malformed event takes down every replica replaying it, not just one.
+**Nothing panics at fire time.** Configuration mistakes come back from `New`; unknown transitions come back from `Fire` as `*NoTransitionError`. `MustNew` panics, but only at construction, so a bad definition fails at process start. This matters when a machine is driven by a replicated log: a panic on a malformed event takes down every replica replaying it, not just one.
 
 **Guards reject with an error, not a bool.** A refusal usually has a reason the caller needs to act on — retry later, or give up. The guard's error is wrapped in a `*GuardError[S]`, which unwraps to it, so both the structure and the reason are available:
 

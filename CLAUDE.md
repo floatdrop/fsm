@@ -9,9 +9,10 @@ that way. This file is the working detail behind it; the two are edited
 together.
 
 Library: `fsm.go` (package doc, `Event`, `Machine`, `Fire`, `Send`, `Check`,
-`Can`, `To`, the error types), `builder.go` (`New`, the
-`From`/`On`/`To` chain, hooks, `Gauge`, `Build`, and the
-`WithGuard`/`WithAction` options), `introspect.go` (`States`,
+`Can`, `To`, the error types), `rules.go` (`New`/`MustNew`, the `Rule` type
+and everything that produces one — the `From`/`On`/`To` chain, `Gauge`,
+`OnEnter`, `OnExit` — plus the `WithGuard`/`WithAction` options),
+`introspect.go` (`States`,
 `Edges`, `Terminals`, `Unreachable`, `DOT`). Tests are `fsm_test.go` and the
 worked machines in `example_test.go`.
 
@@ -98,7 +99,7 @@ committed-and-diffable only as long as that holds.
 
 - **Errors, not panics, once the machine is built.** Configuration mistakes come
   back from `Build`; unknown transitions and rejected guards come back from
-  `Fire` as `*NoTransitionError` / `*GuardError`. `MustBuild` panics, but only
+  `Fire` as `*NoTransitionError` / `*GuardError`. `MustNew` panics, but only
   at construction, so a bad definition fails at process start. The motivating
   caller drives a machine from a replicated log, where a panic on a malformed
   event takes down every replica replaying it rather than one host. Do not
@@ -116,16 +117,21 @@ committed-and-diffable only as long as that holds.
   exists because the natural names collide by tense — `recStop` the event
   beside `recStopped` the state, `pcpReconnect` beside `pcpReconnecting`. A
   reader scanning a transition table cannot be asked to tell those apart.
-- **A transition is declared as `From(a).On(ev).To(b)`**, never as one call
-  taking both states. Two adjacent parameters of the same state type are
+- **A transition is declared as `fsm.From(a).On(ev).To(b)`**, never as one
+  call taking both states. Two adjacent parameters of the same state type are
   indistinguishable and a swap silently reverses the edge. If a shorthand for
   bulk declarations is ever added, it must keep the roles distinguishable in
   the same way — a `[]Edge{{From: …, To: …}}` literal qualifies, a positional
   pair does not.
-- **Guards and actions longer than one line get a named function.** `gofmt`
-  indents a multi-line closure inside a method chain badly, and the chain is
-  the readable part. `example_test.go` shows the shape: `markStopped`,
-  `uploadsSettled`, `unintentional`.
+- **Inline multi-line guards and actions are fine now.** They format correctly
+  inside `New`'s argument list; it was the old method chain that made `gofmt`
+  dedent them. Named callbacks in `example_test.go` (`markStopped`,
+  `uploadsSettled`) are a readability choice, not a workaround.
+- **`Rule[S]` and `Option[A]` are different things** and the names have to
+  keep them apart: a `Rule` declares part of a machine and goes to `New`; an
+  `Option` configures one transition and goes to `To`. This is the one real
+  cost of taking rules as arguments instead of chaining a builder, so do not
+  blur it by naming a new constructor ambiguously.
 - **Tests take their context from `t.Context()`, benchmarks from `b.Context()`.**
   The two `context.Background()` calls left in `example_test.go` are not an
   oversight: an `Example` function has no `testing.TB`, so there is nothing to
