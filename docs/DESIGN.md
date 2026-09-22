@@ -142,6 +142,45 @@ currently in state *s*" is otherwise a `+= 1` and a `-= 1` at every call site
 that changes the state, and it drifts the first time a site is missed.
 `Gauge(s, inc, dec)` binds the pair to the state itself.
 
+### Hooks that need the payload name their event
+
+A plain `Hook` gets a `Transition[S]` and no payload, because a state can be
+entered by events carrying different types — there is no single `A` to hand
+it. Naming the event fixes that:
+
+```go
+fsm.OnEnterVia(pcpDeleted, evPcpKick, func(_ context.Context, tr fsm.Transition[pcpState], d disconnect) {
+    log.Info("participant kicked", "reason", d.reason)
+})
+```
+
+`OnEnterVia` and `OnExitVia` run only when that event is what caused the
+transition, and they are typed in its payload. Without them the only place to
+see the payload is an `Action`, which has to be repeated on every incoming
+edge and runs before the state changes — exactly the duplication hooks exist
+to remove.
+
+They run after the plain hooks of the same state, and cost nothing on a
+machine that declares none: a single flag set at construction skips the whole
+hook block, including the lookups the plain hooks would do.
+
+### Branch on the trigger, not on its name
+
+`Transition.Event` is the trigger's name, for logging. Names are not unique —
+two events declared with the same name are different triggers — so a hook that
+needs to know what fired should ask:
+
+```go
+if tr.Is(evPcpKick) { … }
+```
+
+### Self-transitions run exit and entry
+
+`From(a).On(ev).To(a)` is allowed, and is UML's *external* self-transition: it
+runs the exit hooks, assigns, then runs the entry hooks. A `Gauge` on the
+state therefore dips to zero and comes back. There is no internal transition
+that skips the hooks; an `Action` covers that case.
+
 ## Fire does not allocate
 
 Guards and actions are combined at build time, where the payload type is still

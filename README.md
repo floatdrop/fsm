@@ -128,10 +128,13 @@ go test -bench Fire -benchmem -run '^$' ./...
 goos: darwin
 goarch: arm64
 cpu: Apple M3 Pro
-BenchmarkFire-12    29121236    40.52 ns/op    0 B/op    0 allocs/op
+BenchmarkFire-12             35204294    33.74 ns/op    0 B/op    0 allocs/op
+BenchmarkFireWithHooks-12    17826518    67.18 ns/op    0 B/op    0 allocs/op
 ```
 
-One iteration is a round trip of two fires, one of them carrying an action, so a single `Fire` is roughly 20 ns. The zero is the part that matters and is pinned by `TestFireDoesNotAllocate`; it runs without `-race`, which changes the allocation profile.
+One iteration is a round trip of two fires, one of them carrying an action, so a single `Fire` is roughly 17 ns. `FireWithHooks` is the same round trip on a machine declaring an entry hook, an exit hook and both payload hooks — that is what hooks cost, and a machine that declares none does not pay it: one flag checked at the top of `Fire` skips the hook block entirely.
+
+The zero is the part that matters and is pinned by `TestFireDoesNotAllocate`; it runs without `-race`, which changes the allocation profile.
 
 Single runs vary by around 10%, so re-measure with `-count=6` before quoting a different number.
 

@@ -36,12 +36,14 @@ type builder[S comparable] struct {
 func New[S comparable](name string, rules ...Rule[S]) (*Machine[S], error) {
 	b := &builder[S]{
 		m: &Machine[S]{
-			name:    name,
-			table:   make(map[edge[S]]S),
-			guards:  make(map[edge[S]]any),
-			actions: make(map[edge[S]]any),
-			onEnter: make(map[S][]Hook[S]),
-			onExit:  make(map[S][]Hook[S]),
+			name:       name,
+			table:      make(map[edge[S]]S),
+			guards:     make(map[edge[S]]any),
+			actions:    make(map[edge[S]]any),
+			onEnter:    make(map[S][]Hook[S]),
+			onExit:     make(map[S][]Hook[S]),
+			onEnterVia: make(map[edge[S]][]any),
+			onExitVia:  make(map[edge[S]][]any),
 		},
 		seen: make(map[S]bool),
 	}
@@ -57,6 +59,8 @@ func New[S comparable](name string, rules ...Rule[S]) (*Machine[S], error) {
 	if len(b.m.table) == 0 {
 		b.errs = append(b.errs, errors.New("no transitions declared"))
 	}
+	b.m.hasHooks = len(b.m.onEnter) > 0 || len(b.m.onExit) > 0 ||
+		len(b.m.onEnterVia) > 0 || len(b.m.onExitVia) > 0
 	if len(b.errs) > 0 {
 		return nil, fmt.Errorf("fsm %s: %w", name, errors.Join(b.errs...))
 	}
@@ -107,6 +111,12 @@ type OnStep[S comparable, A any] struct {
 // also the place to hang guards and actions:
 //
 //	fsm.From(a).On(ev).To(b).Guard("...", g).Action(f)
+//
+// A self-transition — To naming the state On came from — is allowed and runs
+// the full sequence: the exit hooks of the state, the assignment, then its
+// entry hooks. That is UML's external self-transition, and it means a [Gauge]
+// on the state decrements and increments back to where it was. There is no
+// internal transition that skips the hooks; use an [ToStep.Action] for that.
 func (o OnStep[S, A]) To(to S) *ToStep[S, A] {
 	return &ToStep[S, A]{from: o.from, ev: o.ev, to: to}
 }
@@ -234,6 +244,58 @@ func OnExit[S comparable](s S, h Hook[S]) Rule[S] {
 		b.m.onExit[s] = append(b.m.onExit[s], h)
 		b.declare(s)
 	})
+}
+
+// OnEnterVia declares a hook that runs just after the machine enters s, but
+// only when ev is what put it there — and hands the hook that event's
+// payload:
+//
+//	fsm.OnEnterVia(pcpDeleted, evPcpKick, func(_ context.Context, tr fsm.Transition[pcpState], d disconnect) {
+//		log.Info("participant kicked", "reason", d.reason)
+//	})
+//
+// A plain [OnEnter] hook cannot do this: a state can be entered by events
+// carrying different payload types, so there is no single type to hand it.
+// Naming the event fixes A, which is what makes the hook typed.
+//
+// Like [OnEnter], it runs after the state has changed and cannot fail. It
+// runs after the plain entry hooks of the same state.
+func OnEnterVia[S comparable, A any](s S, ev Event[A], h func(context.Context, Transition[S], A)) Rule[S] {
+	return ruleFunc[S](func(b *builder[S]) {
+		if !b.checkVia("OnEnterVia", s, ev.def, h == nil) {
+			return
+		}
+		k := edge[S]{from: s, ev: ev.def}
+		b.m.onEnterVia[k] = append(b.m.onEnterVia[k], h)
+		b.declare(s)
+	})
+}
+
+// OnExitVia declares a hook that runs just before the machine leaves s, but
+// only when ev is what moves it — and hands the hook that event's payload.
+// See [OnEnterVia]. It runs after the plain exit hooks of the same state, and
+// still before the state changes.
+func OnExitVia[S comparable, A any](s S, ev Event[A], h func(context.Context, Transition[S], A)) Rule[S] {
+	return ruleFunc[S](func(b *builder[S]) {
+		if !b.checkVia("OnExitVia", s, ev.def, h == nil) {
+			return
+		}
+		k := edge[S]{from: s, ev: ev.def}
+		b.m.onExitVia[k] = append(b.m.onExitVia[k], h)
+		b.declare(s)
+	})
+}
+
+func (b *builder[S]) checkVia(what string, s S, def *eventDef, nilHook bool) bool {
+	if nilHook {
+		b.errs = append(b.errs, fmt.Errorf("nil %s hook for state %v", what, s))
+		return false
+	}
+	if def == nil {
+		b.errs = append(b.errs, fmt.Errorf("%s for state %v: zero Event; declare it with fsm.Define or fsm.Signal", what, s))
+		return false
+	}
+	return true
 }
 
 // Gauge pairs an increment on entering s with a decrement on leaving it.

@@ -62,9 +62,23 @@ func (e Event[A]) String() string { return e.Name() }
 // Transition describes a state change that is about to happen or has just
 // happened. It is passed to the hooks declared with [OnEnter] and [OnExit].
 type Transition[S comparable] struct {
-	From  S
-	To    S
+	From S
+	To   S
+
+	// Event is the trigger's name, for logging. Names are not unique —
+	// compare with [Transition.Is] to identify the trigger.
 	Event string
+
+	trigger *eventDef
+}
+
+// Is reports whether ev triggered the transition.
+//
+// Branch on this rather than on [Transition.Event]: events are identified by
+// declaration, not by name, so two events declared with the same name are
+// different triggers that Event cannot tell apart.
+func (t Transition[S]) Is[A any](ev Event[A]) bool {
+	return t.trigger != nil && t.trigger == ev.def
 }
 
 // edge is the key of the transition table.
@@ -78,6 +92,11 @@ type edge[S comparable] struct {
 // incrementing and decrementing a gauge. Work that can fail belongs in an
 // action registered with [ToStep.Action], which runs before the state changes and
 // aborts the transition on error.
+//
+// A Hook does not see the event's payload, because a state can be entered by
+// events carrying different types. When the payload is what the hook is for,
+// declare it with [OnEnterVia] or [OnExitVia], which name the event and so
+// know its type.
 type Hook[S comparable] func(context.Context, Transition[S])
 
 // Machine is an immutable state machine built by [New] from a set of [Rule]s.
@@ -86,10 +105,21 @@ type Hook[S comparable] func(context.Context, Transition[S])
 type Machine[S comparable] struct {
 	name    string
 	table   map[edge[S]]S
-	guards  map[edge[S]]any // func(context.Context, A) (bool, string)
+	guards  map[edge[S]]any // func(context.Context, A) (string, error)
 	actions map[edge[S]]any // func(context.Context, A) error
 	onEnter map[S][]Hook[S]
 	onExit  map[S][]Hook[S]
+
+	// Payload-aware hooks, keyed by (state, event) rather than (from, event).
+	// Each holds func(context.Context, Transition[S], A) for the A of that
+	// event. Kept separate so a machine that declares none pays one length
+	// check per fire.
+	onEnterVia map[edge[S]][]any
+	onExitVia  map[edge[S]][]any
+
+	// True when any of the four hook maps is non-empty. A machine that
+	// declares no hooks skips building the Transition and looking any up.
+	hasHooks bool
 
 	// Declaration order, kept so that introspection and DOT output are
 	// deterministic rather than map-iteration order.
@@ -138,13 +168,31 @@ func (m *Machine[S]) Fire[A any](ctx context.Context, st *S, ev Event[A], arg A)
 		}
 	}
 
-	t := Transition[S]{From: *st, To: to, Event: ev.def.name}
+	if !m.hasHooks {
+		*st = to
+		return nil
+	}
+
+	t := Transition[S]{From: *st, To: to, Event: ev.def.name, trigger: ev.def}
+
 	for _, h := range m.onExit[t.From] {
 		h(ctx, t)
 	}
+	if len(m.onExitVia) > 0 {
+		for _, raw := range m.onExitVia[edge[S]{from: t.From, ev: ev.def}] {
+			raw.(func(context.Context, Transition[S], A))(ctx, t, arg)
+		}
+	}
+
 	*st = to
+
 	for _, h := range m.onEnter[to] {
 		h(ctx, t)
+	}
+	if len(m.onEnterVia) > 0 {
+		for _, raw := range m.onEnterVia[edge[S]{from: to, ev: ev.def}] {
+			raw.(func(context.Context, Transition[S], A))(ctx, t, arg)
+		}
 	}
 	return nil
 }

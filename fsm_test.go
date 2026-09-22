@@ -426,6 +426,186 @@ func TestBuildRejectsZeroEvent(t *testing.T) {
 	}
 }
 
+// Two events can share a name, so a hook that branches on Transition.Event
+// cannot tell them apart. Is compares the trigger's identity.
+func TestTransitionIsIdentifiesTheTrigger(t *testing.T) {
+	first, second := fsm.Signal("tick"), fsm.Signal("tick")
+
+	var names []string
+	var matchedFirst, matchedSecond int
+	m, err := fsm.New("job",
+		fsm.OnEnter(running, func(_ context.Context, tr fsm.Transition[state]) {
+			names = append(names, tr.Event)
+			if tr.Is(first) {
+				matchedFirst++
+			}
+			if tr.Is(second) {
+				matchedSecond++
+			}
+		}),
+		fsm.From(idle).On(first).To(running),
+		fsm.From(done).On(second).To(running),
+		fsm.From(running).On(evFinish).To(done),
+	)
+	if err != nil {
+		t.Fatalf("build: %v", err)
+	}
+
+	ctx := t.Context()
+	st := idle
+	if err := m.Send(ctx, &st, first); err != nil { // idle -> running
+		t.Fatal(err)
+	}
+	if err := m.Fire(ctx, &st, evFinish, 0); err != nil { // running -> done
+		t.Fatal(err)
+	}
+	if err := m.Send(ctx, &st, second); err != nil { // done -> running
+		t.Fatal(err)
+	}
+
+	// The name cannot distinguish them; the identity can.
+	if got := strings.Join(names, ","); got != "tick,tick" {
+		t.Errorf("hook saw events %q, want \"tick,tick\"", got)
+	}
+	if matchedFirst != 1 || matchedSecond != 1 {
+		t.Errorf("Is matched first=%d second=%d, want 1 and 1", matchedFirst, matchedSecond)
+	}
+}
+
+func TestTransitionIsRejectsTheZeroEvent(t *testing.T) {
+	var zero fsm.Event[int]
+	if (fsm.Transition[state]{}).Is(zero) {
+		t.Error("the zero Transition matched the zero Event")
+	}
+}
+
+// A state can be entered by events carrying different payloads, so a plain
+// hook cannot be typed. Naming the event fixes A and hands the hook the
+// payload that caused the transition.
+func TestOnEnterViaSeesThePayload(t *testing.T) {
+	var got []int
+	var plain int
+	m, err := fsm.New("job",
+		fsm.OnEnter(done, func(context.Context, fsm.Transition[state]) { plain++ }),
+		fsm.OnEnterVia(done, evFinish, func(_ context.Context, tr fsm.Transition[state], code int) {
+			if tr.To != done {
+				t.Errorf("hook ran for a transition into %v", tr.To)
+			}
+			got = append(got, code)
+		}),
+		fsm.From(running).On(evFinish).To(done),
+		fsm.From(running).On(evCancel).To(done), // same target, different event
+		fsm.From(done).On(evStart).To(running),
+	)
+	if err != nil {
+		t.Fatalf("build: %v", err)
+	}
+
+	ctx := t.Context()
+	st := running
+	if err := m.Fire(ctx, &st, evFinish, 7); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.Send(ctx, &st, evStart); err != nil {
+		t.Fatal(err)
+	}
+	// Entering done by another event must not run the evFinish hook.
+	if err := m.Send(ctx, &st, evCancel); err != nil {
+		t.Fatal(err)
+	}
+
+	if len(got) != 1 || got[0] != 7 {
+		t.Errorf("payload hook saw %v, want [7]", got)
+	}
+	if plain != 2 {
+		t.Errorf("plain hook ran %d times, want 2", plain)
+	}
+}
+
+func TestOnExitViaRunsBeforeTheStateChanges(t *testing.T) {
+	var seen []string
+	m, err := fsm.New("job",
+		fsm.OnExit(running, func(context.Context, fsm.Transition[state]) { seen = append(seen, "plain") }),
+		fsm.OnExitVia(running, evFinish, func(_ context.Context, tr fsm.Transition[state], code int) {
+			seen = append(seen, fmt.Sprintf("via:%d:%v->%v", code, tr.From, tr.To))
+		}),
+		fsm.From(running).On(evFinish).To(done),
+	)
+	if err != nil {
+		t.Fatalf("build: %v", err)
+	}
+
+	st := running
+	if err := m.Fire(t.Context(), &st, evFinish, 3); err != nil {
+		t.Fatal(err)
+	}
+	want := "plain,via:3:running->done"
+	if got := strings.Join(seen, ","); got != want {
+		t.Errorf("hooks ran %q, want %q", got, want)
+	}
+}
+
+func TestBuildRejectsBadViaHooks(t *testing.T) {
+	var zero fsm.Event[int]
+
+	_, err := fsm.New("job",
+		fsm.From(idle).On(evStart).To(running),
+		fsm.OnEnterVia(done, evFinish, nil),
+		fsm.OnExitVia(done, zero, func(context.Context, fsm.Transition[state], int) {}),
+	)
+	if err == nil {
+		t.Fatal("expected errors for a nil hook and a zero Event")
+	}
+	for _, want := range []string{"nil OnEnterVia hook", "OnExitVia", "zero Event"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error %q does not mention %q", err, want)
+		}
+	}
+}
+
+// A self-transition is UML's external kind: it runs exit and entry, so a
+// gauge on the state dips and comes back rather than standing still.
+func TestSelfTransitionRunsExitAndEntry(t *testing.T) {
+	var seq []string
+	gauge, low := 0, 0
+	m, err := fsm.New("job",
+		fsm.Gauge(running,
+			func(context.Context) { gauge++ },
+			func(context.Context) { gauge--; low = min(low, gauge) },
+		),
+		fsm.OnExit(running, func(context.Context, fsm.Transition[state]) { seq = append(seq, "exit") }),
+		fsm.OnEnter(running, func(context.Context, fsm.Transition[state]) { seq = append(seq, "enter") }),
+		fsm.From(idle).On(evStart).To(running),
+		fsm.From(running).On(evCancel).To(running), // self-transition
+	)
+	if err != nil {
+		t.Fatalf("build: %v", err)
+	}
+
+	ctx := t.Context()
+	st := idle
+	if err := m.Send(ctx, &st, evStart); err != nil {
+		t.Fatal(err)
+	}
+	seq = nil // drop the entry from idle -> running
+
+	if err := m.Send(ctx, &st, evCancel); err != nil {
+		t.Fatalf("self-transition: %v", err)
+	}
+	if st != running {
+		t.Errorf("state is %v, want running", st)
+	}
+	if got := strings.Join(seq, ","); got != "exit,enter" {
+		t.Errorf("self-transition ran %q, want \"exit,enter\"", got)
+	}
+	if gauge != 1 {
+		t.Errorf("gauge settled at %d, want 1", gauge)
+	}
+	if low != 0 {
+		t.Errorf("gauge dipped to %d during the self-transition, want it to reach 0", low)
+	}
+}
+
 // A nil guard used to be dropped in silence, taking its description out of
 // the DOT label with it: the machine read as guarded and ran unguarded.
 func TestBuildRejectsNilGuard(t *testing.T) {
@@ -555,6 +735,9 @@ func TestFireDoesNotAllocate(t *testing.T) {
 		fsm.From(running).On(evFinish).To(idle).Action(func(context.Context, int) error { return nil }),
 		fsm.OnEnter(running, func(context.Context, fsm.Transition[state]) {}),
 		fsm.OnExit(running, func(context.Context, fsm.Transition[state]) {}),
+		// Payload hooks run in the same path and must not box the payload.
+		fsm.OnEnterVia(running, evStart, func(context.Context, fsm.Transition[state], fsm.Unit) {}),
+		fsm.OnExitVia(running, evFinish, func(context.Context, fsm.Transition[state], int) {}),
 	)
 	if err != nil {
 		t.Fatalf("build: %v", err)
@@ -568,6 +751,29 @@ func TestFireDoesNotAllocate(t *testing.T) {
 	})
 	if avg != 0 {
 		t.Errorf("Fire allocates %.1f times per round trip, want 0", avg)
+	}
+}
+
+// The companion to BenchmarkFire: what hooks cost when a machine uses them.
+func BenchmarkFireWithHooks(b *testing.B) {
+	m, err := fsm.New("job",
+		fsm.OnEnter(running, func(context.Context, fsm.Transition[state]) {}),
+		fsm.OnExit(running, func(context.Context, fsm.Transition[state]) {}),
+		fsm.OnEnterVia(running, evStart, func(context.Context, fsm.Transition[state], fsm.Unit) {}),
+		fsm.OnExitVia(running, evFinish, func(context.Context, fsm.Transition[state], int) {}),
+		fsm.From(idle).On(evStart).To(running),
+		fsm.From(running).On(evFinish).To(idle),
+	)
+	if err != nil {
+		b.Fatal(err)
+	}
+	ctx := b.Context()
+	st := idle
+
+	b.ReportAllocs()
+	for b.Loop() {
+		_ = m.Send(ctx, &st, evStart)
+		_ = m.Fire(ctx, &st, evFinish, 1)
 	}
 }
 

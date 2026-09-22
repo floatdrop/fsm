@@ -89,6 +89,28 @@ cannot fail, so an increment and its decrement cannot come apart. Changing this
 order breaks `TestHooksBracketTheAssignment` and `TestGaugeStaysPaired`, which
 is the point of both.
 
+**A plain `Hook` cannot see the payload, and that is structural.** A state can
+be entered by events carrying different `A`, so there is no single type to
+hand it. `OnEnterVia`/`OnExitVia` name the event, which fixes `A`; that is the
+only way to get a typed hook, so do not widen `Hook` to carry `any`. They run
+after the plain hooks of the same state.
+
+**`Transition.Event` is a name, for logging; `Transition.Is` is identity.**
+Two events can share a name, so anything branching on the trigger uses `Is`.
+Do not add logic keyed on the string.
+
+**A machine with no hooks must not pay for hooks.** `Machine.hasHooks` is set
+at construction and short-circuits the whole block in `Fire`, including the
+map lookups the plain hooks would do — it is why the hookless path is faster
+than it was before payload hooks existed. `BenchmarkFire` and
+`BenchmarkFireWithHooks` are the pair that keeps this honest; measure both
+before and after touching the fire path.
+
+**Self-transitions are UML's external kind.** `From(a).On(ev).To(a)` runs
+exit then entry, so a `Gauge` dips and returns. Pinned by
+`TestSelfTransitionRunsExitAndEntry`; do not turn it into an internal
+transition that skips the hooks.
+
 **Declaration order is the output order.** `Machine.states` and `Machine.edges`
 are slices kept alongside the maps purely so `States`, `Edges`, `Terminals` and
 `DOT` never iterate a map. `S` is only `comparable`, not ordered, so there is
