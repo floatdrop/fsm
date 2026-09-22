@@ -141,22 +141,6 @@ committed-and-diffable only as long as that holds.
   a number quoted from one is noise.
 - **No dependencies.** The module requires nothing. Keep it that way — the
   package is meant to be vendorable into a monorepo without pulling a tree in.
-- **`docs/assets/logo.svg` is traced, not drawn.** It came from a painted PNG
-  with an alpha channel, via vtracer. The silhouette is the alpha, not a
-  colour key — the transparent pixels are RGB black, so anything that
-  palette-maps before masking on alpha turns the background into pupils.
-  Within the silhouette, pixels map to four colours (`#1478D0` blue,
-  `#FBF0E2` eye whites, `#F0DEC3` teeth, `#242547` pupils), each traced as
-  its own binary layer, with the bodies drawn as the whole silhouette so the
-  overlays cannot leave pinholes at their edges.
-- **Do not fill holes in the silhouette.** The space inside the ring of arms
-  and the gaps between limbs are real holes and must stay transparent;
-  `binary_fill_holes` turns the four dancers into one blob.
-- **Teeth are a colour, not a shape.** They are `#f0dec3` against `#fbf0e2`
-  eye whites — close enough that a coarse palette folds them together, which
-  once cost one gopher its teeth entirely.
-- Edit the SVG directly; there is no committed script, and re-tracing from the
-  PNG would not reproduce it byte for byte.
 
 ## Tooling caveats
 
