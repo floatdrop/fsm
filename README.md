@@ -64,8 +64,8 @@ err := recordingFSM.Fire(ctx, &r.state, recFinish, r)
 
 errors.Is(err, ErrUploadPending)   // the guard's own reason — retry later
 
-var ge *fsm.GuardError[recState]
-errors.As(err, &ge)                // ge.Guard, ge.From, ge.To, ge.Event
+ge, ok := errors.AsType[*fsm.GuardError[recState]](err)
+// ge.Guard, ge.From, ge.To, ge.Event
 ```
 
 The `desc` passed to `WithGuard` is the *static* condition, used to label the edge in `DOT()` output and named in the error message. The returned error is the *dynamic* reason the condition did not hold this time. `Check` returns the same error without firing, when you want the reason but not the transition; `Can` is `Check(...) == nil`.

@@ -89,8 +89,7 @@ func Example_recording() {
 
 	// Finishing early is refused by the guard, and the state does not move.
 	err := recordingFSM.Fire(ctx, &r.state, recFinish, r)
-	var ge *fsm.GuardError[recState]
-	if errors.As(err, &ge) {
+	if ge, ok := errors.AsType[*fsm.GuardError[recState]](err); ok {
 		fmt.Printf("finish refused by %q: %v\n", ge.Guard, ge.Err)
 		fmt.Println("is upload pending?", errors.Is(err, errUploadPending), "| state still", r.state)
 	}

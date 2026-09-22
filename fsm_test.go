@@ -54,7 +54,7 @@ func linear(t *testing.T) *fsm.Machine[state] {
 
 func TestFireAdvancesState(t *testing.T) {
 	m := linear(t)
-	ctx := context.Background()
+	ctx := t.Context()
 
 	st := idle
 	if err := m.Send(ctx, &st, evStart); err != nil {
@@ -75,13 +75,13 @@ func TestFireRejectsUnknownTransition(t *testing.T) {
 	m := linear(t)
 	st := idle
 
-	err := m.Fire(context.Background(), &st, evFinish, 0)
+	err := m.Fire(t.Context(), &st, evFinish, 0)
 	if err == nil {
 		t.Fatal("expected an error firing finish from idle")
 	}
 
-	var nte *fsm.NoTransitionError[state]
-	if !errors.As(err, &nte) {
+	nte, ok := errors.AsType[*fsm.NoTransitionError[state]](err)
+	if !ok {
 		t.Fatalf("got %T, want *fsm.NoTransitionError", err)
 	}
 	if nte.From != idle || nte.Event != "finish" {
@@ -106,7 +106,7 @@ func TestPayloadReachesAction(t *testing.T) {
 	}
 
 	st := running
-	if err := m.Fire(context.Background(), &st, evFinish, 42); err != nil {
+	if err := m.Fire(t.Context(), &st, evFinish, 42); err != nil {
 		t.Fatalf("finish: %v", err)
 	}
 	if got != 42 {
@@ -135,13 +135,13 @@ func guarded(t *testing.T) *fsm.Machine[state] {
 
 func TestGuardBlocksTransition(t *testing.T) {
 	m := guarded(t)
-	ctx := context.Background()
+	ctx := t.Context()
 
 	st := running
 	err := m.Fire(ctx, &st, evFinish, 1)
 
-	var ge *fsm.GuardError[state]
-	if !errors.As(err, &ge) {
+	ge, ok := errors.AsType[*fsm.GuardError[state]](err)
+	if !ok {
 		t.Fatalf("got %v (%T), want *fsm.GuardError", err, err)
 	}
 	if ge.Guard != "exit code is zero" {
@@ -163,7 +163,7 @@ func TestGuardBlocksTransition(t *testing.T) {
 // the guard's own reason, not just learn that something was refused.
 func TestGuardErrorUnwrapsToTheGuardsError(t *testing.T) {
 	m := guarded(t)
-	ctx := context.Background()
+	ctx := t.Context()
 
 	st := running
 	err := m.Fire(ctx, &st, evFinish, 3)
@@ -175,15 +175,14 @@ func TestGuardErrorUnwrapsToTheGuardsError(t *testing.T) {
 		t.Errorf("error %q lost the guard's dynamic detail", err)
 	}
 
-	var ge *fsm.GuardError[state]
-	if errors.As(err, &ge) && !errors.Is(ge.Unwrap(), errNonZeroExit) {
+	if ge, ok := errors.AsType[*fsm.GuardError[state]](err); ok && !errors.Is(ge.Unwrap(), errNonZeroExit) {
 		t.Error("GuardError.Unwrap did not return the guard's error")
 	}
 }
 
 func TestCheckReportsReasonWithoutFiring(t *testing.T) {
 	m := guarded(t)
-	ctx := context.Background()
+	ctx := t.Context()
 
 	if err := m.Check(ctx, running, evFinish, 1); !errors.Is(err, errNonZeroExit) {
 		t.Errorf("Check returned %v, want it to wrap errNonZeroExit", err)
@@ -193,9 +192,9 @@ func TestCheckReportsReasonWithoutFiring(t *testing.T) {
 	}
 
 	// Check reports a missing transition the same way Fire does.
-	var nte *fsm.NoTransitionError[state]
-	if err := m.Check(ctx, idle, evFinish, 0); !errors.As(err, &nte) {
-		t.Errorf("Check from idle returned %v, want *fsm.NoTransitionError", err)
+	missing := m.Check(ctx, idle, evFinish, 0)
+	if _, ok := errors.AsType[*fsm.NoTransitionError[state]](missing); !ok {
+		t.Errorf("Check from idle returned %v, want *fsm.NoTransitionError", missing)
 	}
 
 	if m.Can(ctx, running, evFinish, 1) {
@@ -220,7 +219,7 @@ func TestGuardRunsBeforeAction(t *testing.T) {
 	}
 
 	st := running
-	if err := m.Fire(context.Background(), &st, evFinish, 1); !errors.Is(err, errNonZeroExit) {
+	if err := m.Fire(t.Context(), &st, evFinish, 1); !errors.Is(err, errNonZeroExit) {
 		t.Fatalf("got %v, want errNonZeroExit", err)
 	}
 	if acted {
@@ -246,11 +245,11 @@ func TestFirstRejectingGuardWins(t *testing.T) {
 	if err != nil {
 		t.Fatalf("build: %v", err)
 	}
-	ctx := context.Background()
+	ctx := t.Context()
 	st := running
 
-	var ge *fsm.GuardError[state]
-	if err := m.Fire(ctx, &st, evFinish, -1); errors.As(err, &ge) {
+	err = m.Fire(ctx, &st, evFinish, -1)
+	if ge, ok := errors.AsType[*fsm.GuardError[state]](err); ok {
 		if ge.Guard != "first" || !errors.Is(err, errNonZeroExit) {
 			t.Errorf("got guard %q / %v, want the first guard to reject", ge.Guard, err)
 		}
@@ -258,7 +257,8 @@ func TestFirstRejectingGuardWins(t *testing.T) {
 		t.Fatalf("got %v, want *fsm.GuardError", err)
 	}
 
-	if err := m.Fire(ctx, &st, evFinish, 1); errors.As(err, &ge) {
+	err = m.Fire(ctx, &st, evFinish, 1)
+	if ge, ok := errors.AsType[*fsm.GuardError[state]](err); ok {
 		if ge.Guard != "second" || !errors.Is(err, errSecond) {
 			t.Errorf("got guard %q / %v, want the second guard to reject", ge.Guard, err)
 		}
@@ -281,7 +281,7 @@ func TestActionErrorAbortsTransition(t *testing.T) {
 	}
 
 	st := running
-	err = m.Fire(context.Background(), &st, evFinish, 0)
+	err = m.Fire(t.Context(), &st, evFinish, 0)
 	if !errors.Is(err, boom) {
 		t.Fatalf("got %v, want it to wrap boom", err)
 	}
@@ -312,7 +312,7 @@ func TestHooksBracketTheAssignment(t *testing.T) {
 	}
 
 	st := running
-	if err := m.Fire(context.Background(), &st, evFinish, 0); err != nil {
+	if err := m.Fire(t.Context(), &st, evFinish, 0); err != nil {
 		t.Fatalf("finish: %v", err)
 	}
 
@@ -338,7 +338,7 @@ func TestGaugeStaysPaired(t *testing.T) {
 	if err != nil {
 		t.Fatalf("build: %v", err)
 	}
-	ctx := context.Background()
+	ctx := t.Context()
 
 	for range 100 {
 		st := idle
@@ -384,7 +384,7 @@ func TestZeroEventIsAnErrorNotAPanic(t *testing.T) {
 	var zero fsm.Event[int]
 
 	st := idle
-	err := m.Fire(context.Background(), &st, zero, 0)
+	err := m.Fire(t.Context(), &st, zero, 0)
 	if err == nil {
 		t.Fatal("expected an error for the zero Event")
 	}
@@ -437,7 +437,7 @@ func TestFireDoesNotAllocate(t *testing.T) {
 	if err != nil {
 		t.Fatalf("build: %v", err)
 	}
-	ctx := context.Background()
+	ctx := t.Context()
 	st := idle
 
 	avg := testing.AllocsPerRun(1000, func() {
@@ -457,7 +457,7 @@ func BenchmarkFire(b *testing.B) {
 	if err != nil {
 		b.Fatal(err)
 	}
-	ctx := context.Background()
+	ctx := b.Context()
 	st := idle
 
 	b.ReportAllocs()

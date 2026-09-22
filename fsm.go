@@ -196,7 +196,7 @@ func (m *Machine[S]) To[A any](from S, ev Event[A]) (S, bool) {
 }
 
 // NoTransitionError reports an event fired from a state that does not accept
-// it. Match it with errors.As.
+// it. Match it with errors.AsType.
 type NoTransitionError[S comparable] struct {
 	Machine string
 	From    S

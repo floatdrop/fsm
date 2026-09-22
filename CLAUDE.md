@@ -111,6 +111,10 @@ committed-and-diffable only as long as that holds.
   carries the two machines the design was drawn from, a recording lifecycle and
   a participant connection. They are tests, not prose: changing the API means
   changing them, and `ExampleMachine_DOT` pins the exact rendering.
+- **Tests take their context from `t.Context()`, benchmarks from `b.Context()`.**
+  The two `context.Background()` calls left in `example_test.go` are not an
+  oversight: an `Example` function has no `testing.TB`, so there is nothing to
+  take a context from.
 - **Benchmark numbers in `README.md` are measured, not estimated.** Re-run with
   `-count=6` before changing one; single runs vary by ~10% on this machine and
   a number quoted from one is noise.
