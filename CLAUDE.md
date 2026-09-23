@@ -96,7 +96,11 @@ and its decrement cannot come apart. Changing this order breaks
 `TestHooksBracketTheAssignment` and `TestGaugeStaysPaired`, which is the point
 of both. `Fire` reads `*st` once, before any callback: the payload is usually
 the aggregate holding the state, and a guard or action that writes it is
-reported as `*StateChangedError` with nothing assigned. Writing `to` is not
+reported as `*StateChangedError` with nothing assigned — ahead of the
+callback's own rejection or failure, since an `*ActionError` promises the
+state untouched. It keeps that error in `Err` but does not unwrap to it: a
+guard's sentinel means "retry", and matching it here would re-fire from a
+state that is no longer `from`. Writing `to` is not
 exempt: a nested fire landing there would run every hook twice. The check
 runs after the guards and again after the action, and always before the exit
 hooks, because after an exit hook has run an error would leave a gauge

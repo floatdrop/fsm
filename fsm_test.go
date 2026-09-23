@@ -109,19 +109,32 @@ func TestActionWritingTheStateIsAnError(t *testing.T) {
 	if err != nil {
 		t.Fatalf("build: %v", err)
 	}
-	if _, err := m3.Fire(ctx, &st, evFinish, 1); !strings.Contains(err.Error(), "state changed to idle during running --finish--> done") {
+	_, err = m3.Fire(ctx, &st, evFinish, 1)
+	if err == nil || !strings.Contains(err.Error(), "state changed to idle during running --finish--> done") {
 		t.Errorf("got %v, want the guard's write reported", err)
 	}
+	// The rejection is kept but not unwrapped: matching its sentinel would
+	// read as "state untouched, retry".
+	if sce, ok := errors.AsType[*fsm.StateChangedError[state]](err); !ok || sce.Guard != "never" || sce.Err != errBoom || errors.Is(err, errBoom) {
+		t.Errorf("error %q: want the guard and its rejection kept, not unwrapped", err)
+	}
+	if !strings.Contains(err.Error(), `guard "never": boom`) {
+		t.Errorf("error %q does not name the rejecting guard", err)
+	}
 
-	// A failing action is reported as the failure, naming the original source.
+	// So is an action's write ahead of its failure: an ActionError would claim
+	// the state untouched.
 	st = running
 	_, err = m.Send(ctx, &st, evCancel)
-	ae, ok := errors.AsType[*fsm.ActionError[state]](err)
-	if !ok || ae.From != running || ae.To != cancelled || ae.Event != "cancel" {
-		t.Fatalf("got %v, want an ActionError for running --cancel--> cancelled", err)
+	sce, ok = errors.AsType[*fsm.StateChangedError[state]](err)
+	if !ok || sce.From != running || sce.To != cancelled || sce.Found != idle || sce.Event != "cancel" {
+		t.Fatalf("got %v, want a StateChangedError for running --cancel--> cancelled finding idle", err)
 	}
-	if !errors.Is(err, errBoom) || !strings.Contains(err.Error(), "running --cancel--> cancelled: boom") {
-		t.Errorf("error %q does not unwrap to the action's error", err)
+	if sce.Err != errBoom || errors.Is(err, errBoom) || !strings.Contains(err.Error(), "running --cancel--> cancelled: boom") {
+		t.Errorf("error %q: want the action's error in Err and the message, not unwrapped", err)
+	}
+	if st != idle || len(exited) != 0 {
+		t.Errorf("state %v, exited %v; want the action's write kept and no hook run", st, exited)
 	}
 }
 
@@ -590,6 +603,10 @@ func TestActionErrorAbortsTransition(t *testing.T) {
 	_, err = m.Fire(t.Context(), &st, evFinish, 0)
 	if !errors.Is(err, boom) {
 		t.Fatalf("got %v, want it to wrap boom", err)
+	}
+	ae, ok := errors.AsType[*fsm.ActionError[state]](err)
+	if !ok || ae.From != running || ae.To != done || ae.Event != "finish" {
+		t.Errorf("got %v, want an ActionError for running --finish--> done", err)
 	}
 	if st != running {
 		t.Errorf("state changed to %v after a failing action", st)

@@ -207,7 +207,7 @@ func (m *Machine[S]) Fire[A any](ctx context.Context, st *S, ev Event[A], arg A)
 	if raw, ok := m.guards[e]; ok {
 		desc, err := raw.(func(context.Context, A) (string, error))(ctx, arg)
 		if *st != from {
-			return none, &StateChangedError[S]{Machine: m.name, From: from, To: to, Found: *st, Event: ev.def.name}
+			return none, &StateChangedError[S]{Machine: m.name, From: from, To: to, Found: *st, Event: ev.def.name, Guard: desc, Err: err}
 		}
 		if err != nil {
 			return none, &GuardError[S]{Machine: m.name, From: from, To: to, Event: ev.def.name, Guard: desc, Err: err}
@@ -215,11 +215,14 @@ func (m *Machine[S]) Fire[A any](ctx context.Context, st *S, ev Event[A], arg A)
 	}
 
 	if raw, ok := m.actions[e]; ok {
-		if err := raw.(func(context.Context, A) error)(ctx, arg); err != nil {
-			return none, &ActionError[S]{Machine: m.name, From: from, To: to, Event: ev.def.name, Err: err}
-		}
+		// A write is reported ahead of a failure, as for guards: the caller
+		// must learn that *st no longer holds from.
+		err := raw.(func(context.Context, A) error)(ctx, arg)
 		if *st != from {
-			return none, &StateChangedError[S]{Machine: m.name, From: from, To: to, Found: *st, Event: ev.def.name}
+			return none, &StateChangedError[S]{Machine: m.name, From: from, To: to, Found: *st, Event: ev.def.name, Err: err}
+		}
+		if err != nil {
+			return none, &ActionError[S]{Machine: m.name, From: from, To: to, Event: ev.def.name, Err: err}
 		}
 	}
 
@@ -362,16 +365,30 @@ func (e *ActionError[S]) Unwrap() error { return e.Err }
 
 // StateChangedError reports that a guard or action wrote the state, which
 // happens when the payload aliases it. The write is left in place; the
-// machine assigns nothing and runs no hook.
+// machine assigns nothing and runs no hook. It takes precedence over a
+// rejection or failure from the same callback, whose error is kept in Err.
+//
+// It deliberately does not unwrap to Err: a guard's sentinel means "state
+// untouched, retry", and here the state was touched.
 type StateChangedError[S comparable] struct {
 	Machine string
 	From    S // the state the transition started from
 	To      S // the state it was going to
 	Found   S // the state the guard or action left behind
 	Event   string
+	Guard   string // the rejecting guard's description, empty otherwise
+	Err     error  // what the guard or action also returned, nil if it succeeded
 }
 
 func (e *StateChangedError[S]) Error() string {
+	if e.Guard != "" {
+		return fmt.Sprintf("fsm %s: state changed to %v during %v --%s--> %v: guard %q: %v",
+			e.Machine, e.Found, e.From, e.Event, e.To, e.Guard, e.Err)
+	}
+	if e.Err != nil {
+		return fmt.Sprintf("fsm %s: state changed to %v during %v --%s--> %v: %v",
+			e.Machine, e.Found, e.From, e.Event, e.To, e.Err)
+	}
 	return fmt.Sprintf("fsm %s: state changed to %v during %v --%s--> %v",
 		e.Machine, e.Found, e.From, e.Event, e.To)
 }

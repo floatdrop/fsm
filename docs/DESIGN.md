@@ -190,7 +190,11 @@ write the field `Fire` is working on. `Fire` reads the state once, and if a
 guard or action changed it, assigns nothing, runs no hook and reports it,
 rather than overwriting the write and running the hooks of an edge that was
 never taken. Writing the target is no exception: a nested fire that landed
-there would otherwise run every hook twice.
+there would otherwise run every hook twice. The write is reported even when
+the callback also failed, since a `GuardError` or `ActionError` would tell the
+caller the state was untouched. The callback's error is kept in `Err` but
+not unwrapped, so a sentinel meaning "retry later" does not match a state
+that has moved.
 
 ## Guards reject with an error, not a bool
 

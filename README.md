@@ -52,7 +52,7 @@ _, err := recordingFSM.Send(ctx, &r.state, evRecUpload)
 // fsm recording: no transition from active on uploaded
 ```
 
-Every fire-time failure is a typed error carrying the edge: `*NoTransitionError`, `*GuardError`, `*ActionError`, or `*StateChangedError` when a guard or action wrote the state through an aliased payload. `GuardError` and `ActionError` unwrap to the guard's or action's own error, so a sentinel can be matched with `errors.Is`. A nil state pointer or the zero `Event` is a plain error, since it is a bug in the caller.
+Every fire-time failure is a typed error carrying the edge: `*NoTransitionError`, `*GuardError`, `*ActionError`, or `*StateChangedError` when a guard or action wrote the state through an aliased payload, reported ahead of any error that callback also returned (kept in its `Err`, but not unwrapped, since the state did move). `GuardError` and `ActionError` unwrap to the guard's or action's own error, so a sentinel can be matched with `errors.Is`. A nil state pointer or the zero `Event` is a plain error, since it is a bug in the caller.
 
 The reasoning behind the API (state ownership, typed payloads, `Rule` as the single option type, guard semantics, known limitations) is in [docs/DESIGN.md](docs/DESIGN.md).
 
