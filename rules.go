@@ -60,6 +60,10 @@ type builder[S comparable] struct {
 	// Rules that must run once every transition is known.
 	deferred []func(*builder[S])
 
+	// Whether the definition had errors before the deferred phase, so a
+	// deferred check can stay quiet about rows a broken rule dropped.
+	broken bool
+
 	// Which group each inherited row came from, so that two groups claiming
 	// the same (state, event) is reported rather than read as an override.
 	inherited map[edge[S]]string
@@ -127,6 +131,7 @@ func New[S comparable](name string, rules ...Rule[S]) (*Machine[S], error) {
 	for _, e := range b.expand {
 		e(b)
 	}
+	b.broken = len(b.errs) > 0
 	for _, d := range b.deferred {
 		d(b)
 	}
@@ -530,7 +535,8 @@ func Initial[S comparable](s S) Rule[S] {
 // Naming the event fixes A, which is what makes the hook typed.
 //
 // Like [OnEnter], it runs after the state has changed and cannot fail. It
-// runs after the plain entry hooks of the same state.
+// runs after the plain entry hooks of the same state. [New] rejects it when
+// no transition on ev enters s, since it could never run.
 func OnEnterVia[S comparable, A any](s S, ev Event[A], h func(context.Context, Transition[S], A)) Rule[S] {
 	return ruleFunc[S](func(b *builder[S]) {
 		if !b.checkVia("OnEnterVia", s, ev.def, h == nil) {
@@ -539,6 +545,7 @@ func OnEnterVia[S comparable, A any](s S, ev Event[A], h func(context.Context, T
 		k := edge[S]{from: s, ev: ev.def}
 		b.m.onEnterVia[k] = append(b.m.onEnterVia[k], h)
 		b.declare(s)
+		b.requireVia("OnEnterVia", "enters", s, ev.def, func(d decl[S]) bool { return d.to == s })
 	})
 }
 
@@ -554,6 +561,7 @@ func OnExitVia[S comparable, A any](s S, ev Event[A], h func(context.Context, Tr
 		k := edge[S]{from: s, ev: ev.def}
 		b.m.onExitVia[k] = append(b.m.onExitVia[k], h)
 		b.declare(s)
+		b.requireVia("OnExitVia", "leaves", s, ev.def, func(d decl[S]) bool { return d.key.from == s })
 	})
 }
 
@@ -567,6 +575,21 @@ func (b *builder[S]) checkVia(what string, s S, def *eventDef, nilHook bool) boo
 		return false
 	}
 	return true
+}
+
+// requireVia defers a check that some transition on def matches, so a Via
+// hook that can never run is reported rather than silently dead.
+func (b *builder[S]) requireVia(what, verb string, s S, def *eventDef, match func(decl[S]) bool) {
+	b.deferred = append(b.deferred, func(b *builder[S]) {
+		// A broken rule may be what dropped the row; report it alone.
+		if b.broken {
+			return
+		}
+		if !slices.ContainsFunc(b.decls, func(d decl[S]) bool { return d.key.ev == def && match(d) }) {
+			b.errs = append(b.errs, fmt.Errorf(
+				"%s for state %v: no transition on %s %s it, so the hook would never run", what, s, def.name, verb))
+		}
+	})
 }
 
 // Gauge pairs an increment on entering s with a decrement on leaving it.
@@ -621,6 +644,9 @@ func GaugeWith[S comparable, A any](s S, inc, dec func(context.Context, A)) Rule
 			enter := func(ctx context.Context, _ Transition[S], a A) { inc(ctx, a) }
 			exit := func(ctx context.Context, _ Transition[S], a A) { dec(ctx, a) }
 			var touched int
+			// Hooks are keyed by (s, event), which several rows can share when
+			// sources fan in; each key gets one hook or the gauge over-counts.
+			entered, left := make(map[edge[S]]bool), make(map[edge[S]]bool)
 			for _, d := range b.decls {
 				entering := d.to == s
 				leaving := d.key.from == s
@@ -635,10 +661,12 @@ func GaugeWith[S comparable, A any](s S, inc, dec func(context.Context, A)) Rule
 					continue
 				}
 				k := edge[S]{from: s, ev: d.key.ev}
-				if entering {
+				if entering && !entered[k] {
+					entered[k] = true
 					b.m.onEnterVia[k] = append(b.m.onEnterVia[k], enter)
 				}
-				if leaving {
+				if leaving && !left[k] {
+					left[k] = true
 					b.m.onExitVia[k] = append(b.m.onExitVia[k], exit)
 				}
 			}

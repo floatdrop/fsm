@@ -179,7 +179,10 @@ one listing a member twice does not also get reported as "every member
 overrides it". Same for a member lost to another group: the clash is reported
 and the `inherited == 0` branch is suppressed, because that member did not
 override anything. `TestGroupWithNoMembersReportsOneError` and
-`TestGroupClashDoesNotAlsoReportUnreachable` are the guards. Duplicate members
+`TestGroupClashDoesNotAlsoReportUnreachable` are the guards. The deferred
+Via-hook check likewise stays quiet when `b.broken` — errors existed before the
+deferred phase — since the broken rule may be what dropped the row
+(`TestBrokenGroupDoesNotAlsoReportTheViaHook`). Duplicate members
 are rejected rather than deduplicated — silently accepting them inflates the
 group size so no boundary arrow can ever be drawn.
 
@@ -190,13 +193,17 @@ declaration order does not matter. It compares payload types with
 `payloadToken[A]()`, two typed nil pointers being equal exactly when the types
 match, so no reflect is involved. A state reachable by events of differing
 payload types is an error, never a silently skipped edge: that silence would
-be the drift the gauge exists to prevent.
+be the drift the gauge exists to prevent. Hooks are keyed by `(s, event)`,
+which several rows share when sources fan in — every group transition does —
+so each key gets one hook, not one per row, or a single entry counts N times
+(`TestGaugeWithCountsFanInOnce`).
 
 **A plain `Hook` cannot see the payload, and that is structural.** A state can
 be entered by events carrying different `A`, so there is no single type to
 hand it. `OnEnterVia`/`OnExitVia` name the event, which fixes `A`; that is the
 only way to get a typed hook, so do not widen `Hook` to carry `any`. They run
-after the plain hooks of the same state.
+after the plain hooks of the same state. `New` rejects one no transition on its
+event can trigger, the same way `GaugeWith` rejects an isolated state.
 
 **`Transition.Event()` and `Edge.Event()` are names, for display; `.Is` is
 identity.** Two events can share a name, so anything branching on the trigger

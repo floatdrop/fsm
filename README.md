@@ -140,7 +140,7 @@ fsm.OnTransition(func(_ context.Context, tr fsm.Transition[recState]) {
 }),
 ```
 
-A transition hook observes and must not fire the machine itself; entry hooks may. A hook sees the transition, not the payload, because a state can be entered by events carrying different types. `OnEnterVia` and `OnExitVia` name the event, which fixes the payload type, and `GaugeWith` is `Gauge` for a counter that lives in the payload.
+A transition hook observes and must not fire the machine itself; entry hooks may. A hook sees the transition, not the payload, because a state can be entered by events carrying different types. `OnEnterVia` and `OnExitVia` name the event, which fixes the payload type (`New` rejects one that no transition on that event can trigger), and `GaugeWith` is `Gauge` for a counter that lives in the payload.
 
 The order inside `Fire` is fixed: lookup, guards, action, the check that neither wrote the state, exit hooks, assignment, transition hooks, entry hooks. Everything that can fail does so before the assignment, so a hook never runs for a transition that did not happen.
 

@@ -1050,6 +1050,27 @@ func TestGaugeWithRejectsAnIsolatedState(t *testing.T) {
 	}
 }
 
+// A Via hook no transition can trigger is a mistyped state or event.
+func TestViaHookThatCanNeverRunIsAnError(t *testing.T) {
+	_, err := fsm.New("job",
+		fsm.From(idle).On(evStart).To(running),
+		fsm.From(running).On(evFinish).To(done),
+		fsm.OnEnterVia(done, evStart, func(context.Context, fsm.Transition[state], fsm.Unit) {}),
+		fsm.OnExitVia(idle, evFinish, func(context.Context, fsm.Transition[state], int) {}),
+	)
+	if err == nil {
+		t.Fatal("built a machine with hooks that can never run")
+	}
+	for _, want := range []string{
+		"OnEnterVia for state done: no transition on start enters it",
+		"OnExitVia for state idle: no transition on finish leaves it",
+	} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error %q does not mention %q", err, want)
+		}
+	}
+}
+
 // Declaration order must not matter: the edges are read in a second pass.
 func TestGaugeWithMayBeDeclaredBeforeItsEdges(t *testing.T) {
 	type tally struct{ n int }
@@ -1613,6 +1634,40 @@ func TestGaugeWithSeesGroupInheritedEdges(t *testing.T) {
 	}
 }
 
+// Several sources entering on one event share the (state, event) hook key; the
+// gauge must still move once per entry.
+func TestGaugeWithCountsFanInOnce(t *testing.T) {
+	var delta int
+	m, err := fsm.New("job",
+		fsm.GaugeWith(cancelled,
+			func(_ context.Context, _ int) { delta++ },
+			func(_ context.Context, _ int) { delta-- },
+		),
+		fsm.From(idle).On(evStart).To(running),
+		fsm.FromGroup(fsm.NewGroup("live", idle, running)).On(evFinish).To(cancelled),
+		fsm.FromEach(done, cancelled).On(evFinish).To(idle),
+	)
+	if err != nil {
+		t.Fatalf("build: %v", err)
+	}
+
+	for _, from := range []state{idle, running} {
+		st := from
+		if _, err := m.Fire(t.Context(), &st, evFinish, 1); err != nil {
+			t.Fatalf("cancel from %v: %v", from, err)
+		}
+		if delta != 1 {
+			t.Errorf("gauge moved by %d entering from %v, want 1", delta, from)
+		}
+		if _, err := m.Fire(t.Context(), &st, evFinish, 1); err != nil {
+			t.Fatalf("leave cancelled: %v", err)
+		}
+		if delta != 0 {
+			t.Errorf("gauge at %d after leaving, want 0", delta)
+		}
+	}
+}
+
 // Groups are a build-time expansion, so the fire path must be unchanged.
 func TestGroupFireDoesNotAllocate(t *testing.T) {
 	m, err := fsm.New("job",
@@ -1726,6 +1781,21 @@ func TestGroupRuleCanBeSharedBetweenMachines(t *testing.T) {
 	}
 	if !slices.Equal(first.Edges(), second.Edges()) {
 		t.Errorf("machines built from one rule set differ:\n%v\n%v", first.Edges(), second.Edges())
+	}
+}
+
+// A Via hook on an edge the broken group would have added is not a second mistake.
+func TestBrokenGroupDoesNotAlsoReportTheViaHook(t *testing.T) {
+	_, err := fsm.New("job",
+		fsm.From(idle).On(evStart).To(running),
+		fsm.FromGroup(fsm.NewGroup[state]("empty")).On(evCancel).To(cancelled),
+		fsm.OnEnterVia(cancelled, evCancel, func(context.Context, fsm.Transition[state], fsm.Unit) {}),
+	)
+	if err == nil {
+		t.Fatal("expected an error for a group with no members")
+	}
+	if got := strings.Count(err.Error(), "\n") + 1; got != 1 {
+		t.Errorf("reported %d errors, want 1:\n%v", got, err)
 	}
 }
 
