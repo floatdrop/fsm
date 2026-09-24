@@ -12,18 +12,11 @@
 
 A finite state machine for Go, in one package with no dependencies.
 
-- **The caller owns the state.** `Fire` takes a `*S` that lives in your struct, so a serialized state has no second copy in the machine to drift from.
-- **Events carry typed payloads.** `Event[time.Time]` fires only with a `time.Time`. No `any`, no assertions.
-- **Source and target are separate calls.** `From(a).On(ev).To(b)` — two adjacent arguments of one type can be swapped silently; two calls cannot.
-- **`Fire` does not allocate** and never panics. Definition errors come from `New` at startup.
-
 ```sh
 go get github.com/floatdrop/fsm
 ```
 
 ## Quick start
-
-A complete program.
 
 ```go
 package main
