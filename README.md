@@ -7,6 +7,7 @@
 [![CI](https://github.com/floatdrop/fsm/actions/workflows/ci.yml/badge.svg)](https://github.com/floatdrop/fsm/actions/workflows/ci.yml)
 [![Go Reference](https://pkg.go.dev/badge/github.com/floatdrop/fsm.svg)](https://pkg.go.dev/github.com/floatdrop/fsm)
 [![License](https://img.shields.io/github/license/floatdrop/fsm)](LICENSE)
+[![Awesome Go](https://raw.githubusercontent.com/floatdrop/awesome-go/main/badges/flaotdrop--fsm.svg)](https://floatdrop.github.io/awesome-go/#floatdrop--fsm)
 
 A small finite state machine for Go. The caller owns the state, events carry typed payloads, and a machine is a set of rules whose source and target are named in separate calls so they cannot be swapped.
 
