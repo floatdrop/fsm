@@ -6,6 +6,7 @@
 
 [![CI](https://github.com/floatdrop/fsm/actions/workflows/ci.yml/badge.svg)](https://github.com/floatdrop/fsm/actions/workflows/ci.yml)
 [![Go Reference](https://pkg.go.dev/badge/github.com/floatdrop/fsm.svg)](https://pkg.go.dev/github.com/floatdrop/fsm)
+[![Coverage](https://img.shields.io/badge/coverage-100%25-brightgreen)](https://github.com/floatdrop/fsm/actions/workflows/ci.yml)
 [![License](https://img.shields.io/github/license/floatdrop/fsm)](LICENSE)
 [![Awesome Go](https://raw.githubusercontent.com/floatdrop/awesome-go/main/badges/floatdrop--fsm.svg)](https://floatdrop.github.io/awesome-go/#floatdrop--fsm)
 
@@ -52,6 +53,8 @@ _, err := recordingFSM.Send(ctx, &r.state, evRecUpload)
 ```
 
 Every fire-time failure is a typed error carrying the edge: `*NoTransitionError`, `*GuardError`, `*ActionError`, or `*StateChangedError` when a guard or action wrote the state through an aliased payload, reported ahead of any error that callback also returned (kept in its `Err`, but not unwrapped, since the state did move). `GuardError` and `ActionError` unwrap to the guard's or action's own error, so a sentinel can be matched with `errors.Is`. A nil state pointer or the zero `Event` is a plain error, since it is a bug in the caller.
+
+A machine is immutable once `New` returns, so one value serves every goroutine that owns a state and needs no lock. Hooks are shared, though, so whatever they touch is yours to synchronize.
 
 The reasoning behind the API (state ownership, typed payloads, `Rule` as the single option type, guard semantics, known limitations) is in [docs/DESIGN.md](docs/DESIGN.md).
 

@@ -43,9 +43,10 @@ go test -race -run '^TestGuardBlocksTransition$' .   # one test
 go test -count=1 -run TestFireDoesNotAllocate . # the allocation gate, without -race
 go test -run '^$' -bench . -benchmem ./...      # benchmarks
 go test -run '^$' -bench Fire -benchmem -count=6 ./...  # before quoting a number
+go test -run '^$' -fuzz FuzzMachineInvariants -fuzztime=60s .  # the fuzzer
 go vet ./... && golangci-lint run ./...         # lint (config in .golangci.yml)
 test -z "$(gofmt -l .)"                         # formatting gate
-go test -cover ./...                            # coverage
+go test -cover ./...                            # coverage; the package is at 100%
 ```
 
 The full gate, as one chain, the way CI runs it — run this before committing:
@@ -53,7 +54,8 @@ The full gate, as one chain, the way CI runs it — run this before committing:
 ```sh
 test -z "$(gofmt -l .)" && go vet ./... && go test -race -count=1 ./... \
   && golangci-lint run ./... \
-  && go test -count=1 -run TestFireDoesNotAllocate ./...
+  && go test -count=1 -run TestFireDoesNotAllocate ./... \
+  && go test -run '^$' -fuzz FuzzMachineInvariants -fuzztime=60s .
 ```
 
 ## Architecture
@@ -66,7 +68,10 @@ reason the API is shaped this way: a state serialized into a protobuf field,
 written to a snapshot or replayed from a log cannot also live inside a machine
 object, because the two copies drift. Do not add a `Machine.State()` — if a
 state seems to need to live in the machine, the machine is being asked to be
-the aggregate.
+the aggregate. `TestAMachineIsSafeToShareAcrossGoroutines` is what holds the
+"needs no lock" half honest: it fires and introspects one machine from eight
+goroutines under `-race`, which is the only test that would notice a write to
+a `Machine` field after `New`.
 
 **Type erasure is one-directional, and that is what keeps `Fire`
 allocation-free.** Guards and actions are stored in `map[edge[S]]any` holding a
@@ -232,6 +237,54 @@ are slices kept alongside the maps purely so `States`, `Edges`, `Terminals` and
 `DOT` never iterate a map. `S` is only `comparable`, not ordered, so there is
 nothing to sort by; first-seen order is the stable answer. `DOT` output is
 committed-and-diffable only as long as that holds.
+
+## Tests
+
+`fsm_test.go` is black-box (`package fsm_test`) and stays that way — generic
+methods cannot be mocked behind an interface, so the public API is the only
+thing there is to test against, and that is the right target anyway.
+
+- **One named test per invariant.** The names are load-bearing: the
+  Architecture section above cites them, and `go test -run '^TestName$'` is how
+  a claim gets checked. Do not merge named tests into a table — a table is for
+  the *cases* of a single invariant (`TestBuildRejectsNilHooks`,
+  `TestGroupRejectsARepeatedMember`), never for several.
+- **The package is at 100% statement coverage, and CI fails below it.** The
+  badge in `README.md` is static, so the gate is what keeps it from going
+  stale. That is a floor, not a goal:
+  the uncovered lines it forced out were the zero-value accessors, the
+  `Error()` text of `ActionError` and the unnamed-guard `GuardError`, and every
+  nil-hook rejection — all of them user-facing. Keep it at 100%; a new branch
+  with no test is a branch nobody has read.
+- **Error text is pinned exactly**, not with `strings.Contains`, in
+  `TestFireErrorsNameTheirEdge`. The message is what a caller reads in a log,
+  so a reworded one should show up in a diff.
+- **Tests call `t.Parallel()`**; the two exceptions are
+  `TestFireDoesNotAllocate` and `TestGroupFireDoesNotAllocate`, because
+  `testing.AllocsPerRun` sets `GOMAXPROCS` process-wide. Subtests of
+  `TestFireErrorsNameTheirEdge` are sequential too: the action that writes the
+  state closes over the shared `st`.
+- **`FuzzMachineInvariants` covers what nobody wrote down.** It builds a
+  machine from fuzzed `(source, event, target)` rows — sources are the four
+  states plus two groups overlapping on `running`, and two of the three events
+  share the name `a` — then asserts what must hold for any definition `New`
+  accepted: `DOT` is deterministic, every edge endpoint is in `States()`, an
+  inherited edge names a group that `Has` its source, `Events()` repeats no
+  name, `Terminals()` is exactly the states with no outgoing edge,
+  `Unreachable` is closed under the edge relation, a declared `Initial` leaves
+  nothing unreachable and is not terminal, and `Fire` agrees with `To` on every
+  pair — failing without moving the state.
+- **The fuzz generator's filtering is load-bearing, not tidiness.** It drops a
+  source claiming an event twice, two groups claiming one event, and a group
+  transition every member overrides. A random table hits all three
+  systematically, and each one makes `New` return an error, which skips the
+  whole invariant block: unfiltered, acceptance at the ~200-byte inputs the
+  engine actually generates is **0%**, so the fuzzer only ever exercised
+  `New`'s error paths. Filtered it is ~87%. Measure acceptance before changing
+  the generator, and keep the three named tests that cover those errors.
+- **A fuzz failure is a reproducer worth keeping.** Go writes it to
+  `testdata/fuzz` and prints only the path, so CI uploads that directory as an
+  artifact on failure. Download it, commit it, and it becomes a seed.
 
 ## Repo conventions
 

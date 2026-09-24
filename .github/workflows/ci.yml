@@ -30,7 +30,15 @@ jobs:
       - name: test
         run: go test -race -count=1 -coverprofile=coverage.out ./...
       - name: coverage
-        run: go tool cover -func=coverage.out | tail -1
+        # README.md carries a static 100% badge; this is what keeps it honest.
+        run: |
+          go tool cover -func=coverage.out | tail -1
+          pct=$(go tool cover -func=coverage.out | awk 'END {print $NF}')
+          if [ "$pct" != "100.0%" ]; then
+            echo "::error::coverage is $pct, want 100.0% — see the Tests section of CLAUDE.md"
+            go tool cover -func=coverage.out | grep -v '100.0%'
+            exit 1
+          fi
       - name: benchmarks compile and run
         run: go test -run '^$' -bench . -benchtime=50ms ./...
       - name: Fire stays allocation-free
@@ -38,3 +46,17 @@ jobs:
         # combined at build time. -race changes the allocation profile, so this
         # runs on its own without it.
         run: go test -count=1 -run TestFireDoesNotAllocate ./...
+      - name: fuzz
+        # A short run per push; the seed corpus already runs as part of the
+        # suite.
+        run: go test -run '^$' -fuzz FuzzMachineInvariants -fuzztime=60s .
+      - name: fuzz reproducer
+        # Go writes the failing input to testdata/fuzz and prints only its
+        # path, so without this the reproducer dies with the runner. Download
+        # it, commit it, and it becomes a seed.
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-corpus
+          path: testdata/fuzz/
+          if-no-files-found: ignore

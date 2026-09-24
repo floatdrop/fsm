@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"slices"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 
 	"github.com/floatdrop/fsm"
@@ -56,6 +58,8 @@ func linear(t *testing.T) *fsm.Machine[state] {
 // The payload may alias the state. An action that writes it is reported,
 // nothing is assigned and no hook runs.
 func TestActionWritingTheStateIsAnError(t *testing.T) {
+	t.Parallel()
+
 	st := running
 	var exited []state
 	errBoom := errors.New("boom")
@@ -139,6 +143,8 @@ func TestActionWritingTheStateIsAnError(t *testing.T) {
 }
 
 func TestFireReturnsTheTransition(t *testing.T) {
+	t.Parallel()
+
 	m := linear(t)
 	ctx := t.Context()
 	st := idle
@@ -159,6 +165,8 @@ func TestFireReturnsTheTransition(t *testing.T) {
 }
 
 func TestOnTransitionRunsAfterEntryHooks(t *testing.T) {
+	t.Parallel()
+
 	var order []string
 	note := func(what string) fsm.Hook[state] {
 		return func(context.Context, fsm.Transition[state]) { order = append(order, what) }
@@ -193,6 +201,8 @@ func TestOnTransitionRunsAfterEntryHooks(t *testing.T) {
 }
 
 func TestOnTransitionRejectsNil(t *testing.T) {
+	t.Parallel()
+
 	_, err := fsm.New("job", fsm.OnTransition[state](nil), fsm.From(idle).On(evStart).To(running))
 	if err == nil || !strings.Contains(err.Error(), "nil OnTransition hook") {
 		t.Fatalf("got %v, want a nil hook error", err)
@@ -200,6 +210,8 @@ func TestOnTransitionRejectsNil(t *testing.T) {
 }
 
 func TestRulesBundlesRules(t *testing.T) {
+	t.Parallel()
+
 	shared := fsm.Rules(
 		fsm.From(idle).On(evStart).To(running),
 		fsm.From(running).On(evCancel).To(cancelled),
@@ -219,6 +231,8 @@ func TestRulesBundlesRules(t *testing.T) {
 }
 
 func TestEventsListsEachNameOnce(t *testing.T) {
+	t.Parallel()
+
 	twin := fsm.Signal("start") // same name, different event
 	m, err := fsm.New("job",
 		fsm.From(idle).On(evStart).To(running),
@@ -237,6 +251,8 @@ func TestEventsListsEachNameOnce(t *testing.T) {
 // --- Initial ---------------------------------------------------------------
 
 func TestInitialIsReportedAndDrawn(t *testing.T) {
+	t.Parallel()
+
 	if _, ok := linear(t).Initial(); ok {
 		t.Error("a machine without Initial reports one")
 	}
@@ -275,6 +291,8 @@ func TestInitialIsReportedAndDrawn(t *testing.T) {
 }
 
 func TestInitialStartMarkerAvoidsAStateName(t *testing.T) {
+	t.Parallel()
+
 	m, err := fsm.New("job",
 		fsm.Initial("__start"),
 		fsm.From("__start").On(evStart).To("going"),
@@ -292,6 +310,8 @@ func TestInitialStartMarkerAvoidsAStateName(t *testing.T) {
 
 // An entry hook that fires again is logged after the transition it came from.
 func TestOnTransitionKeepsCausalOrder(t *testing.T) {
+	t.Parallel()
+
 	var log []string
 	st := idle
 	ctx := t.Context()
@@ -316,6 +336,8 @@ func TestOnTransitionKeepsCausalOrder(t *testing.T) {
 }
 
 func TestInitialDoesNotReportAMistakeTwice(t *testing.T) {
+	t.Parallel()
+
 	_, err := fsm.New("job",
 		fsm.Initial(idle),
 		fsm.From(idle).On(evStart).To(running),
@@ -330,6 +352,8 @@ func TestInitialDoesNotReportAMistakeTwice(t *testing.T) {
 }
 
 func TestInitialRejectsUnreachableStates(t *testing.T) {
+	t.Parallel()
+
 	_, err := fsm.New("job",
 		fsm.Initial(idle),
 		fsm.From(idle).On(evStart).To(running),
@@ -341,6 +365,8 @@ func TestInitialRejectsUnreachableStates(t *testing.T) {
 }
 
 func TestInitialRejectsADeadStart(t *testing.T) {
+	t.Parallel()
+
 	_, err := fsm.New("job", fsm.Initial(done), fsm.From(idle).On(evStart).To(done))
 	if err == nil || !strings.Contains(err.Error(), "initial state done has no outgoing transition") {
 		t.Fatalf("got %v, want a dead start reported", err)
@@ -351,6 +377,8 @@ func TestInitialRejectsADeadStart(t *testing.T) {
 }
 
 func TestInitialDeclaredTwice(t *testing.T) {
+	t.Parallel()
+
 	for _, second := range []state{idle, running} {
 		_, err := fsm.New("job", fsm.Initial(idle), fsm.Initial(second), fsm.From(idle).On(evStart).To(running))
 		want := fmt.Sprintf("initial state declared twice: idle and %v", second)
@@ -361,6 +389,8 @@ func TestInitialDeclaredTwice(t *testing.T) {
 }
 
 func TestInitialWithNoTransitionsReportsOneError(t *testing.T) {
+	t.Parallel()
+
 	_, err := fsm.New("job", fsm.Initial(idle))
 	if err == nil || !strings.Contains(err.Error(), "no transitions declared") {
 		t.Fatalf("got %v, want the empty machine reported", err)
@@ -371,6 +401,8 @@ func TestInitialWithNoTransitionsReportsOneError(t *testing.T) {
 }
 
 func TestFireAdvancesState(t *testing.T) {
+	t.Parallel()
+
 	m := linear(t)
 	ctx := t.Context()
 
@@ -390,6 +422,8 @@ func TestFireAdvancesState(t *testing.T) {
 }
 
 func TestFireRejectsUnknownTransition(t *testing.T) {
+	t.Parallel()
+
 	m := linear(t)
 	st := idle
 
@@ -411,6 +445,8 @@ func TestFireRejectsUnknownTransition(t *testing.T) {
 }
 
 func TestPayloadReachesAction(t *testing.T) {
+	t.Parallel()
+
 	var got int
 	record := func(_ context.Context, code int) error {
 		got = code
@@ -455,6 +491,8 @@ func guarded(t *testing.T) *fsm.Machine[state] {
 }
 
 func TestGuardBlocksTransition(t *testing.T) {
+	t.Parallel()
+
 	m := guarded(t)
 	ctx := t.Context()
 
@@ -483,6 +521,8 @@ func TestGuardBlocksTransition(t *testing.T) {
 // The point of returning an error rather than a bool: the caller can match
 // the guard's own reason, not just learn that something was refused.
 func TestGuardErrorUnwrapsToTheGuardsError(t *testing.T) {
+	t.Parallel()
+
 	m := guarded(t)
 	ctx := t.Context()
 
@@ -502,6 +542,8 @@ func TestGuardErrorUnwrapsToTheGuardsError(t *testing.T) {
 }
 
 func TestCheckReportsReasonWithoutFiring(t *testing.T) {
+	t.Parallel()
+
 	m := guarded(t)
 	ctx := t.Context()
 
@@ -528,6 +570,8 @@ func TestCheckReportsReasonWithoutFiring(t *testing.T) {
 
 // A guard that rejects must not run the action behind it.
 func TestGuardRunsBeforeAction(t *testing.T) {
+	t.Parallel()
+
 	acted := false
 	m, err := fsm.New("job",
 		fsm.From(running).On(evFinish).To(done).
@@ -550,6 +594,8 @@ func TestGuardRunsBeforeAction(t *testing.T) {
 // With several guards the first rejection wins, and it is reported under the
 // description it was registered with.
 func TestFirstRejectingGuardWins(t *testing.T) {
+	t.Parallel()
+
 	errSecond := errors.New("second")
 	m, err := fsm.New("job",
 		fsm.From(running).On(evFinish).To(done).
@@ -587,6 +633,8 @@ func TestFirstRejectingGuardWins(t *testing.T) {
 }
 
 func TestActionErrorAbortsTransition(t *testing.T) {
+	t.Parallel()
+
 	boom := errors.New("boom")
 	var hooks []string
 
@@ -619,6 +667,8 @@ func TestActionErrorAbortsTransition(t *testing.T) {
 // Hooks must bracket the assignment: exit sees the old state, enter sees the
 // new one. Anything that pairs an increment with a decrement depends on it.
 func TestHooksBracketTheAssignment(t *testing.T) {
+	t.Parallel()
+
 	var order []string
 
 	m, err := fsm.New("job",
@@ -648,6 +698,8 @@ func TestHooksBracketTheAssignment(t *testing.T) {
 // The bug class this package exists to remove: a gauge maintained by hand at
 // every call site that changes the state.
 func TestGaugeStaysPaired(t *testing.T) {
+	t.Parallel()
+
 	counts := map[state]int{}
 	inc := func(s state) func(context.Context) { return func(context.Context) { counts[s]++ } }
 	dec := func(s state) func(context.Context) { return func(context.Context) { counts[s]-- } }
@@ -684,6 +736,8 @@ func TestGaugeStaysPaired(t *testing.T) {
 }
 
 func TestBuildRejectsDuplicateTransition(t *testing.T) {
+	t.Parallel()
+
 	_, err := fsm.New("job",
 		fsm.From(idle).On(evStart).To(running),
 		fsm.From(idle).On(evStart).To(cancelled),
@@ -700,6 +754,8 @@ func TestBuildRejectsDuplicateTransition(t *testing.T) {
 // once and reused. Applying the same rule twice must not let one machine see
 // the other's edges.
 func TestRulesAreReusableValues(t *testing.T) {
+	t.Parallel()
+
 	shared := []fsm.Rule[state]{
 		fsm.From(idle).On(evStart).To(running),
 		fsm.From(running).On(evCancel).To(cancelled),
@@ -733,6 +789,8 @@ func TestRulesAreReusableValues(t *testing.T) {
 }
 
 func TestBuildRejectsZeroEvent(t *testing.T) {
+	t.Parallel()
+
 	var zero fsm.Event[int]
 
 	_, err := fsm.New("job",
@@ -750,6 +808,8 @@ func TestBuildRejectsZeroEvent(t *testing.T) {
 // Two events can share a name, so a hook that branches on Transition.Event
 // cannot tell them apart. Is compares the trigger's identity.
 func TestTransitionIsIdentifiesTheTrigger(t *testing.T) {
+	t.Parallel()
+
 	first, second := fsm.Signal("tick"), fsm.Signal("tick")
 
 	var names []string
@@ -794,6 +854,8 @@ func TestTransitionIsIdentifiesTheTrigger(t *testing.T) {
 }
 
 func TestTransitionIsRejectsTheZeroEvent(t *testing.T) {
+	t.Parallel()
+
 	var zero fsm.Event[int]
 	if (fsm.Transition[state]{}).Is(zero) {
 		t.Error("the zero Transition matched the zero Event")
@@ -804,6 +866,8 @@ func TestTransitionIsRejectsTheZeroEvent(t *testing.T) {
 // hook cannot be typed. Naming the event fixes A and hands the hook the
 // payload that caused the transition.
 func TestOnEnterViaSeesThePayload(t *testing.T) {
+	t.Parallel()
+
 	var got []int
 	var plain int
 	m, err := fsm.New("job",
@@ -844,6 +908,8 @@ func TestOnEnterViaSeesThePayload(t *testing.T) {
 }
 
 func TestOnExitViaRunsBeforeTheStateChanges(t *testing.T) {
+	t.Parallel()
+
 	var seen []string
 	m, err := fsm.New("job",
 		fsm.OnExit(running, func(context.Context, fsm.Transition[state]) { seen = append(seen, "plain") }),
@@ -867,6 +933,8 @@ func TestOnExitViaRunsBeforeTheStateChanges(t *testing.T) {
 }
 
 func TestBuildRejectsBadViaHooks(t *testing.T) {
+	t.Parallel()
+
 	var zero fsm.Event[int]
 
 	_, err := fsm.New("job",
@@ -887,6 +955,8 @@ func TestBuildRejectsBadViaHooks(t *testing.T) {
 // A self-transition is UML's external kind: it runs exit and entry, so a
 // gauge on the state dips and comes back rather than standing still.
 func TestSelfTransitionRunsExitAndEntry(t *testing.T) {
+	t.Parallel()
+
 	var seq []string
 	gauge, low := 0, 0
 	m, err := fsm.New("job",
@@ -931,6 +1001,8 @@ func TestSelfTransitionRunsExitAndEntry(t *testing.T) {
 // over when the machine is built. GaugeWith takes it from the payload and is
 // still declared once per state, so the pair stays bound together.
 func TestGaugeWithCountsPerPayload(t *testing.T) {
+	t.Parallel()
+
 	type tally struct{ n map[state]int }
 	ev := fsm.Define[*tally]("go")
 	back := fsm.Define[*tally]("back")
@@ -975,6 +1047,8 @@ func TestGaugeWithCountsPerPayload(t *testing.T) {
 // The increment and decrement come from one declaration, so no call site can
 // supply one without the other.
 func TestGaugeWithStaysPairedAcrossEveryEdge(t *testing.T) {
+	t.Parallel()
+
 	type tally struct{ n int }
 	in1 := fsm.Define[*tally]("in1")
 	in2 := fsm.Define[*tally]("in2")
@@ -1012,6 +1086,8 @@ func TestGaugeWithStaysPairedAcrossEveryEdge(t *testing.T) {
 // A state reached by events carrying different payloads cannot have its
 // counter kept paired, so New says so instead of skipping an edge.
 func TestGaugeWithRejectsMixedPayloads(t *testing.T) {
+	t.Parallel()
+
 	type tally struct{}
 	typed := fsm.Define[*tally]("typed")
 	other := fsm.Define[int]("other")
@@ -1036,6 +1112,8 @@ func TestGaugeWithRejectsMixedPayloads(t *testing.T) {
 
 // A mismatch is one error, not also "no transition enters or leaves it".
 func TestGaugeWithMismatchReportsOneError(t *testing.T) {
+	t.Parallel()
+
 	type tally struct{}
 	other := fsm.Define[int]("other")
 
@@ -1055,6 +1133,8 @@ func TestGaugeWithMismatchReportsOneError(t *testing.T) {
 }
 
 func TestGaugeWithRejectsAnIsolatedState(t *testing.T) {
+	t.Parallel()
+
 	_, err := fsm.New("job",
 		fsm.GaugeWith(cancelled,
 			func(context.Context, int) {},
@@ -1069,6 +1149,8 @@ func TestGaugeWithRejectsAnIsolatedState(t *testing.T) {
 
 // A Via hook no transition can trigger is a mistyped state or event.
 func TestViaHookThatCanNeverRunIsAnError(t *testing.T) {
+	t.Parallel()
+
 	_, err := fsm.New("job",
 		fsm.From(idle).On(evStart).To(running),
 		fsm.From(running).On(evFinish).To(done),
@@ -1090,6 +1172,8 @@ func TestViaHookThatCanNeverRunIsAnError(t *testing.T) {
 
 // Declaration order must not matter: the edges are read in a second pass.
 func TestGaugeWithMayBeDeclaredBeforeItsEdges(t *testing.T) {
+	t.Parallel()
+
 	type tally struct{ n int }
 	ev := fsm.Define[*tally]("go")
 
@@ -1124,6 +1208,8 @@ func TestGaugeWithMayBeDeclaredBeforeItsEdges(t *testing.T) {
 // A nil guard used to be dropped in silence, taking its description out of
 // the DOT label with it: the machine read as guarded and ran unguarded.
 func TestBuildRejectsNilGuard(t *testing.T) {
+	t.Parallel()
+
 	var nilGuard func(context.Context, int) error
 
 	_, err := fsm.New("job",
@@ -1140,6 +1226,8 @@ func TestBuildRejectsNilGuard(t *testing.T) {
 }
 
 func TestBuildRejectsNilAction(t *testing.T) {
+	t.Parallel()
+
 	var nilAction func(context.Context, int) error
 
 	_, err := fsm.New("job",
@@ -1154,6 +1242,8 @@ func TestBuildRejectsNilAction(t *testing.T) {
 }
 
 func TestBuildRejectsNilRule(t *testing.T) {
+	t.Parallel()
+
 	_, err := fsm.New[state]("job",
 		fsm.From(idle).On(evStart).To(running),
 		nil,
@@ -1169,6 +1259,8 @@ func TestBuildRejectsNilRule(t *testing.T) {
 // Guards and actions attach to the value To returns, so a stored transition
 // picks them up whether or not the result is reassigned.
 func TestChainedOptionsMutateInPlace(t *testing.T) {
+	t.Parallel()
+
 	blocked := false
 	tr := fsm.From(running).On(evFinish).To(done)
 	tr.Guard("blocked", func(context.Context, int) error {
@@ -1191,12 +1283,16 @@ func TestChainedOptionsMutateInPlace(t *testing.T) {
 }
 
 func TestBuildRejectsEmptyMachine(t *testing.T) {
+	t.Parallel()
+
 	if _, err := fsm.New[state]("job"); err == nil {
 		t.Fatal("expected an error for a machine with no transitions")
 	}
 }
 
 func TestZeroEventIsAnErrorNotAPanic(t *testing.T) {
+	t.Parallel()
+
 	m := linear(t)
 	var zero fsm.Event[int]
 
@@ -1208,9 +1304,174 @@ func TestZeroEventIsAnErrorNotAPanic(t *testing.T) {
 	if !strings.Contains(err.Error(), "zero Event") {
 		t.Errorf("error %q does not explain the problem", err)
 	}
+	if err := m.Check(t.Context(), idle, zero, 0); err == nil || !strings.Contains(err.Error(), "zero Event") {
+		t.Errorf("Check: got %v, want the zero Event reported", err)
+	}
+	if m.Can(t.Context(), idle, zero, 0) {
+		t.Error("Can allowed the zero Event")
+	}
+	if to, ok := m.To(idle, zero); ok {
+		t.Errorf("To resolved %v for the zero Event", to)
+	}
+}
+
+// --- Zero values, nil rules and error text --------------------------------
+
+// The zero Event, Transition and Edge are values a caller can declare, so
+// their accessors report rather than panic — and never claim a trigger.
+func TestZeroValuesHaveNoTrigger(t *testing.T) {
+	t.Parallel()
+
+	var (
+		ev fsm.Event[int]
+		tr fsm.Transition[state]
+		ed fsm.Edge[state]
+	)
+
+	if got := ev.Name(); got != "<invalid>" {
+		t.Errorf("zero Event.Name() = %q, want %q", got, "<invalid>")
+	}
+	if got := ev.String(); got != "<invalid>" {
+		t.Errorf("zero Event.String() = %q, want %q", got, "<invalid>")
+	}
+	if got := evStart.String(); got != "start" {
+		t.Errorf("Event.String() = %q, want %q", got, "start")
+	}
+	if got := tr.Event(); got != "" {
+		t.Errorf("zero Transition.Event() = %q, want empty", got)
+	}
+	if got := ed.Event(); got != "" {
+		t.Errorf("zero Edge.Event() = %q, want empty", got)
+	}
+	if tr.Is(evStart) || ed.Is(evStart) {
+		t.Error("a zero Transition or Edge claims a trigger")
+	}
+}
+
+func TestFireRejectsANilStatePointer(t *testing.T) {
+	t.Parallel()
+
+	m := linear(t)
+
+	_, err := m.Send(t.Context(), nil, evStart)
+	if err == nil {
+		t.Fatal("expected an error for a nil state pointer")
+	}
+	if !strings.Contains(err.Error(), "nil state pointer") {
+		t.Errorf("error %q does not explain the problem", err)
+	}
+}
+
+// The error text is what a caller reads in a log, so every fire-time error
+// names the machine and the edge it happened on.
+func TestFireErrorsNameTheirEdge(t *testing.T) {
+	t.Parallel()
+
+	errBoom := errors.New("boom")
+	var st state
+
+	m, err := fsm.New("job",
+		fsm.From(running).On(evFinish).To(done).Action(func(context.Context, int) error { return errBoom }),
+		// An unnamed guard drops the "guard %q" clause.
+		fsm.From(running).On(evCancel).To(cancelled).Guard("", func(context.Context, fsm.Unit) error { return errBoom }),
+		// A write with no error of its own drops the trailing reason.
+		fsm.From(idle).On(evStart).To(running).Action(func(context.Context, fsm.Unit) error {
+			st = done
+			return nil
+		}),
+	)
+	if err != nil {
+		t.Fatalf("build: %v", err)
+	}
+	if got := m.Name(); got != "job" {
+		t.Errorf("machine name %q, want %q", got, "job")
+	}
+	ctx := t.Context()
+
+	for _, tc := range []struct {
+		name string
+		from state
+		fire func(*state) error
+		want string
+	}{
+		{"NoTransitionError", done, func(s *state) error { _, err := m.Send(ctx, s, evStart); return err },
+			"fsm job: no transition from done on start"},
+		{"ActionError", running, func(s *state) error { _, err := m.Fire(ctx, s, evFinish, 0); return err },
+			"fsm job: action for running --finish--> done: boom"},
+		{"GuardError", running, func(s *state) error { _, err := m.Send(ctx, s, evCancel); return err },
+			"fsm job: transition running --cancel--> cancelled rejected: boom"},
+		{"StateChangedError", idle, func(s *state) error { _, err := m.Send(ctx, s, evStart); return err },
+			"fsm job: state changed to done during idle --start--> running"},
+	} {
+		// Not parallel: the write-the-state action closes over st.
+		t.Run(tc.name, func(t *testing.T) {
+			st = tc.from
+			err := tc.fire(&st)
+			if err == nil {
+				t.Fatalf("want %q, got no error", tc.want)
+			}
+			if got := err.Error(); got != tc.want {
+				t.Errorf("error text:\n got %s\nwant %s", got, tc.want)
+			}
+		})
+	}
+}
+
+// A nil hook is a build error, not a nil call at fire time. A gauge needs
+// both halves, or the counter it exists to keep honest could only drift.
+func TestBuildRejectsNilHooks(t *testing.T) {
+	t.Parallel()
+
+	tick := func(context.Context) {}
+	tickWith := func(context.Context, int) {}
+
+	for _, tc := range []struct {
+		name string
+		rule fsm.Rule[state]
+		want string
+	}{
+		{"OnEnter", fsm.OnEnter[state](running, nil), "nil OnEnter hook for state running"},
+		{"OnExit", fsm.OnExit[state](running, nil), "nil OnExit hook for state running"},
+		{"Gauge without inc", fsm.Gauge(running, nil, tick), "Gauge for state running needs both inc and dec"},
+		{"Gauge without dec", fsm.Gauge(running, tick, nil), "Gauge for state running needs both inc and dec"},
+		{"GaugeWith without inc", fsm.GaugeWith(running, nil, tickWith), "GaugeWith for state running needs both inc and dec"},
+		{"GaugeWith without dec", fsm.GaugeWith(running, tickWith, nil), "GaugeWith for state running needs both inc and dec"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			_, err := fsm.New("job", fsm.From(idle).On(evStart).To(running), tc.rule)
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Errorf("got %v, want %q", err, tc.want)
+			}
+		})
+	}
+}
+
+// MustNew is for package-level variables: a bad definition must fail at
+// process start rather than reach Fire.
+func TestMustNewPanicsOnABadDefinition(t *testing.T) {
+	t.Parallel()
+
+	defer func() {
+		r := recover()
+		if r == nil {
+			t.Fatal("MustNew accepted a duplicate transition")
+		}
+		err, ok := r.(error)
+		if !ok || !strings.Contains(err.Error(), "duplicate transition") {
+			t.Errorf("panicked with %v, want the build error", r)
+		}
+	}()
+
+	fsm.MustNew("job",
+		fsm.From(idle).On(evStart).To(running),
+		fsm.From(idle).On(evStart).To(cancelled),
+	)
 }
 
 func TestTerminalsAndReachability(t *testing.T) {
+	t.Parallel()
+
 	m := linear(t)
 
 	terminals := m.Terminals()
@@ -1226,6 +1487,8 @@ func TestTerminalsAndReachability(t *testing.T) {
 }
 
 func TestDOTIsDeterministic(t *testing.T) {
+	t.Parallel()
+
 	m := linear(t)
 
 	first := m.DOT()
@@ -1313,6 +1576,8 @@ func BenchmarkFire(b *testing.B) {
 // --- FromEach -------------------------------------------------------------
 
 func TestFromEachRegistersOneEdgePerSource(t *testing.T) {
+	t.Parallel()
+
 	m, err := fsm.New("job",
 		fsm.From(idle).On(evStart).To(running),
 		fsm.FromEach(idle, running).On(evCancel).To(cancelled),
@@ -1338,6 +1603,8 @@ func TestFromEachRegistersOneEdgePerSource(t *testing.T) {
 // The reason FromEach is variadic rather than From growing a second parameter:
 // a group of sources computed elsewhere has to be spreadable.
 func TestFromEachSpreadsASlice(t *testing.T) {
+	t.Parallel()
+
 	live := []state{idle, running}
 	m, err := fsm.New("job",
 		fsm.From(idle).On(evStart).To(running),
@@ -1354,6 +1621,8 @@ func TestFromEachSpreadsASlice(t *testing.T) {
 // Rules are values, so the slice a rule was built from must not keep affecting
 // it afterwards.
 func TestFromEachCopiesItsSources(t *testing.T) {
+	t.Parallel()
+
 	live := []state{idle, running}
 	rule := fsm.FromEach(live...).On(evCancel).To(cancelled)
 	live[1] = done
@@ -1371,6 +1640,8 @@ func TestFromEachCopiesItsSources(t *testing.T) {
 }
 
 func TestFromEachWithNoSourcesIsAnError(t *testing.T) {
+	t.Parallel()
+
 	_, err := fsm.New("job",
 		fsm.From(idle).On(evStart).To(running),
 		fsm.FromEach[state]().On(evCancel).To(cancelled),
@@ -1384,6 +1655,8 @@ func TestFromEachWithNoSourcesIsAnError(t *testing.T) {
 }
 
 func TestFromEachReportsARepeatedSource(t *testing.T) {
+	t.Parallel()
+
 	_, err := fsm.New("job", fsm.FromEach(idle, idle).On(evStart).To(running))
 	if err == nil {
 		t.Fatal("expected an error for a source listed twice")
@@ -1394,6 +1667,8 @@ func TestFromEachReportsARepeatedSource(t *testing.T) {
 }
 
 func TestFromEachSharesGuardsAndActions(t *testing.T) {
+	t.Parallel()
+
 	var calls int
 	m, err := fsm.New("job",
 		fsm.From(idle).On(evStart).To(running),
@@ -1426,6 +1701,8 @@ func TestFromEachSharesGuardsAndActions(t *testing.T) {
 var live = fsm.NewGroup("live", idle, running)
 
 func TestGroupTransitionAppliesToEveryMember(t *testing.T) {
+	t.Parallel()
+
 	m, err := fsm.New("job",
 		fsm.From(idle).On(evStart).To(running),
 		fsm.FromGroup(live).On(evCancel).To(cancelled),
@@ -1448,6 +1725,8 @@ func TestGroupTransitionAppliesToEveryMember(t *testing.T) {
 // The thing FromEach cannot do: a member handles the event its own way and the
 // group's transition applies to the rest.
 func TestGroupMemberOverridesInheritedEdge(t *testing.T) {
+	t.Parallel()
+
 	m, err := fsm.New("job",
 		fsm.From(idle).On(evStart).To(running),
 		fsm.FromGroup(live).On(evCancel).To(cancelled),
@@ -1468,6 +1747,8 @@ func TestGroupMemberOverridesInheritedEdge(t *testing.T) {
 // Declaration order must not matter: the override is found whether it is
 // written before or after the group transition.
 func TestGroupOverrideOrderDoesNotMatter(t *testing.T) {
+	t.Parallel()
+
 	m, err := fsm.New("job",
 		fsm.From(running).On(evCancel).To(done),
 		fsm.From(idle).On(evStart).To(running),
@@ -1482,6 +1763,8 @@ func TestGroupOverrideOrderDoesNotMatter(t *testing.T) {
 }
 
 func TestGroupEdgesCarryTheirProvenance(t *testing.T) {
+	t.Parallel()
+
 	m, err := fsm.New("job",
 		fsm.From(idle).On(evStart).To(running),
 		fsm.FromGroup(live).On(evCancel).To(cancelled),
@@ -1505,6 +1788,8 @@ func TestGroupEdgesCarryTheirProvenance(t *testing.T) {
 }
 
 func TestGroupHasReportsMembership(t *testing.T) {
+	t.Parallel()
+
 	if !live.Has(idle) || !live.Has(running) {
 		t.Error("live should contain idle and running")
 	}
@@ -1516,6 +1801,8 @@ func TestGroupHasReportsMembership(t *testing.T) {
 // A group is not a state: it expands away at build time and never appears
 // anywhere a state value does.
 func TestGroupIsNotAState(t *testing.T) {
+	t.Parallel()
+
 	m, err := fsm.New("job",
 		fsm.From(idle).On(evStart).To(running),
 		fsm.FromGroup(live).On(evCancel).To(cancelled),
@@ -1532,6 +1819,8 @@ func TestGroupIsNotAState(t *testing.T) {
 }
 
 func TestGroupRejectsUnknownMember(t *testing.T) {
+	t.Parallel()
+
 	typo := fsm.NewGroup("live", idle, done)
 	_, err := fsm.New("job",
 		fsm.From(idle).On(evStart).To(running),
@@ -1546,6 +1835,8 @@ func TestGroupRejectsUnknownMember(t *testing.T) {
 }
 
 func TestGroupRejectsTwoGroupsClaimingTheSameEvent(t *testing.T) {
+	t.Parallel()
+
 	other := fsm.NewGroup("other", running)
 	_, err := fsm.New("job",
 		fsm.From(idle).On(evStart).To(running),
@@ -1561,6 +1852,8 @@ func TestGroupRejectsTwoGroupsClaimingTheSameEvent(t *testing.T) {
 }
 
 func TestGroupRejectsNameReusedForDifferentMembers(t *testing.T) {
+	t.Parallel()
+
 	_, err := fsm.New("job",
 		fsm.From(idle).On(evStart).To(running),
 		fsm.FromGroup(live).On(evCancel).To(cancelled),
@@ -1575,6 +1868,8 @@ func TestGroupRejectsNameReusedForDifferentMembers(t *testing.T) {
 }
 
 func TestGroupWithNoMembersIsAnError(t *testing.T) {
+	t.Parallel()
+
 	_, err := fsm.New("job",
 		fsm.From(idle).On(evStart).To(running),
 		fsm.FromGroup(fsm.NewGroup[state]("empty")).On(evCancel).To(cancelled),
@@ -1587,9 +1882,31 @@ func TestGroupWithNoMembersIsAnError(t *testing.T) {
 	}
 }
 
+// The name is the group's identity in error messages and in DOT's cluster
+// label, so an unnamed group is rejected before it can expand.
+func TestGroupWithNoNameIsAnError(t *testing.T) {
+	t.Parallel()
+
+	_, err := fsm.New("job",
+		fsm.From(idle).On(evStart).To(running),
+		fsm.FromGroup(fsm.NewGroup("", idle, running)).On(evCancel).To(cancelled),
+	)
+	if err == nil {
+		t.Fatal("expected an error for a group with no name")
+	}
+	if !strings.Contains(err.Error(), "group declared with no name") {
+		t.Errorf("unexpected error: %v", err)
+	}
+	if got := strings.Count(err.Error(), "\n") + 1; got != 1 {
+		t.Errorf("reported %d errors, want 1:\n%v", got, err)
+	}
+}
+
 // A group transition every member overrides is dead configuration, and saying
 // so is cheaper than leaving someone to notice the group does nothing.
 func TestGroupTransitionFullyOverriddenIsAnError(t *testing.T) {
+	t.Parallel()
+
 	_, err := fsm.New("job",
 		fsm.From(idle).On(evStart).To(running),
 		fsm.From(idle).On(evCancel).To(done),
@@ -1605,6 +1922,8 @@ func TestGroupTransitionFullyOverriddenIsAnError(t *testing.T) {
 }
 
 func TestGroupGuardRejectsEveryInheritedEdge(t *testing.T) {
+	t.Parallel()
+
 	m, err := fsm.New("job",
 		fsm.From(idle).On(evStart).To(running),
 		fsm.FromGroup(live).On(evCancel).To(cancelled).
@@ -1629,6 +1948,8 @@ func TestGroupGuardRejectsEveryInheritedEdge(t *testing.T) {
 // Group expansion has to run before GaugeWith reads the table, or a gauge
 // silently misses every edge a group contributed.
 func TestGaugeWithSeesGroupInheritedEdges(t *testing.T) {
+	t.Parallel()
+
 	var delta int
 	m, err := fsm.New("job",
 		fsm.GaugeWith(cancelled,
@@ -1654,6 +1975,8 @@ func TestGaugeWithSeesGroupInheritedEdges(t *testing.T) {
 // Several sources entering on one event share the (state, event) hook key; the
 // gauge must still move once per entry.
 func TestGaugeWithCountsFanInOnce(t *testing.T) {
+	t.Parallel()
+
 	var delta int
 	m, err := fsm.New("job",
 		fsm.GaugeWith(cancelled,
@@ -1708,6 +2031,8 @@ func TestGroupFireDoesNotAllocate(t *testing.T) {
 }
 
 func TestGroupDOTDrawsAClusterAndOneBoundaryEdge(t *testing.T) {
+	t.Parallel()
+
 	m, err := fsm.New("job",
 		fsm.From(idle).On(evStart).To(running),
 		fsm.FromGroup(live).On(evCancel).To(cancelled),
@@ -1735,6 +2060,8 @@ func TestGroupDOTDrawsAClusterAndOneBoundaryEdge(t *testing.T) {
 // With a member overriding the event, a single boundary arrow would claim to
 // cover it, so each inherited edge is drawn on its own.
 func TestGroupDOTKeepsPerMemberEdgesWhenOverridden(t *testing.T) {
+	t.Parallel()
+
 	m, err := fsm.New("job",
 		fsm.From(idle).On(evStart).To(running),
 		fsm.FromEach(idle, running).On(evFinish).To(done),
@@ -1757,6 +2084,8 @@ func TestGroupDOTKeepsPerMemberEdgesWhenOverridden(t *testing.T) {
 // A group transition's target is a state even before expansion runs, so a
 // group whose member is only ever named as another group's target is fine.
 func TestGroupTargetCountsAsADeclaredState(t *testing.T) {
+	t.Parallel()
+
 	_, err := fsm.New("job",
 		fsm.From(idle).On(evStart).To(running),
 		fsm.FromGroup(live).On(evCancel).To(cancelled),
@@ -1768,6 +2097,8 @@ func TestGroupTargetCountsAsADeclaredState(t *testing.T) {
 }
 
 func TestGroupRejectsTheSameTransitionDeclaredTwice(t *testing.T) {
+	t.Parallel()
+
 	_, err := fsm.New("job",
 		fsm.From(idle).On(evStart).To(running),
 		fsm.FromGroup(live).On(evCancel).To(cancelled),
@@ -1784,6 +2115,8 @@ func TestGroupRejectsTheSameTransitionDeclaredTwice(t *testing.T) {
 // Rules are values and a set of them can be shared between machines, so
 // applying a group rule must not leave anything behind in the rule itself.
 func TestGroupRuleCanBeSharedBetweenMachines(t *testing.T) {
+	t.Parallel()
+
 	shared := []fsm.Rule[state]{
 		fsm.From(idle).On(evStart).To(running),
 		fsm.FromGroup(live).On(evCancel).To(cancelled),
@@ -1803,6 +2136,8 @@ func TestGroupRuleCanBeSharedBetweenMachines(t *testing.T) {
 
 // A Via hook on an edge the broken group would have added is not a second mistake.
 func TestBrokenGroupDoesNotAlsoReportTheViaHook(t *testing.T) {
+	t.Parallel()
+
 	_, err := fsm.New("job",
 		fsm.From(idle).On(evStart).To(running),
 		fsm.FromGroup(fsm.NewGroup[state]("empty")).On(evCancel).To(cancelled),
@@ -1819,6 +2154,8 @@ func TestBrokenGroupDoesNotAlsoReportTheViaHook(t *testing.T) {
 // A broken group must produce one error, not a cascade: with no members there
 // is nothing to report as overridden.
 func TestGroupWithNoMembersReportsOneError(t *testing.T) {
+	t.Parallel()
+
 	_, err := fsm.New("job",
 		fsm.From(idle).On(evStart).To(running),
 		fsm.FromGroup(fsm.NewGroup[state]("empty")).On(evCancel).To(cancelled),
@@ -1837,6 +2174,8 @@ func TestGroupWithNoMembersReportsOneError(t *testing.T) {
 // A Group is a Rule, so one used only for Has or for DOT output can be passed
 // to New without a transition attached to it.
 func TestBareGroupRuleIsRegistered(t *testing.T) {
+	t.Parallel()
+
 	m, err := fsm.New("job",
 		live,
 		fsm.From(idle).On(evStart).To(running),
@@ -1863,6 +2202,8 @@ func TestBareGroupRuleIsRegistered(t *testing.T) {
 // trigger itself. Counting by name merged two partial expansions into one
 // arrow that covered neither.
 func TestGroupDOTDistinguishesSameNamedEvents(t *testing.T) {
+	t.Parallel()
+
 	goA, goB := fsm.Signal("go"), fsm.Signal("go")
 	g := fsm.NewGroup("g", idle, running, done)
 
@@ -1892,6 +2233,8 @@ func TestGroupDOTDistinguishesSameNamedEvents(t *testing.T) {
 }
 
 func TestEdgeIsIdentifiesTheTrigger(t *testing.T) {
+	t.Parallel()
+
 	sameName := fsm.Signal("start")
 	m, err := fsm.New("job",
 		fsm.From(idle).On(evStart).To(running),
@@ -1922,6 +2265,8 @@ func TestEdgeIsIdentifiesTheTrigger(t *testing.T) {
 // lost a member cannot be an edge tail: Graphviz would drop the ltail and the
 // other members' rows were already skipped.
 func TestGroupDOTKeepsPerMemberEdgesForOverlappingGroups(t *testing.T) {
+	t.Parallel()
+
 	first := fsm.NewGroup("first", idle, running)
 	second := fsm.NewGroup("second", running, done)
 
@@ -1956,6 +2301,8 @@ func TestGroupDOTKeepsPerMemberEdgesForOverlappingGroups(t *testing.T) {
 // A target inside the group would make the boundary arrow a self-loop out of
 // its own cluster, which Graphviz refuses.
 func TestGroupDOTKeepsPerMemberEdgesWhenTargetIsAMember(t *testing.T) {
+	t.Parallel()
+
 	g := fsm.NewGroup("g", idle, running)
 	m, err := fsm.New("job",
 		fsm.From(idle).On(evStart).To(running),
@@ -1979,6 +2326,8 @@ func TestGroupDOTKeepsPerMemberEdgesWhenTargetIsAMember(t *testing.T) {
 // A member lost to another group is already reported; claiming it overrode
 // the event itself would not be true.
 func TestGroupClashDoesNotAlsoReportUnreachable(t *testing.T) {
+	t.Parallel()
+
 	first := fsm.NewGroup("first", running)
 	second := fsm.NewGroup("second", running)
 
@@ -1999,6 +2348,8 @@ func TestGroupClashDoesNotAlsoReportUnreachable(t *testing.T) {
 }
 
 func TestGroupRejectsARepeatedMember(t *testing.T) {
+	t.Parallel()
+
 	for _, tc := range []struct {
 		name  string
 		rules []fsm.Rule[state]
@@ -2013,6 +2364,7 @@ func TestGroupRejectsARepeatedMember(t *testing.T) {
 		}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
 			_, err := fsm.New("job", tc.rules...)
 			if err == nil {
 				t.Fatal("expected an error for a group listing a member twice")
@@ -2021,5 +2373,205 @@ func TestGroupRejectsARepeatedMember(t *testing.T) {
 				t.Errorf("unexpected error: %v", err)
 			}
 		})
+	}
+}
+
+// --- Fuzz ------------------------------------------------------------------
+
+// Whatever table it is handed, a machine New accepted must keep the contract
+// the introspection API advertises, and Fire must agree with To rather than
+// panic or move a state it said it could not move. The named tests above pin
+// the cases the design was reasoned about; this covers the ones nobody wrote
+// down, group expansion and the deferred Initial check in particular.
+func FuzzMachineInvariants(f *testing.F) {
+	f.Add([]byte{0, 0, 0, 1, 1, 0, 2, 1, 1, 3})       // a linear machine
+	f.Add([]byte{1, 4, 1, 3, 0, 0, 1})                // a group transition plus an Initial
+	f.Add([]byte{0, 4, 0, 2, 5, 1, 3, 1, 2, 0})       // both groups, overlapping on running
+	f.Add([]byte{0, 4, 0, 2, 0, 0, 1})                // a member overriding its group
+	f.Add([]byte{0, 0, 0, 1, 0, 0, 2, 4, 2, 0, 5, 2}) // two edges out of idle both named "a"
+	f.Add([]byte{})
+
+	states := []state{idle, running, done, cancelled}
+	// Two of these share a name: the trigger is an identity, never a string.
+	events := []fsm.Event[int]{fsm.Define[int]("a"), fsm.Define[int]("b"), fsm.Define[int]("a")}
+	groups := []fsm.Group[state]{
+		fsm.NewGroup("g0", idle, running),
+		fsm.NewGroup("g1", running, done), // overlaps g0 on running
+	}
+
+	f.Fuzz(func(t *testing.T, in []byte) {
+		if len(in) == 0 {
+			return
+		}
+		head, rows := in[0], in[1:]
+
+		var rules []fsm.Rule[state]
+		if head&1 == 1 {
+			rules = append(rules, fsm.Initial(states[int(head>>1)%len(states)]))
+		}
+		// Drop the three mistakes a random table makes systematically: a
+		// source claiming an event twice, two groups claiming one event, and a
+		// group transition every member overrides. Without this, any input
+		// long enough to be interesting is rejected by New and none of the
+		// invariants below ever runs — at 200 bytes the acceptance rate goes
+		// from 0% to ~87%. The named tests above cover all three errors.
+		type row struct{ src, ev, to int } // src indexes states first, then groups
+		var picked []row
+		seen := map[[2]int]bool{}
+		claimedBy := map[int]int{} // event -> the group source holding it
+		for i := 0; i+2 < len(rows); i += 3 {
+			r := row{int(rows[i]) % (len(states) + len(groups)), int(rows[i+1]) % len(events), int(rows[i+2]) % len(states)}
+			if seen[[2]int{r.src, r.ev}] {
+				continue
+			}
+			if r.src >= len(states) {
+				if prev, ok := claimedBy[r.ev]; ok && prev != r.src {
+					continue
+				}
+				claimedBy[r.ev] = r.src
+			}
+			seen[[2]int{r.src, r.ev}] = true
+			picked = append(picked, r)
+		}
+		picked = slices.DeleteFunc(picked, func(r row) bool {
+			return r.src >= len(states) &&
+				!slices.ContainsFunc(groups[r.src-len(states)].Members(), func(m state) bool {
+					return !seen[[2]int{slices.Index(states, m), r.ev}]
+				})
+		})
+		for _, r := range picked {
+			ev, to := events[r.ev], states[r.to]
+			if r.src < len(states) {
+				rules = append(rules, fsm.From(states[r.src]).On(ev).To(to))
+			} else {
+				rules = append(rules, fsm.FromGroup(groups[r.src-len(states)]).On(ev).To(to))
+			}
+		}
+
+		m, err := fsm.New("fuzz", rules...)
+		if err != nil {
+			return // a rejected definition has no invariants to keep
+		}
+
+		if dot := m.DOT(); dot != m.DOT() {
+			t.Fatalf("DOT output varies between calls:\n%s", dot)
+		}
+
+		known, edges := m.States(), m.Edges()
+		outgoing := map[state]bool{}
+		for _, e := range edges {
+			if !slices.Contains(known, e.From) || !slices.Contains(known, e.To) {
+				t.Fatalf("edge %v --%s--> %v has an endpoint outside States() %v", e.From, e.Event(), e.To, known)
+			}
+			// An inherited edge names the group that owns its source.
+			if e.Group != "" {
+				i := slices.IndexFunc(m.Groups(), func(g fsm.Group[state]) bool { return g.Name() == e.Group })
+				if i < 0 || !m.Groups()[i].Has(e.From) {
+					t.Fatalf("edge %v --%s--> %v claims group %q, which does not hold %v", e.From, e.Event(), e.To, e.Group, e.From)
+				}
+			}
+			outgoing[e.From] = true
+		}
+
+		// Events deduplicates by name; States and Edges do not repeat a row.
+		names := m.Events()
+		if slices.Contains(names, "") || len(slices.Compact(slices.Sorted(slices.Values(names)))) != len(names) {
+			t.Fatalf("Events() %v repeats a name or reports an unnamed trigger", names)
+		}
+
+		for _, s := range known {
+			if got := slices.Contains(m.Terminals(), s); got == outgoing[s] {
+				t.Fatalf("state %v: terminal=%v, has outgoing edges=%v", s, got, outgoing[s])
+			}
+			// Reachability is a fixpoint: nothing a reached state points at
+			// may be reported unreachable.
+			stuck := m.Unreachable(s)
+			for _, e := range edges {
+				if !slices.Contains(stuck, e.From) && slices.Contains(stuck, e.To) {
+					t.Fatalf("Unreachable(%v) = %v, but %v reaches %v", s, stuck, e.From, e.To)
+				}
+			}
+		}
+
+		// New rejects a start nothing reaches from, or one with no way out.
+		if init, ok := m.Initial(); ok {
+			if stuck := m.Unreachable(init); len(stuck) != 0 {
+				t.Fatalf("New accepted initial %v leaving %v unreachable", init, stuck)
+			}
+			if slices.Contains(m.Terminals(), init) {
+				t.Fatalf("New accepted initial %v with no way out", init)
+			}
+		}
+
+		// To is the table; Fire must agree with it, including from a state
+		// the definition never mentioned.
+		ctx := t.Context()
+		for _, from := range states {
+			for _, ev := range events {
+				want, ok := m.To(from, ev)
+				st := from
+				tr, err := m.Fire(ctx, &st, ev, 0)
+				switch {
+				case ok && err != nil:
+					t.Fatalf("Fire %s from %v: %v, but To resolves %v", ev, from, err, want)
+				case ok && (st != want || tr.From != from || tr.To != want || !tr.Is(ev)):
+					t.Fatalf("Fire %s from %v left %v (%v -> %v), want %v", ev, from, st, tr.From, tr.To, want)
+				case !ok && err == nil:
+					t.Fatalf("Fire %s from %v succeeded with no transition declared", ev, from)
+				case !ok && st != from:
+					t.Fatalf("Fire %s from %v failed but moved the state to %v", ev, from, st)
+				}
+			}
+		}
+	})
+}
+
+// --- Concurrency -----------------------------------------------------------
+
+// The headline claim: a Machine is immutable after New, so one value serves
+// every goroutine that owns a state and needs no lock. Nothing else in the
+// suite fires a shared machine concurrently, so -race never saw this path.
+// Hooks are shared, so keeping them safe is the caller's job — hence the
+// atomic counter.
+func TestAMachineIsSafeToShareAcrossGoroutines(t *testing.T) {
+	t.Parallel()
+
+	var inRunning atomic.Int64
+	m, err := fsm.New("job",
+		fsm.Gauge(running, func(context.Context) { inRunning.Add(1) }, func(context.Context) { inRunning.Add(-1) }),
+		fsm.From(idle).On(evStart).To(running).Guard("always", func(context.Context, fsm.Unit) error { return nil }),
+		fsm.From(running).On(evFinish).To(done).Action(func(context.Context, int) error { return nil }),
+		fsm.From(done).On(evCancel).To(idle),
+	)
+	if err != nil {
+		t.Fatalf("build: %v", err)
+	}
+	ctx := t.Context()
+
+	var wg sync.WaitGroup
+	for range 8 {
+		wg.Go(func() {
+			st := idle // each goroutine owns its own state
+			for range 200 {
+				// A round trip is idle -> running -> done -> idle, so the
+				// gauge nets to zero only if every leg ran.
+				_, start := m.Send(ctx, &st, evStart)
+				// Introspection reads the same tables Fire does.
+				_, _, _ = m.DOT(), m.Terminals(), m.Edges()
+				_, finish := m.Fire(ctx, &st, evFinish, 0)
+				_, cancel := m.Send(ctx, &st, evCancel)
+				if err := errors.Join(start, finish, cancel); err != nil {
+					t.Errorf("round trip: %v", err)
+					return
+				}
+			}
+		})
+	}
+	wg.Wait()
+
+	// Only meaningful if every round trip completed; otherwise the drift is
+	// the abandoned cycle, not a lost decrement.
+	if got := inRunning.Load(); got != 0 && !t.Failed() {
+		t.Errorf("gauge drifted to %d across goroutines, want 0", got)
 	}
 }
