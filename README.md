@@ -11,8 +11,6 @@
 
 A small finite state machine for Go. The caller owns the state, events carry typed payloads, and a machine is a set of rules whose source and target are named in separate calls so they cannot be swapped.
 
-Requires Go 1.27. The API uses generic methods, which earlier versions reject with `method must have no type parameters`.
-
 ```go
 type recState int32
 
