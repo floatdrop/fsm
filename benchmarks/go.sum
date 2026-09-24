@@ -1,0 +1,4 @@
+github.com/looplab/fsm v1.0.4 h1:UydovCL/p39HLvmBsLNsX/WgpfyfTZ+3e7YEFywkLMI=
+github.com/looplab/fsm v1.0.4/go.mod h1:PmD3fFvQEIsjMEfvZdrCDZ6y8VwKTwWNjlpEr6IKPO4=
+github.com/qmuntal/stateless v1.8.0 h1:9+Eg/7bWLKxUxs/vysNYAelFAh85kTyueC3ee6v8im8=
+github.com/qmuntal/stateless v1.8.0/go.mod h1:KWa8KVzIBD/ZS0EdzL5oU79sGq7fKwH9WEFijTC5AWw=

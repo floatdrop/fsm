@@ -44,6 +44,7 @@ go test -count=1 -run TestFireDoesNotAllocate . # the allocation gate, without -
 go test -run '^$' -bench . -benchmem ./...      # benchmarks
 go test -run '^$' -bench Fire -benchmem -count=6 ./...  # before quoting a number
 go test -run '^$' -fuzz FuzzMachineInvariants -fuzztime=60s .  # the fuzzer
+(cd benchmarks && go test -run '^$' -bench . -benchmem -count=6 ./...)  # vs other libs
 go vet ./... && golangci-lint run ./...         # lint (config in .golangci.yml)
 test -z "$(gofmt -l .)"                         # formatting gate
 go test -cover ./...                            # coverage; the package is at 100%
@@ -336,8 +337,26 @@ thing there is to test against, and that is the right target anyway.
 - **Benchmark numbers in `README.md` are measured, not estimated.** Re-run with
   `-count=6` before changing one; single runs vary by ~10% on this machine and
   a number quoted from one is noise.
-- **No dependencies.** The module requires nothing. Keep it that way — the
+- **No dependencies.** The root module requires nothing. Keep it that way — the
   package is meant to be vendorable into a monorepo without pulling a tree in.
+  `benchmarks/` is a *separate module* for exactly this reason: it depends on
+  `looplab/fsm` and `qmuntal/stateless` for the comparison table in
+  `README.md`, and none of that reaches a consumer of the root. `go test ./...`
+  from the root skips it, since a directory with its own `go.mod` is excluded.
+  CI does not run it — it would make every build fetch third-party code to
+  reproduce numbers that only change when someone edits them by hand.
+- **The comparison table is a design argument, not a scoreboard.** Every row
+  is measured with `-count=6` from `benchmarks/`, and the three bullets under
+  it — they hold the state, they are `any`-typed, they do things this package
+  does not — are why the numbers differ. Do not quote the table without them:
+  most of the gap is that a `fsm.Machine` is shared configuration while a
+  `looplab.FSM` is one object per entity, which is a different trade, not a
+  slower implementation of the same one.
+- **Every Go block in `README.md` compiles.** The quick start is a whole
+  `main.go`, and its printed output, the `Edges` listing and the `DOT` block
+  are copied from a real run of that exact machine, which is the same machine
+  `example_test.go` pins. Changing one means re-running all of them — extract
+  the blocks, `go vet`, run, paste back.
 
 ## Tooling caveats
 
