@@ -21,8 +21,6 @@ A finite state machine for Go, in one package with no dependencies.
 go get github.com/floatdrop/fsm
 ```
 
-Requires **Go 1.27**: the API uses generic methods, which earlier versions reject with `method must have no type parameters`.
-
 ## Quick start
 
 A complete program.
