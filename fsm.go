@@ -6,6 +6,10 @@
 // snapshot, a workflow variable) and replayed, without the machine holding a
 // second, divergent copy.
 //
+// A [Machine] is immutable once [New] returns, so one value serves every
+// goroutine that owns a state and needs no lock. Hooks are shared, though, so
+// whatever they touch is the caller's to synchronize.
+//
 // Events carry typed payloads. An [Event] declared as Event[time.Time] can only
 // be fired with a time.Time, and its action only ever sees a time.Time — there
 // is no ...any in the public API, and no type assertions in user code.
