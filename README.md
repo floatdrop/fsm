@@ -127,10 +127,10 @@ Each of these returns a `Rule[S]`, the single option type. Rules are plain value
 
 | Rule | Declares |
 | --- | --- |
+| `Initial(a)` | where a fresh instance starts |
 | `From(a).On(ev).To(b)` | one transition |
 | `FromEach(a, b).On(ev).To(c)` | the same transition from several sources |
 | `FromGroup(g).On(ev).To(c)` | a transition inherited by every member of a [group](#groups) |
-| `Initial(a)` | where a fresh instance starts |
 | `OnEnter(s, h)` / `OnExit(s, h)` | [hooks](#hooks) around the assignment |
 | `OnEnterVia(s, ev, h)` / `OnExitVia(s, ev, h)` | hooks that see the payload of one event |
 | `OnEnterWith(s, h)` / `OnExitWith(s, h)` | hooks that see the payload of every event entering or leaving `s` |
