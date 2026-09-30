@@ -39,7 +39,7 @@ to `any` and checked at runtime.
 
 ## A machine is a set of rules, not a builder
 
-`New` takes its transitions, gauges and hooks as `Rule[S]` values and returns
+`New` takes its transitions and hooks as `Rule[S]` values and returns
 `(*Machine[S], error)` in one call. There is no `Build()` step to forget and no
 mutable builder to hold half-finished. Because rules are ordinary values, a
 shared set can be declared once and reused:
@@ -126,16 +126,16 @@ unchanged by their existence.
 
 Because the override rule needs the whole explicit table before it can know
 what to skip, group expansion is a deferred pass — and it must run *before*
-the `GaugeWith` pass, which reads the finished table. So there are two phases,
+the `OnEnterWith`/`OnExitWith` pass, which reads the finished table. So there are two phases,
 not one: expansion adds edges, then the rules that read edges run.
 
 ### What groups deliberately are not
 
-A group has no entry or exit hooks, and no `Gauge`. The reason to want them is
-exactly the thing a flat expansion cannot reproduce: in a real hierarchy,
-moving between two substates of the same superstate does *not* run the
-superstate's hooks. With every row flat there is nowhere to record that, so a
-group gauge would decrement and increment on a move a hierarchy would treat as
+A group has no entry or exit hooks. The reason to want them is exactly the
+thing a flat expansion cannot reproduce: in a real hierarchy, moving between
+two substates of the same superstate does *not* run the superstate's hooks.
+With every row flat there is nowhere to record that, so a counter of what is in
+the group would decrement and increment on a move a hierarchy would treat as
 staying put — the same dip as a self-transition, in a counter whose whole
 purpose is not to drift.
 
@@ -238,38 +238,12 @@ that an entry hook which fires the machine again is logged after the
 transition that caused it, which is also why a transition hook must not fire
 the machine itself: the new state is not yet fully entered.
 
-`Gauge` is that pattern with a name. A counter of "how many things are
-currently in state *s*" is otherwise a `+= 1` and a `-= 1` at every call site
-that changes the state, and it drifts the first time a site is missed.
-`Gauge(s, inc, dec)` binds the pair to the state itself.
-
-`Gauge`'s closures are fixed when the machine is built, which is no good for
-the common case where the counter belongs to whatever the transition is
-*about* — a per-instance metric, labelled by a tenant or a service. That
-instance is in the payload, so `GaugeWith` takes it from there:
-
-```go
-fsm.GaugeWith(recStopped,
-    func(_ context.Context, s recStep) { s.r.metrics.Add(recStopped, 1) },
-    func(_ context.Context, s recStep) { s.r.metrics.Add(recStopped, -1) },
-)
-```
-
-It is still one declaration per state, so the increment and decrement cannot
-come apart. It expands to an entry hook on every event entering the state and
-an exit hook on every event leaving it, which means every such event has to
-carry the same payload type. Rather than let a mismatched event silently skip
-the counter, `New` reports it:
-
-```
-GaugeWith for state running: transition done --other--> running carries a
-different payload type, so the counter cannot be kept paired
-```
-
-So a machine whose events carry different payloads can still use `GaugeWith`
-on the states where they agree, and is told precisely where they do not. The
-expansion happens in a second pass over the finished transition table, so a
-`GaugeWith` can be declared before the edges it applies to.
+A counter of "how many things are currently in state *s*" is the canonical
+case. By hand it is a `+= 1` and a `-= 1` at every call site that changes the
+state, and it drifts the first time a site is missed. As an `OnEnter` and an
+`OnExit` on the state it cannot: neither hook can fail, and neither runs unless
+the assignment happens. A `Gauge(s, inc, dec)` declaring the pair in one call
+would add nothing the two hooks do not already guarantee, so there is none.
 
 ### Hooks that need the payload name their event
 
@@ -289,8 +263,44 @@ see the payload is an `Action`, which has to be repeated on every incoming
 edge and runs before the state changes — exactly the duplication hooks exist
 to remove.
 
-They run after the plain hooks of the same state, and cost nothing on a
-machine that declares none: a single flag set at construction skips the whole
+### Hooks that need the payload of every event
+
+A counter labelled by the thing the transition is *about* — a per-instance
+metric, labelled by a tenant or a service — needs the payload on every edge
+into and out of the state, not on one event. Listing each with `OnEnterVia` is
+the call-site drift again: a new event entering the state silently skips the
+count. `OnEnterWith` and `OnExitWith` take no event:
+
+```go
+fsm.OnEnterWith(jobRunning, func(_ context.Context, _ fsm.Transition[jobState], j *job) {
+    running.WithLabelValues(j.tenant).Inc()
+})
+fsm.OnExitWith(jobRunning, func(_ context.Context, _ fsm.Transition[jobState], j *job) {
+    running.WithLabelValues(j.tenant).Dec()
+})
+```
+
+Each expands to a Via hook on every event entering (or leaving) the state,
+read from the finished transition table in a second pass — so group-inherited
+edges count, and the hook can be declared before the edges it applies to. That
+requires every such event to carry the hook's payload type. Rather than let a
+mismatched event silently skip the hook, `New` reports it:
+
+```
+OnEnterWith for state running: transition done --other--> running carries a
+different payload type, so the hook would miss it
+```
+
+A machine whose events carry different payloads can still use them on the
+states where they agree, and use `OnEnterVia` per event where they do not. A
+With hook no transition can trigger is rejected like a Via hook, so a terminal
+state takes `OnEnterWith` alone: the `OnExitWith` half could never run.
+
+### Ordering and cost
+
+Plain hooks of a state run first, then its Via hooks, then its With hooks,
+which attach last because they wait for the finished table. None of them costs
+anything on a machine that declares none: a single flag set at construction skips the whole
 hook block, including the lookups the plain hooks would do.
 
 ### Branch on the trigger, not on its name
@@ -306,8 +316,8 @@ if tr.Is(evPcpKick) { … }
 ### Self-transitions run exit and entry
 
 `From(a).On(ev).To(a)` is allowed, and is UML's *external* self-transition: it
-runs the exit hooks, assigns, then runs the entry hooks. A `Gauge` on the
-state therefore dips to zero and comes back. There is no internal transition
+runs the exit hooks, assigns, then runs the entry hooks. A counter kept by those
+hooks therefore dips to zero and comes back. There is no internal transition
 that skips the hooks; an `Action` covers that case.
 
 ## Fire does not allocate

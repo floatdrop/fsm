@@ -33,10 +33,10 @@
 // hooks, because the reason to want them is the one thing expansion cannot
 // reproduce: in a real hierarchy, moving between two substates of the same
 // superstate does not run the superstate's hooks, and there is nowhere to
-// record that when every row is flat. So there is also no group [Gauge] — it
-// would decrement and increment on a move that a hierarchy would treat as
-// staying put. Count the member states individually and sum them where the
-// counters are read.
+// record that when every row is flat. So there is also no counter of what is
+// in a group — it would decrement and increment on a move that a hierarchy
+// would treat as staying put. Count the member states individually and sum
+// them where the counters are read.
 //
 // Groups do not nest, and entering a group does not select an initial member.
 package fsm
@@ -128,7 +128,8 @@ type edge[S comparable] struct {
 // A Hook does not see the event's payload, because a state can be entered by
 // events carrying different types. When the payload is what the hook is for,
 // declare it with [OnEnterVia] or [OnExitVia], which name the event and so
-// know its type.
+// know its type, or with [OnEnterWith] or [OnExitWith], which require every
+// event entering or leaving the state to carry the one type.
 type Hook[S comparable] func(context.Context, Transition[S])
 
 // Machine is an immutable state machine built by [New] from a set of [Rule]s.

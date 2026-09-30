@@ -697,16 +697,16 @@ func TestHooksBracketTheAssignment(t *testing.T) {
 
 // The bug class this package exists to remove: a gauge maintained by hand at
 // every call site that changes the state.
-func TestGaugeStaysPaired(t *testing.T) {
+func TestEntryAndExitHooksStayPaired(t *testing.T) {
 	t.Parallel()
 
 	counts := map[state]int{}
-	inc := func(s state) func(context.Context) { return func(context.Context) { counts[s]++ } }
-	dec := func(s state) func(context.Context) { return func(context.Context) { counts[s]-- } }
+	inc := func(s state) fsm.Hook[state] { return func(context.Context, fsm.Transition[state]) { counts[s]++ } }
+	dec := func(s state) fsm.Hook[state] { return func(context.Context, fsm.Transition[state]) { counts[s]-- } }
 
 	m, err := fsm.New("job",
-		fsm.Gauge(running, inc(running), dec(running)),
-		fsm.Gauge(done, inc(done), dec(done)),
+		fsm.OnEnter(running, inc(running)), fsm.OnExit(running, dec(running)),
+		fsm.OnEnter(done, inc(done)), fsm.OnExit(done, dec(done)),
 		fsm.From(idle).On(evStart).To(running),
 		fsm.From(running).On(evFinish).To(done),
 	)
@@ -932,6 +932,38 @@ func TestOnExitViaRunsBeforeTheStateChanges(t *testing.T) {
 	}
 }
 
+// With hooks attach once the table is finished, so they run after the plain
+// and the Via hooks of the same state, whatever the declaration order.
+func TestWithHooksRunAfterViaHooks(t *testing.T) {
+	t.Parallel()
+
+	var seen []string
+	note := func(what string) func(context.Context, fsm.Transition[state], int) {
+		return func(context.Context, fsm.Transition[state], int) { seen = append(seen, what) }
+	}
+	m, err := fsm.New("job",
+		fsm.OnExitWith(running, note("exit-with")),
+		fsm.OnEnterWith(done, note("enter-with")),
+		fsm.OnExitVia(running, evFinish, note("exit-via")),
+		fsm.OnEnterVia(done, evFinish, note("enter-via")),
+		fsm.OnExit(running, func(context.Context, fsm.Transition[state]) { seen = append(seen, "exit") }),
+		fsm.OnEnter(done, func(context.Context, fsm.Transition[state]) { seen = append(seen, "enter") }),
+		fsm.From(running).On(evFinish).To(done),
+	)
+	if err != nil {
+		t.Fatalf("build: %v", err)
+	}
+
+	st := running
+	if _, err := m.Fire(t.Context(), &st, evFinish, 3); err != nil {
+		t.Fatal(err)
+	}
+	want := "exit,exit-via,exit-with,enter,enter-via,enter-with"
+	if got := strings.Join(seen, ","); got != want {
+		t.Errorf("hooks ran %q, want %q", got, want)
+	}
+}
+
 func TestBuildRejectsBadViaHooks(t *testing.T) {
 	t.Parallel()
 
@@ -960,10 +992,8 @@ func TestSelfTransitionRunsExitAndEntry(t *testing.T) {
 	var seq []string
 	gauge, low := 0, 0
 	m, err := fsm.New("job",
-		fsm.Gauge(running,
-			func(context.Context) { gauge++ },
-			func(context.Context) { gauge--; low = min(low, gauge) },
-		),
+		fsm.OnEnter(running, func(context.Context, fsm.Transition[state]) { gauge++ }),
+		fsm.OnExit(running, func(context.Context, fsm.Transition[state]) { gauge--; low = min(low, gauge) }),
 		fsm.OnExit(running, func(context.Context, fsm.Transition[state]) { seq = append(seq, "exit") }),
 		fsm.OnEnter(running, func(context.Context, fsm.Transition[state]) { seq = append(seq, "enter") }),
 		fsm.From(idle).On(evStart).To(running),
@@ -998,9 +1028,9 @@ func TestSelfTransitionRunsExitAndEntry(t *testing.T) {
 }
 
 // A counter labelled by the thing the transition is about cannot be closed
-// over when the machine is built. GaugeWith takes it from the payload and is
-// still declared once per state, so the pair stays bound together.
-func TestGaugeWithCountsPerPayload(t *testing.T) {
+// over when the machine is built. OnEnterWith and OnExitWith take it from the
+// payload, and one declaration each covers every edge.
+func TestWithHooksCountPerPayload(t *testing.T) {
 	t.Parallel()
 
 	type tally struct{ n map[state]int }
@@ -1008,10 +1038,8 @@ func TestGaugeWithCountsPerPayload(t *testing.T) {
 	back := fsm.Define[*tally]("back")
 
 	m, err := fsm.New("job",
-		fsm.GaugeWith(running,
-			func(_ context.Context, x *tally) { x.n[running]++ },
-			func(_ context.Context, x *tally) { x.n[running]-- },
-		),
+		fsm.OnEnterWith(running, func(_ context.Context, _ fsm.Transition[state], x *tally) { x.n[running]++ }),
+		fsm.OnExitWith(running, func(_ context.Context, _ fsm.Transition[state], x *tally) { x.n[running]-- }),
 		fsm.From(idle).On(ev).To(running),
 		fsm.From(running).On(back).To(idle),
 	)
@@ -1044,9 +1072,8 @@ func TestGaugeWithCountsPerPayload(t *testing.T) {
 	}
 }
 
-// The increment and decrement come from one declaration, so no call site can
-// supply one without the other.
-func TestGaugeWithStaysPairedAcrossEveryEdge(t *testing.T) {
+// One declaration covers every way in and out, so no event can skip the count.
+func TestWithHooksCoverEveryEdge(t *testing.T) {
 	t.Parallel()
 
 	type tally struct{ n int }
@@ -1055,10 +1082,8 @@ func TestGaugeWithStaysPairedAcrossEveryEdge(t *testing.T) {
 	out := fsm.Define[*tally]("out")
 
 	m, err := fsm.New("job",
-		fsm.GaugeWith(running,
-			func(_ context.Context, x *tally) { x.n++ },
-			func(_ context.Context, x *tally) { x.n-- },
-		),
+		fsm.OnEnterWith(running, func(_ context.Context, _ fsm.Transition[state], x *tally) { x.n++ }),
+		fsm.OnExitWith(running, func(_ context.Context, _ fsm.Transition[state], x *tally) { x.n-- }),
 		fsm.From(idle).On(in1).To(running),
 		fsm.From(done).On(in2).To(running), // a second way in
 		fsm.From(running).On(out).To(done),
@@ -1083,9 +1108,9 @@ func TestGaugeWithStaysPairedAcrossEveryEdge(t *testing.T) {
 	}
 }
 
-// A state reached by events carrying different payloads cannot have its
-// counter kept paired, so New says so instead of skipping an edge.
-func TestGaugeWithRejectsMixedPayloads(t *testing.T) {
+// A hook on a state reached by events carrying different payloads cannot run
+// on all of them, so New says so instead of skipping an edge.
+func TestWithHooksRejectMixedPayloads(t *testing.T) {
 	t.Parallel()
 
 	type tally struct{}
@@ -1093,57 +1118,65 @@ func TestGaugeWithRejectsMixedPayloads(t *testing.T) {
 	other := fsm.Define[int]("other")
 
 	_, err := fsm.New("job",
-		fsm.GaugeWith(running,
-			func(context.Context, *tally) {},
-			func(context.Context, *tally) {},
-		),
+		fsm.OnEnterWith(running, func(context.Context, fsm.Transition[state], *tally) {}),
+		fsm.OnExitWith(running, func(context.Context, fsm.Transition[state], *tally) {}),
 		fsm.From(idle).On(typed).To(running),
-		fsm.From(done).On(other).To(running), // different payload type
+		fsm.From(done).On(other).To(running), // different payload type in
+		fsm.From(running).On(other).To(done), // and out
 	)
 	if err == nil {
-		t.Fatal("expected an error for a state entered by two payload types")
+		t.Fatal("expected an error for a state entered and left by two payload types")
 	}
-	for _, want := range []string{"GaugeWith for state running", "other", "different payload type"} {
+	for _, want := range []string{
+		"OnEnterWith for state running: transition done --other--> running carries a different payload type, so the hook would miss it",
+		"OnExitWith for state running: transition running --other--> done carries a different payload type, so the hook would miss it",
+	} {
 		if !strings.Contains(err.Error(), want) {
 			t.Errorf("error %q does not mention %q", err, want)
 		}
 	}
 }
 
-// A mismatch is one error, not also "no transition enters or leaves it".
-func TestGaugeWithMismatchReportsOneError(t *testing.T) {
+// A mismatch is one error per event: not one per source fanning in on it, and
+// not also "no transition enters it".
+func TestWithHookMismatchReportsOneError(t *testing.T) {
 	t.Parallel()
 
 	type tally struct{}
 	other := fsm.Define[int]("other")
 
 	_, err := fsm.New("job",
-		fsm.GaugeWith(running,
-			func(context.Context, *tally) {},
-			func(context.Context, *tally) {},
-		),
-		fsm.From(idle).On(other).To(running),
+		fsm.OnEnterWith(running, func(context.Context, fsm.Transition[state], *tally) {}),
+		fsm.FromEach(idle, done, cancelled).On(other).To(running),
 	)
 	if err == nil || !strings.Contains(err.Error(), "different payload type") {
 		t.Fatalf("got %v, want a payload mismatch", err)
 	}
-	if strings.Contains(err.Error(), "no transition enters or leaves it") {
-		t.Errorf("error %q also reports the state as isolated", err)
+	if got := strings.Count(err.Error(), "\n") + 1; got != 1 {
+		t.Errorf("reported %d errors, want 1:\n%v", got, err)
 	}
 }
 
-func TestGaugeWithRejectsAnIsolatedState(t *testing.T) {
+// A With hook no transition can trigger is a mistyped state, or a state whose
+// only entry is the caller's.
+func TestWithHookThatCanNeverRunIsAnError(t *testing.T) {
 	t.Parallel()
 
 	_, err := fsm.New("job",
-		fsm.GaugeWith(cancelled,
-			func(context.Context, int) {},
-			func(context.Context, int) {},
-		),
 		fsm.From(idle).On(evFinish).To(running),
+		fsm.OnEnterWith(idle, func(context.Context, fsm.Transition[state], int) {}),
+		fsm.OnExitWith(running, func(context.Context, fsm.Transition[state], int) {}),
 	)
-	if err == nil || !strings.Contains(err.Error(), "no transition enters or leaves it") {
-		t.Fatalf("got %v, want a complaint about an isolated state", err)
+	if err == nil {
+		t.Fatal("built a machine with hooks that can never run")
+	}
+	for _, want := range []string{
+		"OnEnterWith for state idle: no transition enters it, so the hook would never run",
+		"OnExitWith for state running: no transition leaves it, so the hook would never run",
+	} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error %q does not mention %q", err, want)
+		}
 	}
 }
 
@@ -1170,26 +1203,60 @@ func TestViaHookThatCanNeverRunIsAnError(t *testing.T) {
 	}
 }
 
+// A typed hook does not declare its state, so a mistyped one is reported as a
+// hook that can never run and not also as unreachable from the initial state.
+func TestTypedHookOnAMistypedStateReportsOneError(t *testing.T) {
+	t.Parallel()
+
+	hook := func(context.Context, fsm.Transition[state], int) {}
+	for _, tc := range []struct {
+		name string
+		rule fsm.Rule[state]
+		want string
+	}{
+		{"OnEnterVia", fsm.OnEnterVia(cancelled, evFinish, hook), "OnEnterVia for state cancelled: no transition on finish enters it"},
+		{"OnExitVia", fsm.OnExitVia(cancelled, evFinish, hook), "OnExitVia for state cancelled: no transition on finish leaves it"},
+		{"OnEnterWith", fsm.OnEnterWith(cancelled, hook), "OnEnterWith for state cancelled: no transition enters it"},
+		{"OnExitWith", fsm.OnExitWith(cancelled, hook), "OnExitWith for state cancelled: no transition leaves it"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			_, err := fsm.New("job",
+				fsm.Initial(idle),
+				fsm.From(idle).On(evStart).To(running),
+				fsm.From(running).On(evFinish).To(idle),
+				tc.rule,
+			)
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("got %v, want %q", err, tc.want)
+			}
+			if got := strings.Count(err.Error(), "\n") + 1; got != 1 {
+				t.Errorf("reported %d errors, want 1:\n%v", got, err)
+			}
+		})
+	}
+}
+
 // Declaration order must not matter: the edges are read in a second pass.
-func TestGaugeWithMayBeDeclaredBeforeItsEdges(t *testing.T) {
+func TestOnEnterWithMayBeDeclaredBeforeItsEdges(t *testing.T) {
 	t.Parallel()
 
 	type tally struct{ n int }
 	ev := fsm.Define[*tally]("go")
 
 	first, err := fsm.New("first",
-		fsm.GaugeWith(running, func(_ context.Context, x *tally) { x.n++ }, func(_ context.Context, x *tally) { x.n-- }),
+		fsm.OnEnterWith(running, func(_ context.Context, _ fsm.Transition[state], x *tally) { x.n++ }),
 		fsm.From(idle).On(ev).To(running),
 	)
 	if err != nil {
-		t.Fatalf("gauge first: %v", err)
+		t.Fatalf("hook first: %v", err)
 	}
 	last, err := fsm.New("last",
 		fsm.From(idle).On(ev).To(running),
-		fsm.GaugeWith(running, func(_ context.Context, x *tally) { x.n++ }, func(_ context.Context, x *tally) { x.n-- }),
+		fsm.OnEnterWith(running, func(_ context.Context, _ fsm.Transition[state], x *tally) { x.n++ }),
 	)
 	if err != nil {
-		t.Fatalf("gauge last: %v", err)
+		t.Fatalf("hook last: %v", err)
 	}
 
 	ctx := t.Context()
@@ -1417,13 +1484,11 @@ func TestFireErrorsNameTheirEdge(t *testing.T) {
 	}
 }
 
-// A nil hook is a build error, not a nil call at fire time. A gauge needs
-// both halves, or the counter it exists to keep honest could only drift.
+// A nil hook is a build error, not a nil call at fire time.
 func TestBuildRejectsNilHooks(t *testing.T) {
 	t.Parallel()
 
-	tick := func(context.Context) {}
-	tickWith := func(context.Context, int) {}
+	var nilWith func(context.Context, fsm.Transition[state], int)
 
 	for _, tc := range []struct {
 		name string
@@ -1432,10 +1497,8 @@ func TestBuildRejectsNilHooks(t *testing.T) {
 	}{
 		{"OnEnter", fsm.OnEnter[state](running, nil), "nil OnEnter hook for state running"},
 		{"OnExit", fsm.OnExit[state](running, nil), "nil OnExit hook for state running"},
-		{"Gauge without inc", fsm.Gauge(running, nil, tick), "Gauge for state running needs both inc and dec"},
-		{"Gauge without dec", fsm.Gauge(running, tick, nil), "Gauge for state running needs both inc and dec"},
-		{"GaugeWith without inc", fsm.GaugeWith(running, nil, tickWith), "GaugeWith for state running needs both inc and dec"},
-		{"GaugeWith without dec", fsm.GaugeWith(running, tickWith, nil), "GaugeWith for state running needs both inc and dec"},
+		{"OnEnterWith", fsm.OnEnterWith(running, nilWith), "nil OnEnterWith hook for state running"},
+		{"OnExitWith", fsm.OnExitWith(running, nilWith), "nil OnExitWith hook for state running"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
@@ -1945,17 +2008,14 @@ func TestGroupGuardRejectsEveryInheritedEdge(t *testing.T) {
 	}
 }
 
-// Group expansion has to run before GaugeWith reads the table, or a gauge
+// Group expansion has to run before OnEnterWith reads the table, or the hook
 // silently misses every edge a group contributed.
-func TestGaugeWithSeesGroupInheritedEdges(t *testing.T) {
+func TestOnEnterWithSeesGroupInheritedEdges(t *testing.T) {
 	t.Parallel()
 
 	var delta int
 	m, err := fsm.New("job",
-		fsm.GaugeWith(cancelled,
-			func(_ context.Context, _ int) { delta++ },
-			func(_ context.Context, _ int) { delta-- },
-		),
+		fsm.OnEnterWith(cancelled, func(context.Context, fsm.Transition[state], int) { delta++ }),
 		fsm.From(idle).On(evFinish).To(running),
 		fsm.FromGroup(fsm.NewGroup("live", idle, running)).On(evFinish).To(cancelled),
 	)
@@ -1968,21 +2028,19 @@ func TestGaugeWithSeesGroupInheritedEdges(t *testing.T) {
 		t.Fatalf("finish: %v", err)
 	}
 	if delta != 1 {
-		t.Errorf("gauge moved by %d on a group-inherited edge, want 1", delta)
+		t.Errorf("hook moved the count by %d on a group-inherited edge, want 1", delta)
 	}
 }
 
 // Several sources entering on one event share the (state, event) hook key; the
-// gauge must still move once per entry.
-func TestGaugeWithCountsFanInOnce(t *testing.T) {
+// hook must still run once per entry.
+func TestOnEnterWithRunsOnceOnFanIn(t *testing.T) {
 	t.Parallel()
 
 	var delta int
 	m, err := fsm.New("job",
-		fsm.GaugeWith(cancelled,
-			func(_ context.Context, _ int) { delta++ },
-			func(_ context.Context, _ int) { delta-- },
-		),
+		fsm.OnEnterWith(cancelled, func(context.Context, fsm.Transition[state], int) { delta++ }),
+		fsm.OnExitWith(cancelled, func(context.Context, fsm.Transition[state], int) { delta-- }),
 		fsm.From(idle).On(evStart).To(running),
 		fsm.FromGroup(fsm.NewGroup("live", idle, running)).On(evFinish).To(cancelled),
 		fsm.FromEach(done, cancelled).On(evFinish).To(idle),
@@ -1997,13 +2055,13 @@ func TestGaugeWithCountsFanInOnce(t *testing.T) {
 			t.Fatalf("cancel from %v: %v", from, err)
 		}
 		if delta != 1 {
-			t.Errorf("gauge moved by %d entering from %v, want 1", delta, from)
+			t.Errorf("count moved by %d entering from %v, want 1", delta, from)
 		}
 		if _, err := m.Fire(t.Context(), &st, evFinish, 1); err != nil {
 			t.Fatalf("leave cancelled: %v", err)
 		}
 		if delta != 0 {
-			t.Errorf("gauge at %d after leaving, want 0", delta)
+			t.Errorf("count at %d after leaving, want 0", delta)
 		}
 	}
 }
@@ -2134,7 +2192,8 @@ func TestGroupRuleCanBeSharedBetweenMachines(t *testing.T) {
 	}
 }
 
-// A Via hook on an edge the broken group would have added is not a second mistake.
+// A Via or With hook on an edge the broken group would have added is not a
+// second mistake.
 func TestBrokenGroupDoesNotAlsoReportTheViaHook(t *testing.T) {
 	t.Parallel()
 
@@ -2142,6 +2201,7 @@ func TestBrokenGroupDoesNotAlsoReportTheViaHook(t *testing.T) {
 		fsm.From(idle).On(evStart).To(running),
 		fsm.FromGroup(fsm.NewGroup[state]("empty")).On(evCancel).To(cancelled),
 		fsm.OnEnterVia(cancelled, evCancel, func(context.Context, fsm.Transition[state], fsm.Unit) {}),
+		fsm.OnEnterWith(cancelled, func(context.Context, fsm.Transition[state], fsm.Unit) {}),
 	)
 	if err == nil {
 		t.Fatal("expected an error for a group with no members")
@@ -2538,7 +2598,8 @@ func TestAMachineIsSafeToShareAcrossGoroutines(t *testing.T) {
 
 	var inRunning atomic.Int64
 	m, err := fsm.New("job",
-		fsm.Gauge(running, func(context.Context) { inRunning.Add(1) }, func(context.Context) { inRunning.Add(-1) }),
+		fsm.OnEnter(running, func(context.Context, fsm.Transition[state]) { inRunning.Add(1) }),
+		fsm.OnExit(running, func(context.Context, fsm.Transition[state]) { inRunning.Add(-1) }),
 		fsm.From(idle).On(evStart).To(running).Guard("always", func(context.Context, fsm.Unit) error { return nil }),
 		fsm.From(running).On(evFinish).To(done).Action(func(context.Context, int) error { return nil }),
 		fsm.From(done).On(evCancel).To(idle),

@@ -62,21 +62,25 @@ func uploadsSettled(_ context.Context, r *recording) error {
 
 // Gauges tracking how many recordings sit in each state. In hand-written form
 // these are a += and a -= at every site that changes the state, and they drift
-// as soon as one site is missed.
+// as soon as one site is missed. As entry and exit hooks they cannot.
 var gauge = map[recState]int{}
 
-func incr(s recState) func(context.Context) { return func(context.Context) { gauge[s]++ } }
-func decr(s recState) func(context.Context) { return func(context.Context) { gauge[s]-- } }
+func counted(s recState) fsm.Rule[recState] {
+	return fsm.Rules(
+		fsm.OnEnter(s, func(context.Context, fsm.Transition[recState]) { gauge[s]++ }),
+		fsm.OnExit(s, func(context.Context, fsm.Transition[recState]) { gauge[s]-- }),
+	)
+}
 
 // A machine is a set of rules. Each transition names its source and target in
 // separate calls, so the two states cannot be swapped the way two adjacent
 // arguments can.
 var recordingFSM = fsm.MustNew("recording",
 	fsm.Initial(recActive),
-	fsm.Gauge(recActive, incr(recActive), decr(recActive)),
-	fsm.Gauge(recStopped, incr(recStopped), decr(recStopped)),
-	fsm.Gauge(recFinished, incr(recFinished), decr(recFinished)),
-	fsm.Gauge(recUploaded, incr(recUploaded), decr(recUploaded)),
+	counted(recActive),
+	counted(recStopped),
+	counted(recFinished),
+	counted(recUploaded),
 
 	fsm.From(recActive).On(evRecStop).To(recStopped).Action(markStopped),
 	fsm.From(recStopped).On(evRecFinish).To(recFinished).

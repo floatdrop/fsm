@@ -8,12 +8,13 @@ import (
 	"strings"
 )
 
-// Rule is one declaration a machine is made of: a transition, a gauge or a
-// hook. Rules are values, so a set of them can be built up in a loop, stored,
-// and shared between machines.
+// Rule is one declaration a machine is made of: a transition, a hook, a group
+// or the initial state. Rules are values, so a set of them can be built up in
+// a loop, stored, and shared between machines.
 //
-// Only this package implements Rule. Declare one with [From], [Gauge],
-// [OnEnter], [OnExit], [OnTransition], [Initial] or [Rules].
+// Only this package implements Rule. Declare one with [From], [FromEach],
+// [FromGroup], [OnEnter], [OnExit], [OnEnterVia], [OnExitVia], [OnEnterWith],
+// [OnExitWith], [OnTransition], [NewGroup], [Initial] or [Rules].
 type Rule[S comparable] interface {
 	applyTo(*builder[S])
 }
@@ -49,7 +50,7 @@ type builder[S comparable] struct {
 	seen map[S]bool
 
 	// Every declared transition in order, with the payload type its event
-	// carries. [GaugeWith] needs to see the whole table, so it is recorded
+	// carries. [OnEnterWith] needs to see the whole table, so it is recorded
 	// here and read in a second pass.
 	decls []decl[S]
 
@@ -127,7 +128,7 @@ func New[S comparable](name string, rules ...Rule[S]) (*Machine[S], error) {
 
 	// Group transitions expand first, since they add edges. Rules that need
 	// the whole transition table then run against the finished one, so a
-	// GaugeWith can be declared before the edges it applies to.
+	// OnEnterWith can be declared before the edges it applies to.
 	for _, e := range b.expand {
 		e(b)
 	}
@@ -222,8 +223,8 @@ type OnStep[S comparable, A any] struct {
 //
 // A self-transition — To naming the state On came from — is allowed and runs
 // the full sequence: the exit hooks of the state, the assignment, then its
-// entry hooks. That is UML's external self-transition, and it means a [Gauge]
-// on the state decrements and increments back to where it was. There is no
+// entry hooks. That is UML's external self-transition, and it means a counter
+// kept by those hooks decrements and increments back to where it was. There is no
 // internal transition that skips the hooks; use an [ToStep.Action] for that.
 func (o OnStep[S, A]) To(to S) *ToStep[S, A] {
 	return &ToStep[S, A]{froms: o.froms, group: o.group, ev: o.ev, to: to}
@@ -494,7 +495,7 @@ func OnTransition[S comparable](h Hook[S]) Rule[S] {
 // start has no way out, and lets [Machine.DOT] mark where the machine begins.
 //
 // Entering the initial state is not a transition, so no hook runs for it and
-// the first increment of a [Gauge] is the caller's.
+// the first increment of a counter kept by entry hooks is the caller's.
 func Initial[S comparable](s S) Rule[S] {
 	return ruleFunc[S](func(b *builder[S]) {
 		if b.m.hasInitial {
@@ -544,7 +545,6 @@ func OnEnterVia[S comparable, A any](s S, ev Event[A], h func(context.Context, T
 		}
 		k := edge[S]{from: s, ev: ev.def}
 		b.m.onEnterVia[k] = append(b.m.onEnterVia[k], h)
-		b.declare(s)
 		b.requireVia("OnEnterVia", "enters", s, ev.def, func(d decl[S]) bool { return d.to == s })
 	})
 }
@@ -560,7 +560,6 @@ func OnExitVia[S comparable, A any](s S, ev Event[A], h func(context.Context, Tr
 		}
 		k := edge[S]{from: s, ev: ev.def}
 		b.m.onExitVia[k] = append(b.m.onExitVia[k], h)
-		b.declare(s)
 		b.requireVia("OnExitVia", "leaves", s, ev.def, func(d decl[S]) bool { return d.key.from == s })
 	})
 }
@@ -578,7 +577,9 @@ func (b *builder[S]) checkVia(what string, s S, def *eventDef, nilHook bool) boo
 }
 
 // requireVia defers a check that some transition on def matches, so a Via
-// hook that can never run is reported rather than silently dead.
+// hook that can never run is reported rather than silently dead. The hook does
+// not declare s: an edge does, so a mistyped state is reported here alone and
+// not also as unreachable.
 func (b *builder[S]) requireVia(what, verb string, s S, def *eventDef, match func(decl[S]) bool) {
 	b.deferred = append(b.deferred, func(b *builder[S]) {
 		// A broken rule may be what dropped the row; report it alone.
@@ -592,89 +593,79 @@ func (b *builder[S]) requireVia(what, verb string, s S, def *eventDef, match fun
 	})
 }
 
-// Gauge pairs an increment on entering s with a decrement on leaving it.
+// OnEnterWith declares a hook that runs just after the machine enters s, on
+// every event that enters it, and hands the hook that event's payload:
 //
-// This is the hook pattern worth having a name for: a counter that tracks
-// "how many things are currently in state s" is otherwise maintained by hand
-// at every call site that changes the state, and drifts the moment one of them
-// is missed.
-func Gauge[S comparable](s S, inc, dec func(context.Context)) Rule[S] {
+//	fsm.OnEnterWith(jobRunning, func(_ context.Context, _ fsm.Transition[jobState], j *job) {
+//		running.WithLabelValues(j.tenant).Inc()
+//	})
+//
+// It is [OnEnterVia] for every such event at once. The events are read from
+// the finished transition table, group-inherited edges included, so one added
+// later is covered without another declaration. That requires every event
+// entering s to carry payload type A: [New] reports one that does not, rather
+// than let the hook silently miss it. Where the payloads differ, name each
+// event with OnEnterVia instead.
+//
+// Paired with [OnExitWith] it keeps a count of what is in s, labelled by the
+// payload. Hooks cannot fail and run only once the transition is certain, so
+// the increment and its decrement cannot come apart. Entering the initial
+// state is not a transition, so the first increment is the caller's.
+//
+// [New] rejects a With hook no transition can trigger, so a terminal state,
+// which nothing leaves, takes OnEnterWith without the OnExitWith half.
+//
+// It runs after the plain and the [OnEnterVia] entry hooks of the same state.
+func OnEnterWith[S comparable, A any](s S, h func(context.Context, Transition[S], A)) Rule[S] {
 	return ruleFunc[S](func(b *builder[S]) {
-		if inc == nil || dec == nil {
-			b.errs = append(b.errs, fmt.Errorf("Gauge for state %v needs both inc and dec", s))
-			return
-		}
-		b.m.onEnter[s] = append(b.m.onEnter[s], func(ctx context.Context, _ Transition[S]) { inc(ctx) })
-		b.m.onExit[s] = append(b.m.onExit[s], func(ctx context.Context, _ Transition[S]) { dec(ctx) })
-		b.declare(s)
+		b.attachWith("OnEnterWith", "enters", s, h, b.m.onEnterVia, func(d decl[S]) bool { return d.to == s })
 	})
 }
 
-// GaugeWith is [Gauge] for a counter that needs something from the event's
-// payload — the instance the count is labelled by, typically:
-//
-//	fsm.GaugeWith(recStopped,
-//		func(_ context.Context, s recStep) { s.r.metrics.Add(recStopped, 1) },
-//		func(_ context.Context, s recStep) { s.r.metrics.Add(recStopped, -1) },
-//	)
-//
-// Gauge's closures are fixed when the machine is built, which is no good when
-// the counter belongs to whatever the transition is about. GaugeWith is still
-// declared once per state, so the increment and its decrement stay bound
-// together: it expands to an entry hook on every event that enters s and an
-// exit hook on every event that leaves s.
-//
-// That requires every event touching s to carry the same payload type A.
-// [New] checks it and reports the offending transition rather than letting a
-// mismatched event silently skip the counter, so a machine whose events carry
-// different payloads can still use GaugeWith on the states where they agree.
-//
-// Entering the initial state is not a transition, so the first increment is
-// the caller's, exactly as with [Gauge].
-func GaugeWith[S comparable, A any](s S, inc, dec func(context.Context, A)) Rule[S] {
+// OnExitWith declares a hook that runs just before the machine leaves s, on
+// every event that leaves it, and hands the hook that event's payload. See
+// [OnEnterWith]. It runs after the plain and the [OnExitVia] exit hooks of
+// the same state, and still before the state changes.
+func OnExitWith[S comparable, A any](s S, h func(context.Context, Transition[S], A)) Rule[S] {
 	return ruleFunc[S](func(b *builder[S]) {
-		if inc == nil || dec == nil {
-			b.errs = append(b.errs, fmt.Errorf("GaugeWith for state %v needs both inc and dec", s))
-			return
-		}
-		b.declare(s)
+		b.attachWith("OnExitWith", "leaves", s, h, b.m.onExitVia, func(d decl[S]) bool { return d.key.from == s })
+	})
+}
 
-		b.deferred = append(b.deferred, func(b *builder[S]) {
-			want := payloadToken[A]()
-			enter := func(ctx context.Context, _ Transition[S], a A) { inc(ctx, a) }
-			exit := func(ctx context.Context, _ Transition[S], a A) { dec(ctx, a) }
-			var touched int
-			// Hooks are keyed by (s, event), which several rows can share when
-			// sources fan in; each key gets one hook or the gauge over-counts.
-			entered, left := make(map[edge[S]]bool), make(map[edge[S]]bool)
-			for _, d := range b.decls {
-				entering := d.to == s
-				leaving := d.key.from == s
-				if !entering && !leaving {
-					continue
-				}
-				touched++
-				if d.payload != want {
-					b.errs = append(b.errs, fmt.Errorf(
-						"GaugeWith for state %v: transition %v --%s--> %v carries a different payload type, so the counter cannot be kept paired",
-						s, d.key.from, d.key.ev.name, d.to))
-					continue
-				}
-				k := edge[S]{from: s, ev: d.key.ev}
-				if entering && !entered[k] {
-					entered[k] = true
-					b.m.onEnterVia[k] = append(b.m.onEnterVia[k], enter)
-				}
-				if leaving && !left[k] {
-					left[k] = true
-					b.m.onExitVia[k] = append(b.m.onExitVia[k], exit)
-				}
+// attachWith attaches h to every event on a row that match selects, once the
+// table is finished, so declaration order does not matter.
+func (b *builder[S]) attachWith[A any](what, verb string, s S, h func(context.Context, Transition[S], A),
+	hooks map[edge[S]][]any, match func(decl[S]) bool) {
+	if h == nil {
+		b.errs = append(b.errs, fmt.Errorf("nil %s hook for state %v", what, s))
+		return
+	}
+	b.deferred = append(b.deferred, func(b *builder[S]) {
+		want := payloadToken[A]()
+		var touched bool
+		// Rows fanning in on one event share its (s, event) key and its
+		// payload type: one hook and at most one error per event.
+		seen := make(map[*eventDef]bool)
+		for _, d := range b.decls {
+			if !match(d) || seen[d.key.ev] {
+				continue
 			}
-			if touched == 0 {
+			seen[d.key.ev] = true
+			touched = true
+			if d.payload != want {
 				b.errs = append(b.errs, fmt.Errorf(
-					"GaugeWith for state %v: no transition enters or leaves it, so the counter would never move", s))
+					"%s for state %v: transition %v --%s--> %v carries a different payload type, so the hook would miss it",
+					what, s, d.key.from, d.key.ev.name, d.to))
+				continue
 			}
-		})
+			k := edge[S]{from: s, ev: d.key.ev}
+			hooks[k] = append(hooks[k], h)
+		}
+		// A broken rule may be what dropped the row; report it alone.
+		if !touched && !b.broken {
+			b.errs = append(b.errs, fmt.Errorf(
+				"%s for state %v: no transition %s it, so the hook would never run", what, s, verb))
+		}
 	})
 }
 

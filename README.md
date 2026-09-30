@@ -132,9 +132,9 @@ Each of these returns a `Rule[S]`, the single option type. Rules are plain value
 | `FromGroup(g).On(ev).To(c)` | a transition inherited by every member of a [group](#groups) |
 | `Initial(a)` | where a fresh instance starts |
 | `OnEnter(s, h)` / `OnExit(s, h)` | [hooks](#hooks) around the assignment |
+| `OnEnterVia(s, ev, h)` / `OnExitVia(s, ev, h)` | hooks that see the payload of one event |
+| `OnEnterWith(s, h)` / `OnExitWith(s, h)` | hooks that see the payload of every event entering or leaving `s` |
 | `OnTransition(h)` | a hook on every transition |
-| `OnEnterVia(s, ev, h)` / `OnExitVia(s, ev, h)` | hooks that see the payload |
-| `Gauge(s, inc, dec)` / `GaugeWith(s, inc, dec)` | a counter of how many things are in `s` |
 | `NewGroup(name, a, b)` | a [group](#groups), usable as a rule on its own |
 | `Rules(...)` | several rules as one value |
 
@@ -234,18 +234,6 @@ The order inside `Fire` is fixed:
 
 `OnTransition` precedes the entry hooks so an entry hook that fires again is logged after its cause; the price is that a transition hook must observe and not fire. A self-transition `From(a).On(ev).To(a)` is UML's *external* kind — it runs exit then entry.
 
-### Gauges
-
-`Gauge` pairs an increment on entry with a decrement on exit. A "how many are in state X" counter otherwise lives as a `+=` and a `-=` at every call site that moves the state, and drifts the moment one is missed:
-
-```go
-fsm.Gauge(recStopped, metrics.Inc(recStopped), metrics.Dec(recStopped))
-```
-
-Hooks cannot fail and none runs before the assignment is certain, so the two halves cannot come apart.
-
-`GaugeWith` is the same for a counter that lives in the payload. It is declared once per state and expands to a hook on every event entering and leaving it, which requires all of them to carry the same payload type; `New` reports the offending transition rather than silently skipping an edge.
-
 ### Typed hooks
 
 A plain `Hook` sees the transition but not the payload, because a state can be entered by events carrying different types. `OnEnterVia` and `OnExitVia` name the event, which fixes the type:
@@ -256,7 +244,17 @@ fsm.OnExitVia(recActive, evRecStop, func(_ context.Context, tr fsm.Transition[re
 })
 ```
 
-`New` rejects one that no transition on that event could trigger. Via hooks run after the plain hooks of the same state.
+`OnEnterWith` and `OnExitWith` do the same for every event entering or leaving the state, which is what a hook that must not miss a way in needs — a counter labelled by the payload, typically:
+
+```go
+fsm.OnEnterWith(recStopped, func(_ context.Context, tr fsm.Transition[recState], r *recording) {
+	log.Info("stopped", "on", tr.Event(), "pending", r.pendingUploads)
+})
+```
+
+They read the finished transition table, group-inherited edges included, so an event added later is covered without another declaration. That requires every such event to carry the hook's payload type; `New` reports one that does not, rather than let the hook silently miss it.
+
+`New` rejects a typed hook that no transition could trigger, so a terminal state takes `OnEnterWith` without `OnExitWith`. Plain hooks run first, then Via hooks, then With hooks.
 
 ## Groups
 
@@ -335,7 +333,7 @@ for _, e := range participantFSM.Edges() {
 
 `New` rejects an unknown member, a repeated one, a name reused for different members, two groups claiming one event for the same state, and a group transition every member overrides.
 
-Groups cover most of what substates are for, but not all: no group hooks or `Gauge`, no nesting, no initial member. Why, in [docs/DESIGN.md](docs/DESIGN.md#groups-are-a-build-time-expansion).
+Groups cover most of what substates are for, but not all: no group hooks or group counters, no nesting, no initial member. Why, in [docs/DESIGN.md](docs/DESIGN.md#groups-are-a-build-time-expansion).
 
 ## Introspection
 

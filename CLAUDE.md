@@ -12,8 +12,8 @@ Library: `fsm.go` (package doc, `Event`, `Machine`, `Fire`, `Send`, `Check`,
 `Can`, `To`, the four error types), `rules.go` (`New`/`MustNew`, the `Rule`
 interface and everything that produces one — the `From`/`FromEach`/`FromGroup`
 chain through `On`/`To` with its `Guard`/`Action` methods, plus `Rules`,
-`Group`, `Gauge`, `GaugeWith`, `OnEnter`, `OnExit`, `OnEnterVia`, `OnExitVia`,
-`OnTransition`, `Initial`), `introspect.go` (`States`, `Events`, `Edges`,
+`Group`, `OnEnter`, `OnExit`, `OnEnterVia`, `OnExitVia`, `OnEnterWith`,
+`OnExitWith`, `OnTransition`, `Initial`), `introspect.go` (`States`, `Events`, `Edges`,
 `Groups`, `Initial`, `Terminals`, `Unreachable`, `DOT`). Tests are
 `fsm_test.go` and the worked machines in `example_test.go`.
 
@@ -97,9 +97,9 @@ a transition hook is an observer and must not fire, or the new state's exit
 would run before its entry. Do not move it after the entry hooks to lift that
 rule without giving up the ordering.
 A failure anywhere before the assignment leaves the state untouched and runs
-no hook, which is what makes `Gauge` safe: hooks cannot fail, so an increment
-and its decrement cannot come apart. Changing this order breaks
-`TestHooksBracketTheAssignment` and `TestGaugeStaysPaired`, which is the point
+no hook, which is what makes a counter kept by hooks safe: hooks cannot fail,
+so an increment and its decrement cannot come apart. Changing this order breaks
+`TestHooksBracketTheAssignment` and `TestEntryAndExitHooksStayPaired`, which is the point
 of both. `Fire` reads `*st` once, before any callback: the payload is usually
 the aggregate holding the state, and a guard or action that writes it is
 reported as `*StateChangedError` with nothing assigned — ahead of the
@@ -127,9 +127,9 @@ exists only because of the mistake (`TestInitialDoesNotReportAMistakeTwice`).
 
 **`builder` has two deferred phases, and the order is load-bearing.**
 `b.expand` runs group transitions, which *add* edges; `b.deferred` runs the
-rules that *read* the finished table, `GaugeWith` and `Initial`. Expansion must go
-first or a gauge silently misses every edge a group contributed
-(`TestGaugeWithSeesGroupInheritedEdges`). They cannot be one slice: `New`
+rules that *read* the finished table, `OnEnterWith`/`OnExitWith` and `Initial`.
+Expansion must go first or a With hook silently misses every edge a group
+contributed (`TestOnEnterWithSeesGroupInheritedEdges`). They cannot be one slice: `New`
 ranges over it, and Go evaluates a range expression once, so work appended
 during the loop is never visited. Group member validation sits between the
 first pass and expansion, while `b.seen` still holds only explicitly declared
@@ -145,10 +145,10 @@ which group owns each inherited row so the two cases can be told apart. With
 no nesting there is no specificity rule to fall back on.
 
 **Groups are not states and `Fire` knows nothing about them.** They expand to
-ordinary rows before `New` returns. Do not add group entry/exit hooks or a
-group `Gauge`: the only reason to want them is superstate hook suppression,
-which a flat table cannot express, and a group gauge would dip on an
-intra-group move. `docs/DESIGN.md` has the argument and the sum-the-members
+ordinary rows before `New` returns. Do not add group entry/exit hooks: the
+only reason to want them is superstate hook suppression, which a flat table
+cannot express, and a group counter kept by them would dip on an intra-group
+move. `docs/DESIGN.md` has the argument and the sum-the-members
 answer. `TestGroupFireDoesNotAllocate` pins that the expansion produces rows
 indistinguishable from hand-written ones.
 
@@ -190,30 +190,37 @@ overrides it". Same for a member lost to another group: the clash is reported
 and the `inherited == 0` branch is suppressed, because that member did not
 override anything. `TestGroupWithNoMembersReportsOneError` and
 `TestGroupClashDoesNotAlsoReportUnreachable` are the guards. The deferred
-Via-hook check likewise stays quiet when `b.broken` — errors existed before the
+Via- and With-hook checks likewise stay quiet when `b.broken` — errors existed before the
 deferred phase — since the broken rule may be what dropped the row
 (`TestBrokenGroupDoesNotAlsoReportTheViaHook`). Duplicate members
 are rejected rather than deduplicated — silently accepting them inflates the
 group size so no boundary arrow can ever be drawn.
 
-**`GaugeWith` expands in a second pass and validates payload types.** It is
-declared per state but needs the whole transition table, so it defers through
-`builder.deferred` and runs after every rule has applied — which is why
-declaration order does not matter. It compares payload types with
-`payloadToken[A]()`, two typed nil pointers being equal exactly when the types
-match, so no reflect is involved. A state reachable by events of differing
-payload types is an error, never a silently skipped edge: that silence would
-be the drift the gauge exists to prevent. Hooks are keyed by `(s, event)`,
-which several rows share when sources fan in — every group transition does —
-so each key gets one hook, not one per row, or a single entry counts N times
-(`TestGaugeWithCountsFanInOnce`).
+**`OnEnterWith`/`OnExitWith` expand in a second pass and validate payload
+types.** They are declared per state but need the whole transition table, so
+they defer through `builder.deferred` and run after every rule has applied —
+which is why declaration order does not matter, and why they run after the
+Via hooks of the same state (`TestWithHooksRunAfterViaHooks`). They compare
+payload types with `payloadToken[A]()`, two typed nil pointers being equal
+exactly when the types match, so no reflect is involved. An event entering (or
+leaving) the state with a differing payload type is an error, never a silently
+skipped edge: that silence is the drift a payload-labelled counter exists to
+prevent. Hooks are keyed by `(s, event)`, which several rows share when
+sources fan in — every group transition does — so each key gets one hook, not
+one per row, or a single entry counts N times
+(`TestOnEnterWithRunsOnceOnFanIn`). There is no `Gauge`: an `OnEnter` plus an
+`OnExit` (or the two With hooks) already pair an increment with its
+decrement, and a wrapper for the pair adds nothing but API surface.
 
 **A plain `Hook` cannot see the payload, and that is structural.** A state can
 be entered by events carrying different `A`, so there is no single type to
 hand it. `OnEnterVia`/`OnExitVia` name the event, which fixes `A`; that is the
-only way to get a typed hook, so do not widen `Hook` to carry `any`. They run
-after the plain hooks of the same state. `New` rejects one no transition on its
-event can trigger, the same way `GaugeWith` rejects an isolated state.
+only way to get a typed hook, so do not widen `Hook` to carry `any` —
+`OnEnterWith`/`OnExitWith` are Via hooks on every matching event, not an
+exception. They run after the plain hooks of the same state. `New` rejects a
+Via or With hook no transition can trigger, and neither declares its state —
+an edge does — so a mistyped state is that one error and not also an
+unreachable one (`TestTypedHookOnAMistypedStateReportsOneError`).
 
 **`Transition.Event()` and `Edge.Event()` are names, for display; `.Is` is
 identity.** Two events can share a name, so anything branching on the trigger
@@ -229,7 +236,7 @@ than it was before payload hooks existed. `BenchmarkFire` and
 before and after touching the fire path.
 
 **Self-transitions are UML's external kind.** `From(a).On(ev).To(a)` runs
-exit then entry, so a `Gauge` dips and returns. Pinned by
+exit then entry, so a counter kept by those hooks dips and returns. Pinned by
 `TestSelfTransitionRunsExitAndEntry`; do not turn it into an internal
 transition that skips the hooks.
 
