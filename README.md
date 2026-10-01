@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="docs/assets/logo.png" alt="" width="420">
+  <a href="https://en.wikipedia.org/wiki/Dance_(Matisse)"><img src="docs/assets/logo.png" alt="Gopher dance" width="420"></a>
 </p>
 
 # fsm
