@@ -1634,6 +1634,264 @@ func TestStayIsDrawnDashed(t *testing.T) {
 	}
 }
 
+// --- Group hooks ------------------------------------------------------------
+
+// A group's hooks run on a transition that crosses its boundary, and on no
+// other: not on a move between members, not on a member's self-transition,
+// not on an internal transition.
+func TestGroupHooksRunOnlyAcrossTheBoundary(t *testing.T) {
+	t.Parallel()
+
+	var log []string
+	note := func(what string) fsm.Hook[state] {
+		return func(_ context.Context, tr fsm.Transition[state]) {
+			log = append(log, fmt.Sprintf("%s %v->%v", what, tr.From, tr.To))
+		}
+	}
+	busy := fsm.NewGroup("busy", running, done)
+	m, err := fsm.New("job",
+		fsm.From(idle).On(evStart).To(running),
+		fsm.From(running).On(evFinish).To(done),
+		fsm.From(done).On(evStart).To(done),
+		fsm.From(done).On(evFinish).Stay(),
+		fsm.From(done).On(evCancel).To(cancelled),
+		fsm.OnEnterGroup(busy, note("enter busy")),
+		fsm.OnExitGroup(busy, note("exit busy")),
+	)
+	if err != nil {
+		t.Fatalf("build: %v", err)
+	}
+	ctx, st := t.Context(), idle
+	steps := []func() error{
+		func() error { _, err := m.Send(ctx, &st, evStart); return err },     // idle -> running: enters
+		func() error { _, err := m.Fire(ctx, &st, evFinish, 1); return err }, // running -> done: inside
+		func() error { _, err := m.Send(ctx, &st, evStart); return err },     // done -> done: inside
+		func() error { _, err := m.Fire(ctx, &st, evFinish, 1); return err }, // internal
+		func() error { _, err := m.Send(ctx, &st, evCancel); return err },    // done -> cancelled: leaves
+	}
+	for i, step := range steps {
+		if err := step(); err != nil {
+			t.Fatalf("step %d: %v", i, err)
+		}
+	}
+	if want := []string{"enter busy idle->running", "exit busy done->cancelled"}; !slices.Equal(log, want) {
+		t.Errorf("ran %q, want %q", log, want)
+	}
+}
+
+// Group hooks sit between the state's own: exit the state, then the group;
+// assign; the transition hooks; enter the group, then the state.
+func TestGroupHooksRunBetweenStateHooks(t *testing.T) {
+	t.Parallel()
+
+	var log []string
+	note := func(what string) fsm.Hook[state] {
+		return func(context.Context, fsm.Transition[state]) { log = append(log, what) }
+	}
+	busy := fsm.NewGroup("busy", running)
+	m, err := fsm.New("job",
+		fsm.From(idle).On(evStart).To(running),
+		fsm.From(running).On(evCancel).To(idle),
+		fsm.OnEnter(running, note("enter running")),
+		fsm.OnExit(running, note("exit running")),
+		fsm.OnEnterGroup(busy, note("enter busy")),
+		fsm.OnExitGroup(busy, note("exit busy")),
+		fsm.OnTransition(note("transition")),
+	)
+	if err != nil {
+		t.Fatalf("build: %v", err)
+	}
+	ctx, st := t.Context(), idle
+	_, _ = m.Send(ctx, &st, evStart)
+	_, _ = m.Send(ctx, &st, evCancel)
+	want := []string{
+		"transition", "enter busy", "enter running",
+		"exit running", "exit busy", "transition",
+	}
+	if !slices.Equal(log, want) {
+		t.Errorf("ran %q, want %q", log, want)
+	}
+}
+
+// A transition across several groups enters the larger one first and
+// leaves the smaller one first, as a hierarchy enters a superstate before
+// its substate and leaves it after.
+func TestGroupHooksRunOutsideInAndInsideOut(t *testing.T) {
+	t.Parallel()
+
+	var log []string
+	note := func(what string) fsm.Hook[state] {
+		return func(context.Context, fsm.Transition[state]) { log = append(log, what) }
+	}
+	inner := fsm.NewGroup("inner", running)
+	outer := fsm.NewGroup("outer", running, done)
+	m, err := fsm.New("job",
+		// Declared inner first, to show the order is by size, not declaration.
+		fsm.OnEnterGroup(inner, note("enter inner")),
+		fsm.OnExitGroup(inner, note("exit inner")),
+		fsm.OnEnterGroup(outer, note("enter outer")),
+		fsm.OnExitGroup(outer, note("exit outer")),
+		fsm.From(idle).On(evStart).To(running),
+		fsm.From(running).On(evFinish).To(done),
+		fsm.From(done).On(evCancel).To(cancelled),
+		fsm.From(running).On(evCancel).To(cancelled),
+	)
+	if err != nil {
+		t.Fatalf("build: %v", err)
+	}
+	ctx := t.Context()
+	for _, tc := range []struct {
+		from state
+		fire func(*state) error
+		want []string
+	}{
+		{idle, func(s *state) error { _, err := m.Send(ctx, s, evStart); return err }, []string{"enter outer", "enter inner"}},
+		{running, func(s *state) error { _, err := m.Send(ctx, s, evCancel); return err }, []string{"exit inner", "exit outer"}},
+		{running, func(s *state) error { _, err := m.Fire(ctx, s, evFinish, 0); return err }, []string{"exit inner"}},
+	} {
+		log = nil
+		st := tc.from
+		if err := tc.fire(&st); err != nil {
+			t.Fatal(err)
+		}
+		if !slices.Equal(log, tc.want) {
+			t.Errorf("from %v: ran %q, want %q", tc.from, log, tc.want)
+		}
+	}
+}
+
+// The With variants hand the hook the payload of the event that crossed.
+func TestGroupWithHooksSeeThePayload(t *testing.T) {
+	t.Parallel()
+
+	var got []int
+	busy := fsm.NewGroup("busy", running)
+	m, err := fsm.New("job",
+		fsm.From(idle).On(evFinish).To(running),
+		fsm.From(running).On(evFinish).To(done),
+		fsm.OnEnterGroupWith(busy, func(_ context.Context, _ fsm.Transition[state], n int) { got = append(got, n) }),
+		fsm.OnExitGroupWith(busy, func(_ context.Context, _ fsm.Transition[state], n int) { got = append(got, -n) }),
+	)
+	if err != nil {
+		t.Fatalf("build: %v", err)
+	}
+	ctx, st := t.Context(), idle
+	_, _ = m.Fire(ctx, &st, evFinish, 3)
+	_, _ = m.Fire(ctx, &st, evFinish, 4)
+	if !slices.Equal(got, []int{3, -4}) {
+		t.Errorf("hooks saw %v, want [3 -4]", got)
+	}
+}
+
+// A count of what is in a group, kept by its hooks, is exact on every move,
+// moves between members included: it never dips.
+func TestGroupHooksKeepAnExactCount(t *testing.T) {
+	t.Parallel()
+
+	busy := fsm.NewGroup("busy", running, done)
+	var inBusy int
+	var seen []int
+	m, err := fsm.New("job",
+		fsm.From(idle).On(evStart).To(running),
+		fsm.From(running).On(evFinish).To(done),
+		fsm.From(done).On(evStart).To(running),
+		fsm.FromGroup(busy).On(evCancel).To(idle),
+		fsm.OnEnterGroup(busy, func(context.Context, fsm.Transition[state]) { inBusy++ }),
+		fsm.OnExitGroup(busy, func(context.Context, fsm.Transition[state]) { inBusy-- }),
+		fsm.OnTransition(func(context.Context, fsm.Transition[state]) { seen = append(seen, inBusy) }),
+	)
+	if err != nil {
+		t.Fatalf("build: %v", err)
+	}
+	ctx, st := t.Context(), idle
+	_, _ = m.Send(ctx, &st, evStart)     // enters
+	_, _ = m.Fire(ctx, &st, evFinish, 0) // inside
+	_, _ = m.Send(ctx, &st, evStart)     // inside
+	_, _ = m.Send(ctx, &st, evCancel)    // leaves
+	// OnTransition runs after the exit hooks and before the entry hooks.
+	if want := []int{0, 1, 1, 0}; !slices.Equal(seen, want) || inBusy != 0 {
+		t.Errorf("count at each transition %v, ending %d; want %v ending 0", seen, inBusy, want)
+	}
+}
+
+// New rejects a group hook that could never run, a With hook a crossing
+// event would miss, and a nil one; a hook declares its group.
+func TestBuildChecksGroupHooks(t *testing.T) {
+	t.Parallel()
+
+	busy := fsm.NewGroup("busy", running)
+	base := []fsm.Rule[state]{
+		fsm.From(idle).On(evStart).To(running),
+		fsm.From(running).On(evFinish).To(done),
+	}
+	for _, tc := range []struct {
+		name string
+		hook fsm.Rule[state]
+		want string
+	}{
+		{"never leaves", fsm.OnExitGroup(fsm.NewGroup("all", idle, running, done), func(context.Context, fsm.Transition[state]) {}),
+			"fsm job: OnExitGroup for group all: no transition leaves it, so the hook would never run"},
+		{"never enters", fsm.OnEnterGroup(fsm.NewGroup("start", idle), func(context.Context, fsm.Transition[state]) {}),
+			"fsm job: OnEnterGroup for group start: no transition enters it, so the hook would never run"},
+		{"payload mismatch", fsm.OnEnterGroupWith(busy, func(context.Context, fsm.Transition[state], int) {}),
+			"fsm job: OnEnterGroupWith for group busy: transition idle --start--> running carries a different payload type, so the hook would miss it"},
+		{"nil enter", fsm.OnEnterGroup(busy, nil), "fsm job: nil OnEnterGroup hook for group busy"},
+		{"nil exit", fsm.OnExitGroup(busy, nil), "fsm job: nil OnExitGroup hook for group busy"},
+		{"nil enter with", fsm.OnEnterGroupWith[state, int](busy, nil), "fsm job: nil OnEnterGroupWith hook for group busy"},
+		{"nil exit with", fsm.OnExitGroupWith[state, int](busy, nil), "fsm job: nil OnExitGroupWith hook for group busy"},
+		{"unnamed group", fsm.OnEnterGroup(fsm.NewGroup("", running), func(context.Context, fsm.Transition[state]) {}),
+			"fsm job: group declared with no name"},
+	} {
+		_, err := fsm.New("job", append(slices.Clone(base), tc.hook)...)
+		if err == nil || err.Error() != tc.want {
+			t.Errorf("%s: got %v, want %q", tc.name, err, tc.want)
+		}
+	}
+
+	m, err := fsm.New("job", append(slices.Clone(base), fsm.OnEnterGroup(busy, func(context.Context, fsm.Transition[state]) {}))...)
+	if err != nil {
+		t.Fatalf("build: %v", err)
+	}
+	if got := m.Groups(); len(got) != 1 || got[0].Name() != "busy" {
+		t.Errorf("Groups() = %v, want the hook's group", got)
+	}
+}
+
+// A broken rule is reported alone, not also as a group hook that never runs.
+func TestBrokenRuleDoesNotAlsoReportTheGroupHook(t *testing.T) {
+	t.Parallel()
+
+	_, err := fsm.New("job",
+		fsm.From(idle).On(evStart).To(running).Guard("g", nil),
+		fsm.OnExitGroup(fsm.NewGroup("busy", running), func(context.Context, fsm.Transition[state]) {}),
+	)
+	if want := `fsm job: transition idle -> running: guard "g" is nil`; err == nil || err.Error() != want {
+		t.Errorf("got %v, want %q", err, want)
+	}
+}
+
+// Group hooks run on Fire's path, and must not allocate there either.
+func TestGroupHooksDoNotAllocate(t *testing.T) {
+	busy := fsm.NewGroup("busy", running)
+	m, err := fsm.New("job",
+		fsm.From(idle).On(evStart).To(running),
+		fsm.From(running).On(evFinish).To(idle),
+		fsm.OnEnterGroup(busy, func(context.Context, fsm.Transition[state]) {}),
+		fsm.OnExitGroupWith(busy, func(context.Context, fsm.Transition[state], int) {}),
+	)
+	if err != nil {
+		t.Fatalf("build: %v", err)
+	}
+	ctx, st := t.Context(), idle
+	avg := testing.AllocsPerRun(1000, func() {
+		_, _ = m.Send(ctx, &st, evStart)
+		_, _ = m.Fire(ctx, &st, evFinish, 7)
+	})
+	if avg != 0 {
+		t.Errorf("group hooks allocate %.1f times per round trip, want 0", avg)
+	}
+}
+
 // --- TryFire ----------------------------------------------------------------
 
 // TryFire makes the transition Fire would, hooks and all, and says it did.
@@ -1688,6 +1946,10 @@ func TestTryFireRunsTheHooksFireDoes(t *testing.T) {
 			fsm.OnEnter(running, note("enter")),
 			fsm.OnEnterVia(done, evFinish, func(_ context.Context, _ fsm.Transition[state], n int) {
 				log = append(log, fmt.Sprintf("enter via finish %d", n))
+			}),
+			fsm.OnEnterGroup(fsm.NewGroup("busy", running), note("enter group")),
+			fsm.OnExitGroupWith(fsm.NewGroup("busy", running), func(_ context.Context, _ fsm.Transition[state], n int) {
+				log = append(log, fmt.Sprintf("exit group %d", n))
 			}),
 		)
 		if err != nil {

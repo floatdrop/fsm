@@ -1,6 +1,7 @@
 package fsm
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
@@ -72,6 +73,20 @@ type builder[S comparable] struct {
 	// Targets of the group transitions declared so far, so that one declared
 	// twice reads as a duplicate rather than as a group clashing with itself.
 	groupEdges map[groupEdge]string // what the first declaration does
+
+	// Group hooks in declaration order, attached to the rows that cross
+	// their group's boundary once the table is finished.
+	groupHooks []groupHookDecl[S]
+}
+
+// groupHookDecl is one declared group hook, before it is attached to rows.
+type groupHookDecl[S comparable] struct {
+	index   int    // in declaration order
+	what    string // the declaring function, for errors
+	group   Group[S]
+	enter   bool
+	hook    groupHook[S]
+	payload any // (*A)(nil) for a typed hook, nil for a plain one
 }
 
 // groupEdge identifies one group transition, before it expands to a row per
@@ -108,6 +123,8 @@ func New[S comparable](name string, rules ...Rule[S]) (*Machine[S], error) {
 			onEnterVia: make(map[edge[S]][]any),
 			onExitVia:  make(map[edge[S]][]any),
 			internal:   make(map[edge[S]]bool),
+			groupEnter: make(map[edge[S]][]groupHook[S]),
+			groupExit:  make(map[edge[S]][]groupHook[S]),
 		},
 		seen:       make(map[S]bool),
 		inherited:  make(map[edge[S]]string),
@@ -138,12 +155,16 @@ func New[S comparable](name string, rules ...Rule[S]) (*Machine[S], error) {
 	for _, d := range b.deferred {
 		d(b)
 	}
+	b.attachGroupHooks()
 
 	if len(b.m.table) == 0 {
 		b.errs = append(b.errs, errors.New("no transitions declared"))
 	}
 	b.m.hasHooks = len(b.m.onEnter) > 0 || len(b.m.onExit) > 0 ||
-		len(b.m.onEnterVia) > 0 || len(b.m.onExitVia) > 0 || len(b.m.onAll) > 0
+		len(b.m.onEnterVia) > 0 || len(b.m.onExitVia) > 0 || len(b.m.onAll) > 0 ||
+		len(b.m.groupEnter) > 0 || len(b.m.groupExit) > 0
+	b.m.hasInternal = len(b.m.internal) > 0
+	b.m.hasGroupHooks = len(b.m.groupEnter) > 0 || len(b.m.groupExit) > 0
 	if len(b.errs) > 0 {
 		return nil, fmt.Errorf("fsm %s: %w", name, errors.Join(b.errs...))
 	}
@@ -731,6 +752,140 @@ func (b *builder[S]) attachWith[A any](what, verb string, s S, h func(context.Co
 	})
 }
 
+// OnEnterGroup declares a hook that runs when the machine enters g from a
+// state outside it: just after the [OnTransition] hooks, before the entry
+// hooks of the state entered. A move between members of g crosses no
+// boundary and does not run it, nor does an external self-transition of a
+// member, so a count of what is in the group, kept by it and
+// [OnExitGroup], never dips on an intra-group move.
+//
+// When a transition enters several groups at once, the larger group's hooks
+// run first, as a superstate's entry runs before its substate's; a group's
+// own hooks run in declaration order. Entering the initial state is not a
+// transition, so no group hook runs for it.
+//
+// A group entry hook must not fire the machine on the same state: the state
+// entered has not run its entry hooks yet. [New] rejects one that no
+// transition could run.
+func OnEnterGroup[S comparable](g Group[S], h Hook[S]) Rule[S] {
+	return ruleFunc[S](func(b *builder[S]) {
+		b.declareGroupHook("OnEnterGroup", g, true, groupHook[S]{plain: h}, nil, h == nil)
+	})
+}
+
+// OnExitGroup declares a hook that runs when the machine leaves g for a
+// state outside it: just after the exit hooks of the state left, before the
+// assignment. When a transition leaves several groups, the smaller group's
+// hooks run first. See [OnEnterGroup].
+func OnExitGroup[S comparable](g Group[S], h Hook[S]) Rule[S] {
+	return ruleFunc[S](func(b *builder[S]) {
+		b.declareGroupHook("OnExitGroup", g, false, groupHook[S]{plain: h}, nil, h == nil)
+	})
+}
+
+// OnEnterGroupWith is [OnEnterGroup] with the payload of the event that
+// entered g, which every event entering g must carry: [New] reports one
+// that does not, as for [OnEnterWith].
+func OnEnterGroupWith[S comparable, A any](g Group[S], h func(context.Context, Transition[S], A)) Rule[S] {
+	return ruleFunc[S](func(b *builder[S]) {
+		b.declareGroupHook("OnEnterGroupWith", g, true, groupHook[S]{typed: h}, payloadToken[A](), h == nil)
+	})
+}
+
+// OnExitGroupWith is [OnExitGroup] with the payload of the event that left
+// g, which every event leaving g must carry.
+func OnExitGroupWith[S comparable, A any](g Group[S], h func(context.Context, Transition[S], A)) Rule[S] {
+	return ruleFunc[S](func(b *builder[S]) {
+		b.declareGroupHook("OnExitGroupWith", g, false, groupHook[S]{typed: h}, payloadToken[A](), h == nil)
+	})
+}
+
+// declareGroupHook records a group hook, declaring its group, for
+// attachGroupHooks to attach once the table is finished.
+func (b *builder[S]) declareGroupHook(what string, g Group[S], enter bool, h groupHook[S], payload any, nilHook bool) {
+	if nilHook {
+		b.errs = append(b.errs, fmt.Errorf("nil %s hook for group %s", what, g.name))
+		return
+	}
+	if !b.declareGroup(g) {
+		return
+	}
+	b.groupHooks = append(b.groupHooks, groupHookDecl[S]{
+		index: len(b.groupHooks), what: what, group: g, enter: enter, hook: h, payload: payload,
+	})
+}
+
+// attachGroupHooks gives every row the group hooks it runs: those of the
+// groups it leaves, smallest first, and of the groups it enters, largest
+// first, each group's in declaration order. It runs last, against the
+// finished table, so group-inherited rows count and declaration order does
+// not matter.
+func (b *builder[S]) attachGroupHooks() {
+	if len(b.groupHooks) == 0 {
+		return
+	}
+	bySize := func(asc bool) []groupHookDecl[S] {
+		out := slices.Clone(b.groupHooks)
+		slices.SortStableFunc(out, func(x, y groupHookDecl[S]) int {
+			if asc {
+				return cmp.Compare(len(x.group.members), len(y.group.members))
+			}
+			return cmp.Compare(len(y.group.members), len(x.group.members))
+		})
+		return out
+	}
+	touched := make([]bool, len(b.groupHooks))
+	// One error per hook and event: rows fanning in on an event share its
+	// payload type.
+	type hookEvent struct {
+		hook int
+		ev   *eventDef
+	}
+	reported := make(map[hookEvent]bool)
+	attach := func(decls []groupHookDecl[S], enter bool) {
+		for _, d := range b.decls {
+			if d.internal {
+				continue
+			}
+			for _, h := range decls {
+				if h.enter != enter || h.group.Has(d.key.from) == enter || h.group.Has(d.to) != enter {
+					continue
+				}
+				touched[h.index] = true
+				if h.payload != nil && h.payload != d.payload {
+					if k := (hookEvent{h.index, d.key.ev}); !reported[k] {
+						reported[k] = true
+						b.errs = append(b.errs, fmt.Errorf(
+							"%s for group %s: transition %v --%s--> %v carries a different payload type, so the hook would miss it",
+							h.what, h.group.name, d.key.from, d.key.ev.name, d.to))
+					}
+					continue
+				}
+				hooks := b.m.groupExit
+				if enter {
+					hooks = b.m.groupEnter
+				}
+				hooks[d.key] = append(hooks[d.key], h.hook)
+			}
+		}
+	}
+	attach(bySize(true), false)
+	attach(bySize(false), true)
+	if b.broken {
+		return // a broken rule may be what dropped the rows
+	}
+	for i, h := range b.groupHooks {
+		if !touched[i] {
+			verb := "leaves"
+			if h.enter {
+				verb = "enters"
+			}
+			b.errs = append(b.errs, fmt.Errorf(
+				"%s for group %s: no transition %s it, so the hook would never run", h.what, h.group.name, verb))
+		}
+	}
+}
+
 // Group is a named set of states that share transitions. A transition declared
 // with [FromGroup] applies to every member that does not declare that event
 // itself, so adding a member inherits the group's transitions and a member can
@@ -748,8 +903,8 @@ func (b *builder[S]) attachWith[A any](what, verb string, s S, h func(context.Co
 // A Group is not a state. A *S never holds one and it does not appear in
 // [Machine.States] — it is a declaration-time grouping that expands to
 // ordinary rows in the transition table, so [Machine.Fire] neither knows nor
-// pays for it. Group entry and exit hooks are deliberately absent; see the
-// package documentation for what that rules out.
+// pays for it beyond the hooks declared on it ([OnEnterGroup], [OnExitGroup]),
+// which run only on the transitions that cross its boundary.
 //
 // A Group is itself a [Rule], so a group used only for [Group.Has] or for DOT
 // output can be passed to [New] on its own.
