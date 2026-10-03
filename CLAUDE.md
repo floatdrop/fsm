@@ -13,7 +13,8 @@ Library: `fsm.go` (package doc, `Event`, `Machine`, `Fire`, `Send`, `TryFire`,
 interface and everything that produces one — the `From`/`FromEach`/`FromGroup`
 chain through `On`/`To` with its `Guard`/`Action` methods, plus `Rules`,
 `Group`, `OnEnter`, `OnExit`, `OnEnterVia`, `OnExitVia`, `OnEnterWith`,
-`OnExitWith`, `OnTransition`, `Initial`), `introspect.go` (`States`, `Events`, `Edges`,
+`OnExitWith`, `OnTransition`, `Initial`, `Stay`, `OnEnterGroup`/`OnExitGroup` and
+their With variants, and `buildPlans`), `introspect.go` (`States`, `Events`, `Edges`,
 `Groups`, `Initial`, `Terminals`, `Unreachable`, `DOT`). Tests are
 `fsm_test.go` and the worked machines in `example_test.go`.
 
@@ -88,7 +89,8 @@ allocation half; it runs without `-race`, which changes the profile.
 not inlined, and splitting `Fire` into a lookup and an apply step cost
 `BenchmarkFire` six nanoseconds a round trip. So `Fire` keeps its whole body;
 `TryFire` and `Check` share `lookup`, and `TryFire` carries a transition out
-through `apply`, a copy of `Fire`'s tail. `TestTryFireRunsTheHooksFireDoes`
+through `apply`, a copy of `Fire`'s tail — the action and the plan's two
+loops. `TestTryFireRunsTheHooksFireDoes`
 fires the same transitions both ways with every kind of hook and compares the
 logs, and `FuzzMachineInvariants` checks that `TryFire` fires exactly when
 `To` resolves: those are what keep the copy honest. A refusal from `TryFire`
@@ -99,8 +101,20 @@ for the same reason: the combining closure is built where `A` is still known.
 Guards run in registration order and the first rejection wins, reported under
 the description it was declared with.
 
+**Every hook a row runs is one plan, built by `New`.** `buildPlans` runs last
+and gives each non-internal row a `plan`: `exit` — its source's plain, Via and
+With exit hooks, then the exit hooks of the groups it leaves — and `enter` —
+the `OnTransition` hooks, the entry hooks of the groups it enters, then its
+target's plain, Via and With entry hooks. The declared hooks live on the
+`builder`, not the `Machine`; `Fire` does one `plans` lookup, behind
+`hasHooks`, and an internal row, or one no hook concerns, has no plan. A
+`call` is a plain `Hook` or a typed func asserted to the row's `A`, which is
+safe for the reason the guard assertion is. This replaced four lookups and
+cut `BenchmarkFireWithHooks` by a third.
+
 **The order inside `Fire` is fixed** — lookup, guards, action, the
-state-changed check, `OnExit(from)`, assign, `OnTransition`, `OnEnter(to)`.
+state-changed check, `OnExit(from)` and the groups left, assign,
+`OnTransition`, the groups entered and `OnEnter(to)`.
 `OnTransition` precedes the entry hooks so an entry hook that fires again is
 logged after its cause (`TestOnTransitionKeepsCausalOrder`); the price is that
 a transition hook is an observer and must not fire, or the new state's exit
@@ -164,10 +178,11 @@ knows its source and target, so `attachGroupHooks` — the last step of `New`,
 after expansion and the deferred pass, so inherited rows count — gives every
 row the hooks of the groups it leaves (source in, target out) and enters, in
 the order they run: leaving, smaller groups first; entering, larger first;
-each group's in declaration order. `Fire` then runs `groupExit[e]` after the
-state's exit hooks and `groupEnter[e]` before its entry hooks, behind
-`hasGroupHooks`, a precomputed bool: a map-length check there cost a
-nanosecond more. An internal row runs none, and an external self-transition
+each group's in declaration order, groups ranked outermost first — larger,
+then declared earlier, so twins nest as `DOT` draws them
+(`TestTwinGroupHooksNestByDeclaration`). `buildPlans` puts them in each row's
+plan after the state's exit hooks and before its entry hooks. An internal row
+runs none, and an external self-transition
 of a member crosses nothing. Pinned by `TestGroupHooksRunOnlyAcrossTheBoundary`,
 `TestGroupHooksRunBetweenStateHooks`, `TestGroupHooksRunOutsideInAndInsideOut`
 and `TestGroupHooksKeepAnExactCount`. A group entry hook must not fire on the
@@ -261,9 +276,7 @@ once already, in `DOT`'s group-edge collapse, and produced an arrow that
 described a machine nobody had declared.
 
 **A machine with no hooks must not pay for hooks.** `Machine.hasHooks` is set
-at construction and short-circuits the whole block in `Fire`, including the
-map lookups the plain hooks would do — it is why the hookless path is faster
-than it was before payload hooks existed. `BenchmarkFire` and
+at construction and skips the plan lookup in `Fire`. `BenchmarkFire` and
 `BenchmarkFireWithHooks` are the pair that keeps this honest; measure both
 before and after touching the fire path.
 
@@ -273,9 +286,8 @@ exit then entry, so a counter kept by those hooks dips and returns. Pinned by
 transition that skips the hooks. The internal kind is its own declaration,
 `From(a).On(ev).Stay()`: guards and actions run, then `Fire` returns before
 any hook, `OnTransition` included (`TestStayRunsGuardsAndActionsButNoHook`).
-`Machine.internal` holds those rows, and `Fire` and `apply` look it up only
-inside the hook block, behind `hasInternal`, so a hookless machine pays
-nothing. An internal row is registered with `to` set to its source, which
+`builder.internal` holds those rows, and `buildPlans` gives them no plan, so
+`Fire` needs no check of its own. An internal row is registered with `to` set to its source, which
 keeps `To`, `Check` and the fuzzer's Fire-agrees-with-To invariant uniform,
 but it is not a way out (`Terminals` skips it) and it enters and leaves
 nothing (`decl.internal` keeps it out of every Via and With hook).

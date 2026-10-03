@@ -112,11 +112,17 @@ func (t Transition[S]) Is[A any](ev Event[A]) bool {
 	return t.trigger != nil && t.trigger == ev.def
 }
 
-// groupHook is one group hook on one row: plain, or typed in the payload
-// of the row's event, func(context.Context, Transition[S], A).
-type groupHook[S comparable] struct {
+// call is one hook as a row runs it: plain, or typed in the payload of the
+// row's event, func(context.Context, Transition[S], A).
+type call[S comparable] struct {
 	plain Hook[S]
 	typed any
+}
+
+// plan is every hook a row runs, in the order it runs them: exit before
+// the assignment; enter after it, the transition hooks first.
+type plan[S comparable] struct {
+	exit, enter []call[S]
 }
 
 // edge is the key of the transition table.
@@ -146,37 +152,13 @@ type Machine[S comparable] struct {
 	table   map[edge[S]]S
 	guards  map[edge[S]]any // func(context.Context, A) (string, error)
 	actions map[edge[S]]any // func(context.Context, A) error
-	onEnter map[S][]Hook[S]
-	onExit  map[S][]Hook[S]
 
-	// Payload-aware hooks, keyed by (state, event) rather than (from, event).
-	// Each holds func(context.Context, Transition[S], A) for the A of that
-	// event. Kept separate so a machine that declares none pays one length
-	// check per fire.
-	onEnterVia map[edge[S]][]any
-	onExitVia  map[edge[S]][]any
+	// plans holds the hooks of every row that runs any, worked out by New.
+	// A row with none, an internal one included, has no plan.
+	plans map[edge[S]]*plan[S]
 
-	// The rows declared with [OnStep.Stay], which run no hook. Empty in a
-	// machine that declares none, which then pays one length check per fire.
-	internal map[edge[S]]bool
-
-	// Group hooks, per row: the ones a row runs because it leaves, or
-	// enters, a group, in the order they run. Worked out once the table is
-	// finished, so a move between members of a group, which crosses no
-	// boundary, has none.
-	groupExit  map[edge[S]][]groupHook[S]
-	groupEnter map[edge[S]][]groupHook[S]
-
-	// Hooks that run after every transition, declared with [OnTransition].
-	onAll []Hook[S]
-
-	// True when any hook is declared. A machine that declares none skips the
-	// hook block and its lookups.
+	// True when some row has a plan; a machine with none skips the lookup.
 	hasHooks bool
-
-	// True when the machine declares an internal transition, or a group
-	// hook: one load each in the hook block, cheaper than a map's length.
-	hasInternal, hasGroupHooks bool
 
 	// The state declared with [Initial], if any.
 	initial    S
@@ -259,44 +241,24 @@ func (m *Machine[S]) Fire[A any](ctx context.Context, st *S, ev Event[A], arg A)
 		*st = to
 		return t, nil
 	}
-	// An internal transition leaves nothing, so it runs no hook; *st is
-	// already to.
-	if m.hasInternal && m.internal[e] {
+	p := m.plans[e]
+	if p == nil { // a row with no hooks, an internal one included
+		*st = to
 		return t, nil
 	}
-
-	for _, h := range m.onExit[from] {
-		h(ctx, t)
-	}
-	if len(m.onExitVia) > 0 {
-		for _, raw := range m.onExitVia[e] {
-			raw.(func(context.Context, Transition[S], A))(ctx, t, arg)
+	for _, c := range p.exit {
+		if c.plain != nil {
+			c.plain(ctx, t)
+		} else {
+			c.typed.(func(context.Context, Transition[S], A))(ctx, t, arg)
 		}
 	}
-	if m.hasGroupHooks {
-		for _, g := range m.groupExit[e] {
-			runGroupHook(ctx, g, t, arg)
-		}
-	}
-
 	*st = to
-
-	// Before the entry hooks, so an entry hook that fires again logs after
-	// this one. That is why a transition hook must not fire itself.
-	for _, h := range m.onAll {
-		h(ctx, t)
-	}
-	if m.hasGroupHooks {
-		for _, g := range m.groupEnter[e] {
-			runGroupHook(ctx, g, t, arg)
-		}
-	}
-	for _, h := range m.onEnter[to] {
-		h(ctx, t)
-	}
-	if len(m.onEnterVia) > 0 {
-		for _, raw := range m.onEnterVia[edge[S]{from: to, ev: ev.def}] {
-			raw.(func(context.Context, Transition[S], A))(ctx, t, arg)
+	for _, c := range p.enter {
+		if c.plain != nil {
+			c.plain(ctx, t)
+		} else {
+			c.typed.(func(context.Context, Transition[S], A))(ctx, t, arg)
 		}
 	}
 	return t, nil
@@ -357,8 +319,8 @@ func (m *Machine[S]) lookup[A any](ctx context.Context, from S, ev Event[A], arg
 }
 
 // apply carries out a transition its guards allowed: the action, then the
-// hooks around the assignment. It is the tail of Fire, which keeps its own
-// copy rather than call this: the call costs Fire about two nanoseconds.
+// row's plan around the assignment. It is the tail of Fire, which keeps its
+// own copy.
 func (m *Machine[S]) apply[A any](ctx context.Context, st *S, from, to S, ev Event[A], arg A) (Transition[S], error) {
 	var none Transition[S]
 	e := edge[S]{from: from, ev: ev.def}
@@ -379,44 +341,24 @@ func (m *Machine[S]) apply[A any](ctx context.Context, st *S, from, to S, ev Eve
 		*st = to
 		return t, nil
 	}
-	// An internal transition leaves nothing, so it runs no hook; *st is
-	// already to.
-	if m.hasInternal && m.internal[e] {
+	p := m.plans[e]
+	if p == nil { // a row with no hooks, an internal one included
+		*st = to
 		return t, nil
 	}
-
-	for _, h := range m.onExit[from] {
-		h(ctx, t)
-	}
-	if len(m.onExitVia) > 0 {
-		for _, raw := range m.onExitVia[e] {
-			raw.(func(context.Context, Transition[S], A))(ctx, t, arg)
+	for _, c := range p.exit {
+		if c.plain != nil {
+			c.plain(ctx, t)
+		} else {
+			c.typed.(func(context.Context, Transition[S], A))(ctx, t, arg)
 		}
 	}
-	if m.hasGroupHooks {
-		for _, g := range m.groupExit[e] {
-			runGroupHook(ctx, g, t, arg)
-		}
-	}
-
 	*st = to
-
-	// Before the entry hooks, so an entry hook that fires again logs after
-	// this one. That is why a transition hook must not fire itself.
-	for _, h := range m.onAll {
-		h(ctx, t)
-	}
-	if m.hasGroupHooks {
-		for _, g := range m.groupEnter[e] {
-			runGroupHook(ctx, g, t, arg)
-		}
-	}
-	for _, h := range m.onEnter[to] {
-		h(ctx, t)
-	}
-	if len(m.onEnterVia) > 0 {
-		for _, raw := range m.onEnterVia[edge[S]{from: to, ev: ev.def}] {
-			raw.(func(context.Context, Transition[S], A))(ctx, t, arg)
+	for _, c := range p.enter {
+		if c.plain != nil {
+			c.plain(ctx, t)
+		} else {
+			c.typed.(func(context.Context, Transition[S], A))(ctx, t, arg)
 		}
 	}
 	return t, nil
@@ -555,14 +497,4 @@ func (e *StateChangedError[S]) Error() string {
 	}
 	return fmt.Sprintf("fsm %s: state changed to %v during %v --%s--> %v",
 		e.Machine, e.Found, e.From, e.Event, e.To)
-}
-
-// runGroupHook runs g with the payload, if it takes one. Its A is the
-// payload type of the row it was attached to, which New checked.
-func runGroupHook[S comparable, A any](ctx context.Context, g groupHook[S], t Transition[S], arg A) {
-	if g.plain != nil {
-		g.plain(ctx, t)
-		return
-	}
-	g.typed.(func(context.Context, Transition[S], A))(ctx, t, arg)
 }

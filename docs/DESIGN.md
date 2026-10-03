@@ -153,8 +153,8 @@ groups', the smaller group first; entering: the larger group first, then the
 state's own. With overlapping groups there is no hierarchy to appeal to, and
 size, then declaration order, decides. A group entry hook runs before the
 state entered has run its own, so it must not fire the machine, as a
-transition hook must not. The cost is one flag check per direction in a
-machine with hooks, and none in one without.
+transition hook must not. They are part of each row's plan, so they cost
+nothing beyond running them.
 
 ### What groups still are not
 
@@ -260,7 +260,7 @@ lookup → guards → action → exit(from) → *st = to → transition hooks �
 ```
 
 If the lookup, a guard, or the action fails, the state is untouched and no hook
-runs. `OnTransition` hooks run for every edge, just after the assignment; they
+runs. `OnTransition` hooks run for every edge but an internal one, just after the assignment; they
 are where an audit log or a trace goes, instead of one `OnEnter` per state
 that a new state would silently escape. They run before the entry hooks so
 that an entry hook which fires the machine again is logged after the
@@ -333,9 +333,13 @@ state takes `OnEnterWith` alone: the `OnExitWith` half could never run.
 ### Ordering and cost
 
 Plain hooks of a state run first, then its Via hooks, then its With hooks,
-which attach last because they wait for the finished table. None of them costs
-anything on a machine that declares none: a single flag set at construction skips the whole
-hook block, including the lookups the plain hooks would do.
+which attach last because they wait for the finished table. `New` then works
+out, for every row, the one list of hooks it runs — its source's exit hooks
+and the groups it leaves, then after the assignment the transition hooks, the
+groups it enters and its target's entry hooks — so `Fire` does a single lookup
+for them, and a machine that declares no hook skips even that on a flag. That
+made `BenchmarkFireWithHooks` a third faster than the four lookups it
+replaced.
 
 ### Branch on the trigger, not on its name
 
@@ -373,9 +377,8 @@ again: `NoTransitionError` means the state refuses the event rather than
 An internal transition enters and leaves nothing, so it is not a way out
 (`Terminals` keeps a state that has only these), and it triggers no Via or
 With hook — one that only an internal transition could trigger is rejected
-as never running. `Fire` checks for one only inside its hook block, so a
-machine without hooks pays nothing for the feature, and one without internal
-transitions pays a length check.
+as never running. An internal row has no hooks in its plan, so `Fire` needs no
+check of its own for it.
 
 ## Fire does not allocate
 
