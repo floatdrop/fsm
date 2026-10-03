@@ -78,10 +78,10 @@ type builder[S comparable] struct {
 	// their group's boundary once the table is finished.
 	groupHooks []groupHookDecl[S]
 
-	// Hooks as declared, which buildPlans turns into each row's plan.
-	onEnter, onExit       map[S][]Hook[S]
-	onEnterVia, onExitVia map[edge[S]][]any // keyed by (state, event); func(context.Context, Transition[S], A)
-	onAll                 []Hook[S]
+	// Hooks as declared, which buildPlans joins into each row's plan.
+	onEnter, onExit       map[S][]call[S]
+	onEnterVia, onExitVia map[edge[S]][]call[S] // keyed by (state, event)
+	onAll                 []call[S]
 	groupEnter, groupExit map[edge[S]][]call[S] // keyed by row, in the order they run
 	internal              map[edge[S]]bool      // the rows declared with Stay
 }
@@ -127,10 +127,10 @@ func New[S comparable](name string, rules ...Rule[S]) (*Machine[S], error) {
 			actions: make(map[edge[S]]any),
 			plans:   make(map[edge[S]]*plan[S]),
 		},
-		onEnter:    make(map[S][]Hook[S]),
-		onExit:     make(map[S][]Hook[S]),
-		onEnterVia: make(map[edge[S]][]any),
-		onExitVia:  make(map[edge[S]][]any),
+		onEnter:    make(map[S][]call[S]),
+		onExit:     make(map[S][]call[S]),
+		onEnterVia: make(map[edge[S]][]call[S]),
+		onExitVia:  make(map[edge[S]][]call[S]),
 		internal:   make(map[edge[S]]bool),
 		groupEnter: make(map[edge[S]][]call[S]),
 		groupExit:  make(map[edge[S]][]call[S]),
@@ -540,7 +540,7 @@ func OnEnter[S comparable](s S, h Hook[S]) Rule[S] {
 			b.errs = append(b.errs, fmt.Errorf("nil OnEnter hook for state %v", s))
 			return
 		}
-		b.onEnter[s] = append(b.onEnter[s], h)
+		b.onEnter[s] = append(b.onEnter[s], call[S]{plain: h})
 		b.declare(s)
 	})
 }
@@ -552,7 +552,7 @@ func OnExit[S comparable](s S, h Hook[S]) Rule[S] {
 			b.errs = append(b.errs, fmt.Errorf("nil OnExit hook for state %v", s))
 			return
 		}
-		b.onExit[s] = append(b.onExit[s], h)
+		b.onExit[s] = append(b.onExit[s], call[S]{plain: h})
 		b.declare(s)
 	})
 }
@@ -573,7 +573,7 @@ func OnTransition[S comparable](h Hook[S]) Rule[S] {
 			b.errs = append(b.errs, errors.New("nil OnTransition hook"))
 			return
 		}
-		b.onAll = append(b.onAll, h)
+		b.onAll = append(b.onAll, call[S]{plain: h})
 	})
 }
 
@@ -636,7 +636,7 @@ func OnEnterVia[S comparable, A any](s S, ev Event[A], h func(context.Context, T
 			return
 		}
 		k := edge[S]{from: s, ev: ev.def}
-		b.onEnterVia[k] = append(b.onEnterVia[k], h)
+		b.onEnterVia[k] = append(b.onEnterVia[k], call[S]{typed: h})
 		b.requireVia("OnEnterVia", "enters", s, ev.def, func(d decl[S]) bool { return d.to == s && !d.internal })
 	})
 }
@@ -651,7 +651,7 @@ func OnExitVia[S comparable, A any](s S, ev Event[A], h func(context.Context, Tr
 			return
 		}
 		k := edge[S]{from: s, ev: ev.def}
-		b.onExitVia[k] = append(b.onExitVia[k], h)
+		b.onExitVia[k] = append(b.onExitVia[k], call[S]{typed: h})
 		b.requireVia("OnExitVia", "leaves", s, ev.def, func(d decl[S]) bool { return d.key.from == s && !d.internal })
 	})
 }
@@ -727,7 +727,7 @@ func OnExitWith[S comparable, A any](s S, h func(context.Context, Transition[S],
 // attachWith attaches h to every event on a row that match selects, once the
 // table is finished, so declaration order does not matter.
 func (b *builder[S]) attachWith[A any](what, verb string, s S, h func(context.Context, Transition[S], A),
-	hooks map[edge[S]][]any, match func(decl[S]) bool) {
+	hooks map[edge[S]][]call[S], match func(decl[S]) bool) {
 	if h == nil {
 		b.errs = append(b.errs, fmt.Errorf("nil %s hook for state %v", what, s))
 		return
@@ -751,7 +751,7 @@ func (b *builder[S]) attachWith[A any](what, verb string, s S, h func(context.Co
 				continue
 			}
 			k := edge[S]{from: s, ev: d.key.ev}
-			hooks[k] = append(hooks[k], h)
+			hooks[k] = append(hooks[k], call[S]{typed: h})
 		}
 		// A broken rule may be what dropped the row; report it alone.
 		if !touched && !b.broken {
@@ -769,9 +769,12 @@ func (b *builder[S]) attachWith[A any](what, verb string, s S, h func(context.Co
 // [OnExitGroup], never dips on an intra-group move.
 //
 // When a transition enters several groups at once, the larger group's hooks
-// run first, as a superstate's entry runs before its substate's; a group's
-// own hooks run in declaration order. Entering the initial state is not a
-// transition, so no group hook runs for it.
+// run first, as a superstate's entry runs before its substate's. Of groups
+// the same size, the one whose hooks were declared first runs first, except
+// that of two with the same members the earlier-declared group is the outer
+// one, as [Machine.DOT] draws it. A group's own hooks run in declaration
+// order. Entering the initial state is not a transition, so no group hook
+// runs for it.
 //
 // A group entry hook must not fire the machine on the same state: the state
 // entered has not run its entry hooks yet. [New] rejects one that no
@@ -785,7 +788,8 @@ func OnEnterGroup[S comparable](g Group[S], h Hook[S]) Rule[S] {
 // OnExitGroup declares a hook that runs when the machine leaves g for a
 // state outside it: just after the exit hooks of the state left, before the
 // assignment. When a transition leaves several groups, the smaller group's
-// hooks run first. See [OnEnterGroup].
+// hooks run first, and of two with the same members the later-declared,
+// inner one's; otherwise as [OnEnterGroup].
 func OnExitGroup[S comparable](g Group[S], h Hook[S]) Rule[S] {
 	return ruleFunc[S](func(b *builder[S]) {
 		b.declareGroupHook("OnExitGroup", g, false, call[S]{plain: h}, nil, h == nil)
@@ -824,30 +828,40 @@ func (b *builder[S]) declareGroupHook(what string, g Group[S], enter bool, h cal
 	})
 }
 
-// attachGroupHooks gives every row the group hooks it runs: those of the
-// groups it leaves, smallest first, and of the groups it enters, largest
-// first, each group's in declaration order. It runs last, against the
-// finished table, so group-inherited rows count and declaration order does
-// not matter.
+// attachGroupHooks gives every row the group hooks it runs, in the order
+// they run: entering, larger groups first, and leaving, smaller first. Of
+// groups the same size, the one whose hooks were declared first goes first
+// either way, unless the two have the same members: such twins nest by
+// declaration, as DOT draws them, so leaving runs the later one's first. A
+// group's own hooks keep their declaration order. It runs against the
+// finished table, so group-inherited rows count.
 func (b *builder[S]) attachGroupHooks() {
 	if len(b.groupHooks) == 0 {
 		return
 	}
-	// Groups from outermost to innermost: larger first, and of two the same
-	// size the one declared first, as DOT nests them. Entering runs their
-	// hooks in that order and leaving in its reverse, a group's own hooks in
-	// declaration order either way.
-	rank := func(g Group[S]) int {
-		return slices.IndexFunc(b.m.groups, func(h Group[S]) bool { return h.name == g.name })
+	rank := make(map[string]int, len(b.m.groups))
+	for i, g := range b.m.groups {
+		rank[g.name] = i
 	}
-	byNesting := func(outerFirst bool) []groupHookDecl[S] {
+	type key struct{ size, twins, rank int }
+	keys := make([]key, len(b.groupHooks))
+	var twins []Group[S] // one group per member set, by its first hook
+	for i, h := range b.groupHooks {
+		t := slices.IndexFunc(twins, func(g Group[S]) bool { return subset(g.members, h.group) && subset(h.group.members, g) })
+		if t < 0 {
+			twins, t = append(twins, h.group), len(twins)
+		}
+		keys[i] = key{size: len(h.group.members), twins: t, rank: rank[h.group.name]}
+	}
+	byNesting := func(entering bool) []groupHookDecl[S] {
 		out := slices.Clone(b.groupHooks)
 		slices.SortStableFunc(out, func(x, y groupHookDecl[S]) int {
-			c := cmp.Or(cmp.Compare(len(y.group.members), len(x.group.members)), cmp.Compare(rank(x.group), rank(y.group)))
-			if !outerFirst {
-				c = -c
+			kx, ky := keys[x.index], keys[y.index]
+			size, nest := cmp.Compare(ky.size, kx.size), cmp.Compare(kx.rank, ky.rank)
+			if !entering {
+				size, nest = -size, -nest
 			}
-			return c
+			return cmp.Or(size, cmp.Compare(kx.twins, ky.twins), nest)
 		})
 		return out
 	}
@@ -903,39 +917,39 @@ func (b *builder[S]) attachGroupHooks() {
 	}
 }
 
-// buildPlans gives every row the hooks it runs, in order: the exit hooks of
-// its source, plain, Via and With, then of the groups it leaves; and after
-// the assignment the transition hooks, the entry hooks of the groups it
-// enters, then of its target, plain, Via and With. An internal row runs
-// none.
+// buildPlans gives every row the hooks it runs, in order: before the
+// assignment, the exit hooks of its source, plain, Via and With, then of the
+// groups it leaves; after it, the transition hooks, the entry hooks of the
+// groups it enters, then of its target, plain, Via and With. It runs last.
+// An internal row, and one no hook concerns, gets no plan.
 func (b *builder[S]) buildPlans() {
-	plain := func(hs []Hook[S]) []call[S] {
-		out := make([]call[S], len(hs))
-		for i, h := range hs {
-			out[i] = call[S]{plain: h}
-		}
-		return out
-	}
-	typed := func(hs []any) []call[S] {
-		out := make([]call[S], len(hs))
-		for i, h := range hs {
-			out[i] = call[S]{typed: h}
-		}
-		return out
-	}
 	for _, d := range b.decls {
 		if d.internal {
 			continue
 		}
-		p := &plan[S]{
-			exit: slices.Concat(plain(b.onExit[d.key.from]), typed(b.onExitVia[d.key]), b.groupExit[d.key]),
-			enter: slices.Concat(plain(b.onAll), b.groupEnter[d.key],
-				plain(b.onEnter[d.to]), typed(b.onEnterVia[edge[S]{from: d.to, ev: d.key.ev}])),
-		}
-		if len(p.exit) > 0 || len(p.enter) > 0 {
-			b.m.plans[d.key] = p
+		exit := join(b.onExit[d.key.from], b.onExitVia[d.key], b.groupExit[d.key])
+		enter := join(b.onAll, b.groupEnter[d.key], b.onEnter[d.to], b.onEnterVia[edge[S]{from: d.to, ev: d.key.ev}])
+		if len(exit) > 0 || len(enter) > 0 {
+			b.m.plans[d.key] = &plan[S]{exit: exit, enter: enter}
 		}
 	}
+}
+
+// join concatenates lists of calls, sharing the one that is not empty when
+// only one is: plans are never written once built, so rows with the same
+// hooks, every row with only transition hooks say, keep one list.
+func join[S comparable](lists ...[]call[S]) []call[S] {
+	var only []call[S]
+	n := 0
+	for _, l := range lists {
+		if len(l) > 0 {
+			only, n = l, n+1
+		}
+	}
+	if n <= 1 {
+		return only
+	}
+	return slices.Concat(lists...)
 }
 
 // Group is a named set of states that share transitions. A transition declared

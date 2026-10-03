@@ -447,7 +447,7 @@ A group inside another is drawn inside its cluster. A group that partly overlaps
 
 ## Performance
 
-Guards and actions are combined at construction, where the payload type is still known, and stored as a concrete `func(context.Context, A) error`. `Fire` asserts back to that type and passes the payload directly, so nothing is boxed. Hooks are worked out at construction too: every row gets one list of what it runs, so a machine with hooks does one lookup per fire, and one without skips even that on a flag.
+Guards and actions are combined at construction, where the payload type is still known, and stored as a concrete `func(context.Context, A) error`. `Fire` asserts back to that type and passes the payload directly, so nothing is boxed. Hooks are worked out at construction too: every row gets a plan, the hooks it runs before the assignment and after it, so a machine with hooks does one lookup per fire, and one without skips even that on a flag.
 
 ```
 goos: darwin, goarch: arm64, cpu: Apple M3 Max

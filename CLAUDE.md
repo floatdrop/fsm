@@ -174,13 +174,16 @@ the expansion produces rows indistinguishable from hand-written ones.
 
 **Group hooks are worked out per row, after everything else.** A flat table
 can suppress a superstate's hooks on an intra-group move after all: each row
-knows its source and target, so `attachGroupHooks` — the last step of `New`,
-after expansion and the deferred pass, so inherited rows count — gives every
+knows its source and target, so `attachGroupHooks` — run after expansion and
+the deferred pass, so inherited rows count, and just before `buildPlans` — gives every
 row the hooks of the groups it leaves (source in, target out) and enters, in
 the order they run: leaving, smaller groups first; entering, larger first;
-each group's in declaration order, groups ranked outermost first — larger,
-then declared earlier, so twins nest as `DOT` draws them
-(`TestTwinGroupHooksNestByDeclaration`). `buildPlans` puts them in each row's
+each group's in declaration order. Of groups the same size, the one whose
+hooks were declared first goes first both ways
+(`TestCrossingGroupHooksKeepDeclarationOrder`), except twins — same members
+— which nest by group declaration as `DOT` draws them, so leaving runs the
+later twin first (`TestTwinGroupHooksNestByDeclaration`). The sort key is
+(size, twin set by first hook, group rank), so it is a total order. `buildPlans` puts them in each row's
 plan after the state's exit hooks and before its entry hooks. An internal row
 runs none, and an external self-transition
 of a member crosses nothing. Pinned by `TestGroupHooksRunOnlyAcrossTheBoundary`,

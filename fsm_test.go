@@ -1795,6 +1795,37 @@ func TestTwinGroupHooksNestByDeclaration(t *testing.T) {
 	}
 }
 
+// Groups the same size that only partly overlap are no hierarchy: the one
+// whose hooks were declared first goes first, entering and leaving alike.
+func TestCrossingGroupHooksKeepDeclarationOrder(t *testing.T) {
+	t.Parallel()
+
+	var log []string
+	note := func(what string) fsm.Hook[state] {
+		return func(context.Context, fsm.Transition[state]) { log = append(log, what) }
+	}
+	x := fsm.NewGroup("x", running, done)
+	y := fsm.NewGroup("y", done, cancelled)
+	m, err := fsm.New("job",
+		fsm.From(idle).On(evStart).To(done),
+		fsm.From(done).On(evCancel).To(idle),
+		fsm.From(running).On(evFinish).To(cancelled),
+		fsm.OnEnterGroup(x, note("enter x")),
+		fsm.OnEnterGroup(y, note("enter y")),
+		fsm.OnExitGroup(x, note("exit x")),
+		fsm.OnExitGroup(y, note("exit y")),
+	)
+	if err != nil {
+		t.Fatalf("build: %v", err)
+	}
+	ctx, st := t.Context(), idle
+	_, _ = m.Send(ctx, &st, evStart)
+	_, _ = m.Send(ctx, &st, evCancel)
+	if want := []string{"enter x", "enter y", "exit x", "exit y"}; !slices.Equal(log, want) {
+		t.Errorf("ran %q, want %q", log, want)
+	}
+}
+
 // The With variants hand the hook the payload of the event that crossed.
 func TestGroupWithHooksSeeThePayload(t *testing.T) {
 	t.Parallel()

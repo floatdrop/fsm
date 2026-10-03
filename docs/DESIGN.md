@@ -150,8 +150,10 @@ leading becomes handing over. Before, that was a flag beside the machine.
 
 The order is the hierarchy's. Leaving: the state's exit hooks, then its
 groups', the smaller group first; entering: the larger group first, then the
-state's own. With overlapping groups there is no hierarchy to appeal to, and
-size, then declaration order, decides. A group entry hook runs before the
+state's own. Of two groups the same size there is no hierarchy to appeal to,
+and the one whose hooks were declared first goes first, entering and leaving
+alike — unless they have the same members, when the later-declared one is
+inside the earlier, as `DOT` draws them, and is left first. A group entry hook runs before the
 state entered has run its own, so it must not fire the machine, as a
 transition hook must not. They are part of each row's plan, so they cost
 nothing beyond running them.
@@ -377,7 +379,7 @@ again: `NoTransitionError` means the state refuses the event rather than
 An internal transition enters and leaves nothing, so it is not a way out
 (`Terminals` keeps a state that has only these), and it triggers no Via or
 With hook — one that only an internal transition could trigger is rejected
-as never running. An internal row has no hooks in its plan, so `Fire` needs no
+as never running. An internal row has no plan at all, so `Fire` needs no
 check of its own for it.
 
 ## Fire does not allocate
