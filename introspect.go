@@ -1,8 +1,10 @@
 package fsm
 
 import (
+	"cmp"
 	"fmt"
 	"slices"
+	"strconv"
 	"strings"
 )
 
@@ -106,63 +108,176 @@ func (m *Machine[S]) DOT() string {
 		fmt.Fprintf(&b, "%s\"%s\" [shape=%s];\n", indent, dotEscape(fmt.Sprint(s)), shape)
 	}
 
-	// Graphviz puts a node in one cluster, and nests clusters, so groups
-	// that are disjoint or contain one another are drawn as they are, a
-	// group inside the smallest that contains it and a state inside the
-	// smallest group that holds it. A group that partly overlaps an earlier
-	// drawn one cannot be: it gets no cluster, and a comment says so.
-	drawn := m.drawableGroups()
-	parent := make(map[string]string, len(drawn))
-	owner := make(map[S]string, len(m.states))
-	for i, g := range drawn {
-		if h, ok := innermost(drawn, g.members, i); ok {
-			parent[g.name] = h
-		}
-	}
-	for _, s := range m.states {
-		if h, ok := innermost(drawn, []S{s}, -1); ok {
-			owner[s] = h
-		}
-	}
-	var cluster func(g Group[S], indent string)
-	cluster = func(g Group[S], indent string) {
+	l := m.layout()
+	l.nest(func(g Group[S], depth int) {
+		indent := strings.Repeat("\t", depth)
 		fmt.Fprintf(&b, "%ssubgraph \"cluster_%s\" {\n", indent, dotEscape(g.name))
 		fmt.Fprintf(&b, "%s\tlabel=\"%s\";\n", indent, dotEscape(g.name))
 		fmt.Fprintf(&b, "%s\tstyle=rounded;\n", indent)
-		for _, h := range drawn {
-			if parent[h.name] == g.name {
-				cluster(h, indent+"\t")
-			}
-		}
-		for _, s := range g.members {
-			if owner[s] == g.name {
-				node(indent+"\t", s)
-			}
-		}
-		fmt.Fprintf(&b, "%s}\n", indent)
-	}
-	for _, g := range drawn {
-		if _, inner := parent[g.name]; !inner {
-			cluster(g, "\t")
-		}
-	}
-	for _, g := range m.groups {
-		if !slices.ContainsFunc(drawn, func(h Group[S]) bool { return h.name == g.name }) {
-			fmt.Fprintf(&b, "\t// group %s overlaps another without containing it, so it is not drawn as a cluster\n",
-				commentReplacer.Replace(g.name))
-		}
+	}, func(s S, depth int) {
+		node(strings.Repeat("\t", depth), s)
+	}, func(depth int) {
+		fmt.Fprintf(&b, "%s}\n", strings.Repeat("\t", depth))
+	})
+	for _, g := range l.unboxed {
+		fmt.Fprintf(&b, "\t// group %s overlaps another without containing it, so it is not drawn as a cluster\n",
+			commentReplacer.Replace(g.name))
 	}
 	for _, s := range m.states {
-		if _, grouped := owner[s]; !grouped {
+		if _, grouped := l.owner[s]; !grouped {
 			node("\t", s)
 		}
 	}
 
-	// A cluster can only be the tail of an edge if it really holds every one
-	// of its members, which a drawn group does, nested clusters included.
-	whole := make(map[string]bool, len(drawn))
-	for _, g := range drawn {
-		whole[g.name] = true
+	if m.hasInitial {
+		fmt.Fprintf(&b, "\t\"%s\" -> \"%s\";\n", start, dotEscape(fmt.Sprint(m.initial)))
+	}
+	for i, e := range m.edges {
+		if l.skip[i] {
+			continue
+		}
+		// The separator is added after escaping so that the \n stays a
+		// Graphviz line break rather than becoming a literal backslash-n.
+		label := e.label(dotEscape, `\n`)
+
+		var attrs string
+		if e.Internal {
+			attrs = ", style=dashed" // handled in the state, which it does not leave
+		}
+		if l.tail[i] != "" {
+			attrs = fmt.Sprintf(`, ltail="cluster_%s"`, dotEscape(l.tail[i]))
+		}
+		fmt.Fprintf(&b, "\t\"%s\" -> \"%s\" [label=\"%s\"%s];\n",
+			dotEscape(fmt.Sprint(e.From)), dotEscape(fmt.Sprint(e.To)), label, attrs)
+	}
+
+	b.WriteString("}\n")
+	return b.String()
+}
+
+// Mermaid renders the machine as a Mermaid state diagram, for a mermaid
+// code block in Markdown, which GitHub draws. It draws what [Machine.DOT]
+// draws, in Mermaid's terms: a [Group] is a composite state, nested and
+// left out exactly as DOT's clusters are, with a transition every member
+// inherited drawn once from it under the same conditions; an internal
+// transition is a line inside its state rather than a loop; the [Initial]
+// state is entered from [*], and a terminal state leads to [*].
+//
+// Output is deterministic, as DOT's is, so it can be committed and diffed.
+func (m *Machine[S]) Mermaid() string {
+	ids := make(map[S]string, len(m.states))
+	for i, s := range m.states {
+		ids[s] = "s" + strconv.Itoa(i)
+	}
+	gids := make(map[string]string, len(m.groups))
+	for i, g := range m.groups {
+		gids[g.name] = "g" + strconv.Itoa(i)
+	}
+	indent := func(depth int) string { return strings.Repeat("    ", depth) }
+
+	var b strings.Builder
+	fmt.Fprintf(&b, "---\ntitle: %s\n---\n", strconv.Quote(m.name)) // a YAML double-quoted string
+	b.WriteString("stateDiagram-v2\n    direction LR\n")
+	l := m.layout()
+	l.nest(func(g Group[S], depth int) {
+		fmt.Fprintf(&b, "%sstate \"%s\" as %s {\n", indent(depth), mermaidEscape(g.name), gids[g.name])
+	}, func(s S, depth int) {
+		fmt.Fprintf(&b, "%s%s\n", indent(depth), ids[s])
+	}, func(depth int) {
+		fmt.Fprintf(&b, "%s}\n", indent(depth))
+	})
+	// Mermaid reads a %%{ directive even inside a comment, so the name is
+	// escaped here too.
+	for _, g := range l.unboxed {
+		fmt.Fprintf(&b, "    %%%% group %s overlaps another without containing it, so it is not drawn as a composite state\n",
+			mermaidEscape(g.name))
+	}
+
+	// A state's first description line is its name, and each internal
+	// transition adds one below it.
+	inside := make(map[S][]Edge[S])
+	for _, e := range m.edges {
+		if e.Internal {
+			inside[e.From] = append(inside[e.From], e)
+		}
+	}
+	for _, s := range m.states {
+		fmt.Fprintf(&b, "    %s : %s\n", ids[s], mermaidEscape(fmt.Sprint(s)))
+		for _, e := range inside[s] {
+			fmt.Fprintf(&b, "    %s : %s\n", ids[s], e.label(mermaidEscape, " "))
+		}
+	}
+
+	if m.hasInitial {
+		fmt.Fprintf(&b, "    [*] --> %s\n", ids[m.initial])
+	}
+	for i, e := range m.edges {
+		if e.Internal || l.skip[i] {
+			continue
+		}
+		from := ids[e.From]
+		if l.tail[i] != "" {
+			from = gids[l.tail[i]]
+		}
+		fmt.Fprintf(&b, "    %s --> %s : %s\n", from, ids[e.To], e.label(mermaidEscape, "<br>"))
+	}
+	for _, s := range m.Terminals() {
+		fmt.Fprintf(&b, "    %s --> [*]\n", ids[s])
+	}
+	return b.String()
+}
+
+// label is e's event and its guard in brackets, each escaped, joined by
+// sep, which is not.
+func (e Edge[S]) label(escape func(string) string, sep string) string {
+	label := escape(e.Event())
+	if e.Guard != "" {
+		label += sep + "[" + escape(e.Guard) + "]"
+	}
+	return label
+}
+
+// layout is how a diagram draws the groups: which it boxes, how the boxes
+// nest and which holds each state, and which edges it draws once from a
+// box's boundary instead of once per member.
+type layout[S comparable] struct {
+	drawn   []Group[S]
+	unboxed []Group[S]        // the groups left out of drawn, in declaration order
+	parent  map[string]string // a drawn group's innermost enclosing one
+	owner   map[S]string      // a state's innermost drawn group
+	tail    []string          // per edge: the group it is drawn from, or ""
+	skip    []bool            // per edge: drawn already, from its group
+}
+
+// layout works out how m's groups are drawn. A box holds a state, or
+// another box, only once, and boxes nest, so groups that are disjoint or
+// contain one another are drawn as they are, a group inside the smallest
+// that contains it and a state inside the smallest group that holds it. A
+// group that partly overlaps an earlier drawn one cannot be: it gets no box.
+func (m *Machine[S]) layout() layout[S] {
+	l := layout[S]{
+		drawn:  m.drawableGroups(),
+		parent: make(map[string]string),
+		owner:  make(map[S]string, len(m.states)),
+		tail:   make([]string, len(m.edges)),
+		skip:   make([]bool, len(m.edges)),
+	}
+	boxed := make(map[string]bool, len(l.drawn))
+	for i, g := range l.drawn {
+		boxed[g.name] = true
+		if h, ok := innermost(l.drawn, g.members, i); ok {
+			l.parent[g.name] = h
+		}
+	}
+	for _, g := range m.groups {
+		if !boxed[g.name] {
+			l.unboxed = append(l.unboxed, g)
+		}
+	}
+	for _, s := range m.states {
+		if h, ok := innermost(l.drawn, []S{s}, -1); ok {
+			l.owner[s] = h
+		}
 	}
 
 	// Rows are counted per group transition, identified by the group and the
@@ -172,49 +287,52 @@ func (m *Machine[S]) DOT() string {
 		group   string
 		trigger *eventDef
 	}
-	of := func(e Edge[S]) boundary { return boundary{group: e.Group, trigger: e.trigger} }
 	rows := make(map[boundary]int)
 	for _, e := range m.edges {
 		if e.Group != "" {
-			rows[of(e)]++
+			rows[boundary{e.Group, e.trigger}]++
 		}
 	}
-
 	byName := make(map[string]Group[S], len(m.groups))
 	for _, g := range m.groups {
 		byName[g.name] = g
 	}
-
-	if m.hasInitial {
-		fmt.Fprintf(&b, "\t\"%s\" -> \"%s\";\n", start, dotEscape(fmt.Sprint(m.initial)))
+	drawnFrom := make(map[boundary]bool)
+	for i, e := range m.edges {
+		k := boundary{e.Group, e.trigger}
+		if e.Group == "" || !collapsible(e, byName[e.Group], rows[k], boxed[e.Group]) {
+			continue
+		}
+		l.tail[i], l.skip[i] = e.Group, drawnFrom[k]
+		drawnFrom[k] = true
 	}
-	collapsed := make(map[boundary]bool)
-	for _, e := range m.edges {
-		// The guard is appended after escaping so that the \n stays a
-		// Graphviz line break rather than becoming a literal backslash-n.
-		label := dotEscape(e.Event())
-		if e.Guard != "" {
-			label += `\n[` + dotEscape(e.Guard) + `]`
-		}
+	return l
+}
 
-		var attrs string
-		if e.Internal {
-			attrs = ", style=dashed" // handled in the state, which it does not leave
-		}
-		if e.Group != "" && collapsible(e, byName[e.Group], rows[of(e)], whole[e.Group]) {
-			k := of(e)
-			if collapsed[k] {
-				continue
+// nest walks the boxes depth first, in declaration order: open and close
+// bracket each, and state is called for each state a box holds directly,
+// after the boxes inside it. An outermost box is at depth 1.
+func (l *layout[S]) nest(open func(g Group[S], depth int), state func(s S, depth int), closed func(depth int)) {
+	var walk func(g Group[S], depth int)
+	walk = func(g Group[S], depth int) {
+		open(g, depth)
+		for _, h := range l.drawn {
+			if l.parent[h.name] == g.name {
+				walk(h, depth+1)
 			}
-			collapsed[k] = true
-			attrs = fmt.Sprintf(`, ltail="cluster_%s"`, dotEscape(e.Group))
 		}
-		fmt.Fprintf(&b, "\t\"%s\" -> \"%s\" [label=\"%s\"%s];\n",
-			dotEscape(fmt.Sprint(e.From)), dotEscape(fmt.Sprint(e.To)), label, attrs)
+		for _, s := range g.members {
+			if l.owner[s] == g.name {
+				state(s, depth+1)
+			}
+		}
+		closed(depth)
 	}
-
-	b.WriteString("}\n")
-	return b.String()
+	for _, g := range l.drawn {
+		if _, inner := l.parent[g.name]; !inner {
+			walk(g, 1)
+		}
+	}
 }
 
 // drawableGroups returns the groups that can be drawn as clusters, in
@@ -279,6 +397,15 @@ func collapsible[S comparable](e Edge[S], g Group[S], rows int, whole bool) bool
 
 // commentReplacer keeps a name on its line in a // comment.
 var commentReplacer = strings.NewReplacer("\n", " ", "\r", " ")
+
+// mermaidReplacer keeps a string on its line, and writes as entity codes
+// the characters Mermaid would read as syntax or markup.
+var mermaidReplacer = strings.NewReplacer("#", "#35;", `"`, "#34;", ":", "#58;", ";", "#59;",
+	"%", "#37;", "&", "#38;", "<", "#60;", ">", "#62;", "\n", " ", "\r", " ")
+
+// mermaidEscape makes s safe as a Mermaid label. An empty one is a
+// zero-width space, since Mermaid shows an id in place of an empty label.
+func mermaidEscape(s string) string { return cmp.Or(mermaidReplacer.Replace(s), "#8203;") }
 
 // dotReplacer makes a string safe inside double quotes in Graphviz.
 var dotReplacer = strings.NewReplacer(`\`, `\\`, `"`, `\"`, "\n", `\n`)

@@ -114,7 +114,7 @@ type decl[S comparable] struct {
 // pointers compare equal exactly when their types match.
 func payloadToken[A any]() any { return (*A)(nil) }
 
-// New builds a machine from its rules. name appears in errors and DOT output.
+// New builds a machine from its rules. name appears in errors and diagrams.
 //
 // S is inferred from the rules, so it rarely has to be written out. A machine
 // with no rules cannot infer it, and is an error in any case.
@@ -297,7 +297,7 @@ type ToStep[S comparable, A any] struct {
 // wrapped in a [GuardError], which unwraps to it, so a guard can reject with
 // a sentinel the caller matches using errors.Is.
 //
-// desc is the guard's static description: it labels the edge in DOT output
+// desc is the guard's static description: it labels the edge in diagrams
 // and appears in the error, so it should read as the condition being
 // enforced — "all chunks and tracks uploaded". The returned error carries the
 // dynamic reason the condition did not hold this time.
@@ -580,7 +580,8 @@ func OnTransition[S comparable](h Hook[S]) Rule[S] {
 // Initial declares the state a fresh instance starts in. The machine still
 // holds no state, so nothing changes at fire time; it lets [New] reject a
 // machine in which some state cannot be reached from the start, or whose
-// start has no way out, and lets [Machine.DOT] mark where the machine begins.
+// start has no way out, and lets [Machine.DOT] and [Machine.Mermaid] mark
+// where the machine begins.
 //
 // Entering the initial state is not a transition, so no hook runs for it and
 // the first increment of a counter kept by entry hooks is the caller's.
@@ -972,15 +973,15 @@ func join[S comparable](lists ...[]call[S]) []call[S] {
 // pays for it beyond the hooks declared on it ([OnEnterGroup], [OnExitGroup]),
 // which run only on the transitions that cross its boundary.
 //
-// A Group is itself a [Rule], so a group used only for [Group.Has] or for DOT
-// output can be passed to [New] on its own.
+// A Group is itself a [Rule], so a group used only for [Group.Has] or for a
+// diagram can be passed to [New] on its own.
 type Group[S comparable] struct {
 	name    string
 	members []S
 }
 
-// NewGroup declares a group of states. name labels it in errors and in DOT
-// output, and must be unique within a machine.
+// NewGroup declares a group of states. name labels it in errors and in
+// diagrams, and must be unique within a machine.
 func NewGroup[S comparable](name string, members ...S) Group[S] {
 	return Group[S]{name: name, members: slices.Clone(members)}
 }

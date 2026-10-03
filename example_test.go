@@ -263,3 +263,29 @@ func ExampleMachine_DOT() {
 	// 	"finished" -> "uploaded" [label="uploaded"];
 	// }
 }
+
+// Mermaid draws the same diagram for a mermaid block in Markdown, which
+// GitHub renders: the group is a composite state, the kick leaves it once,
+// and [*] marks where the machine starts and where it can end.
+func ExampleMachine_Mermaid() {
+	fmt.Print(participantFSM.Mermaid())
+
+	// Output:
+	// ---
+	// title: "participant"
+	// ---
+	// stateDiagram-v2
+	//     direction LR
+	//     state "live" as g0 {
+	//         s0
+	//         s1
+	//     }
+	//     s0 : connected
+	//     s1 : reconnecting
+	//     s2 : deleted
+	//     [*] --> s0
+	//     s0 --> s1 : disconnect<br>[disconnect was not intentional]
+	//     s1 --> s0 : reconnect
+	//     g0 --> s2 : kick
+	//     s2 --> [*]
+}
