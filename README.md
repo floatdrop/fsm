@@ -188,6 +188,14 @@ tr, err := recordingFSM.Send(ctx, &r.state, evRecUpload)  // for events declared
 
 `Fire` returns the `Transition` it made: `tr.From`, `tr.To`, and `tr.Event()` for display. Names are not unique, so branch with `tr.Is(evRecStop)`, never on the string.
 
+A caller that fires whenever an event *might* apply — a controller reconciling on every turn — wants a refusal to be no news:
+
+```go
+tr, fired, err := m.TryFire(ctx, &st, evReconcile, x) // fired is false, err nil, when nothing applies
+```
+
+`TryFire` (and `TrySend`) report a state that does not take the event, or a guard that rejects it, as `false` with a nil error, and allocate nothing doing so. A failed action, or a state written by a callback, is still an error.
+
 To ask without firing:
 
 ```go

@@ -1380,6 +1380,9 @@ func TestZeroEventIsAnErrorNotAPanic(t *testing.T) {
 	if to, ok := m.To(idle, zero); ok {
 		t.Errorf("To resolved %v for the zero Event", to)
 	}
+	if _, fired, err := m.TryFire(t.Context(), &st, zero, 0); fired || err == nil || !strings.Contains(err.Error(), "zero Event") {
+		t.Errorf("TryFire: fired=%v, err %v; want the zero Event reported", fired, err)
+	}
 }
 
 // --- Zero values, nil rules and error text --------------------------------
@@ -1427,7 +1430,192 @@ func TestFireRejectsANilStatePointer(t *testing.T) {
 	if !strings.Contains(err.Error(), "nil state pointer") {
 		t.Errorf("error %q does not explain the problem", err)
 	}
+	if _, fired, err := m.TrySend(t.Context(), nil, evStart); fired || err == nil || !strings.Contains(err.Error(), "nil state pointer") {
+		t.Errorf("TrySend: fired=%v, err %v; want the nil state pointer reported", fired, err)
+	}
 }
+
+// --- TryFire ----------------------------------------------------------------
+
+// TryFire makes the transition Fire would, hooks and all, and says it did.
+func TestTryFireFiresWhatFireWould(t *testing.T) {
+	t.Parallel()
+
+	var entered []state
+	m, err := fsm.New("job",
+		fsm.From(idle).On(evStart).To(running),
+		fsm.From(running).On(evFinish).To(done).Action(func(context.Context, int) error { return nil }),
+		fsm.OnEnter(running, func(_ context.Context, tr fsm.Transition[state]) { entered = append(entered, tr.To) }),
+	)
+	if err != nil {
+		t.Fatalf("build: %v", err)
+	}
+	ctx := t.Context()
+	st := idle
+
+	tr, fired, err := m.TrySend(ctx, &st, evStart)
+	if !fired || err != nil || st != running || tr.From != idle || tr.To != running || !tr.Is(evStart) {
+		t.Fatalf("TrySend: %v -> %v, fired=%v, err %v, state %v; want idle -> running", tr.From, tr.To, fired, err, st)
+	}
+	if !slices.Equal(entered, []state{running}) {
+		t.Errorf("entry hooks ran for %v, want [running]", entered)
+	}
+	if _, fired, err := m.TryFire(ctx, &st, evFinish, 3); !fired || err != nil || st != done {
+		t.Errorf("TryFire: fired=%v, err %v, state %v; want done", fired, err, st)
+	}
+}
+
+// TryFire runs every kind of hook Fire does, in the same order: it carries
+// out a transition with its own copy of Fire's tail, and this is what keeps
+// the two from drifting apart.
+func TestTryFireRunsTheHooksFireDoes(t *testing.T) {
+	t.Parallel()
+
+	run := func(try bool) []string {
+		var log []string
+		note := func(what string) fsm.Hook[state] {
+			return func(_ context.Context, tr fsm.Transition[state]) {
+				log = append(log, fmt.Sprintf("%s %v->%v", what, tr.From, tr.To))
+			}
+		}
+		m, err := fsm.New("job",
+			fsm.From(idle).On(evStart).To(running),
+			fsm.From(running).On(evFinish).To(done),
+			fsm.OnExit(idle, note("exit")),
+			fsm.OnExitVia(running, evFinish, func(_ context.Context, _ fsm.Transition[state], n int) {
+				log = append(log, fmt.Sprintf("exit via finish %d", n))
+			}),
+			fsm.OnTransition(note("transition")),
+			fsm.OnEnter(running, note("enter")),
+			fsm.OnEnterVia(done, evFinish, func(_ context.Context, _ fsm.Transition[state], n int) {
+				log = append(log, fmt.Sprintf("enter via finish %d", n))
+			}),
+		)
+		if err != nil {
+			t.Fatalf("build: %v", err)
+		}
+		ctx, st := t.Context(), idle
+		if try {
+			_, _, _ = m.TrySend(ctx, &st, evStart)
+			_, _, _ = m.TryFire(ctx, &st, evFinish, 7)
+		} else {
+			_, _ = m.Send(ctx, &st, evStart)
+			_, _ = m.Fire(ctx, &st, evFinish, 7)
+		}
+		return log
+	}
+	if fire, try := run(false), run(true); !slices.Equal(fire, try) {
+		t.Errorf("hooks differ:\nFire    %v\nTryFire %v", fire, try)
+	}
+}
+
+// A state that does not take the event, and a guard that rejects it, are
+// refusals: false and no error, the state untouched, no action and no hook.
+func TestTryFireReportsARefusalAsFalse(t *testing.T) {
+	t.Parallel()
+
+	var ran []string
+	errNotYet := errors.New("not yet")
+	m, err := fsm.New("job",
+		fsm.From(idle).On(evStart).To(running).
+			Guard("ready", func(context.Context, fsm.Unit) error { return errNotYet }).
+			Action(func(context.Context, fsm.Unit) error { ran = append(ran, "action"); return nil }),
+		fsm.OnExit(idle, func(context.Context, fsm.Transition[state]) { ran = append(ran, "exit") }),
+		fsm.From(running).On(evFinish).To(done),
+	)
+	if err != nil {
+		t.Fatalf("build: %v", err)
+	}
+	ctx := t.Context()
+
+	for _, tc := range []struct {
+		name string
+		from state
+		try  func(*state) (fsm.Transition[state], bool, error)
+	}{
+		{"no transition", done, func(s *state) (fsm.Transition[state], bool, error) { return m.TrySend(ctx, s, evStart) }},
+		{"guard rejects", idle, func(s *state) (fsm.Transition[state], bool, error) { return m.TrySend(ctx, s, evStart) }},
+	} {
+		st := tc.from
+		tr, fired, err := tc.try(&st)
+		if fired || err != nil || tr != (fsm.Transition[state]{}) || st != tc.from {
+			t.Errorf("%s: %v, fired=%v, err %v, state %v; want a quiet refusal from %v", tc.name, tr, fired, err, st, tc.from)
+		}
+	}
+	if len(ran) != 0 {
+		t.Errorf("a refusal ran %v", ran)
+	}
+}
+
+// What would be news from Fire is news from TryFire: a failed action, and a
+// state written by a guard or an action.
+func TestTryFireReportsFailuresAsErrors(t *testing.T) {
+	t.Parallel()
+
+	errBoom := errors.New("boom")
+	var st state
+	m, err := fsm.New("job",
+		fsm.From(running).On(evFinish).To(done).Action(func(context.Context, int) error { return errBoom }),
+		fsm.From(idle).On(evStart).To(running).Guard("writes", func(context.Context, fsm.Unit) error {
+			st = done
+			return errBoom
+		}),
+		fsm.From(running).On(evCancel).To(cancelled).Action(func(context.Context, fsm.Unit) error {
+			st = idle
+			return nil
+		}),
+	)
+	if err != nil {
+		t.Fatalf("build: %v", err)
+	}
+	ctx := t.Context()
+
+	st = running
+	if _, fired, err := m.TryFire(ctx, &st, evFinish, 0); fired || !errors.Is(err, errBoom) {
+		t.Errorf("failed action: fired=%v, err %v; want an ActionError", fired, err)
+	} else if _, ok := errors.AsType[*fsm.ActionError[state]](err); !ok {
+		t.Errorf("failed action: %T, want *fsm.ActionError", err)
+	}
+	for _, tc := range []struct {
+		name     string
+		from, at state
+		ev       fsm.Event[fsm.Unit]
+	}{
+		{"guard", idle, done, evStart},
+		{"action", running, idle, evCancel},
+	} {
+		st = tc.from
+		_, fired, err := m.TrySend(ctx, &st, tc.ev)
+		sce, ok := errors.AsType[*fsm.StateChangedError[state]](err)
+		if fired || !ok || sce.Found != tc.at {
+			t.Errorf("%s writing the state: fired=%v, err %v; want a StateChangedError finding %v", tc.name, fired, err, tc.at)
+		}
+	}
+}
+
+// The point of TryFire: a caller firing on every turn pays nothing for the
+// turns with nothing to do.
+func TestTryFireRefusalDoesNotAllocate(t *testing.T) {
+	m, err := fsm.New("job",
+		fsm.From(idle).On(evStart).To(running).Guard("never", func(context.Context, fsm.Unit) error { return errNever }),
+		fsm.From(running).On(evFinish).To(done),
+	)
+	if err != nil {
+		t.Fatalf("build: %v", err)
+	}
+	ctx := t.Context()
+	st := idle
+
+	avg := testing.AllocsPerRun(1000, func() {
+		_, _, _ = m.TrySend(ctx, &st, evStart)     // a guard rejects
+		_, _, _ = m.TryFire(ctx, &st, evFinish, 0) // idle takes no finish
+	})
+	if avg != 0 {
+		t.Errorf("a refusal allocates %.1f times per round trip, want 0", avg)
+	}
+}
+
+var errNever = errors.New("never")
 
 // The error text is what a caller reads in a log, so every fire-time error
 // names the machine and the edge it happened on.
@@ -2580,6 +2768,20 @@ func FuzzMachineInvariants(f *testing.F) {
 					t.Fatalf("Fire %s from %v succeeded with no transition declared", ev, from)
 				case !ok && st != from:
 					t.Fatalf("Fire %s from %v failed but moved the state to %v", ev, from, st)
+				}
+				// TryFire is Fire with a refusal as false: with no guards or
+				// actions here, it fires exactly when To resolves.
+				st = from
+				tr, fired, err := m.TryFire(ctx, &st, ev, 0)
+				switch {
+				case err != nil:
+					t.Fatalf("TryFire %s from %v: %v", ev, from, err)
+				case fired != ok:
+					t.Fatalf("TryFire %s from %v fired=%v, but To resolves=%v", ev, from, fired, ok)
+				case fired && (st != want || tr.To != want || !tr.Is(ev)):
+					t.Fatalf("TryFire %s from %v left %v (-> %v), want %v", ev, from, st, tr.To, want)
+				case !fired && st != from:
+					t.Fatalf("TryFire %s from %v refused but moved the state to %v", ev, from, st)
 				}
 			}
 		}

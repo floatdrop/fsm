@@ -220,6 +220,14 @@ same error without firing, when you want the reason but not the transition;
 When several guards are registered on one transition they run in order and the
 first rejection wins, reported under the description it was declared with.
 
+A refusal is not always news. A controller that fires `reconcile` on every turn
+and lets the guards say whether there is anything to do would pay for an error
+value on every quiet turn, and would have to tell refusals from failures by
+type. `TryFire` reports a missing transition or a rejecting guard as `false`
+with a nil error, and allocates nothing; the failures that still are errors are
+the ones that mean something went wrong: an action that failed, a callback that
+wrote the state.
+
 ## Entry/exit hooks cannot fail
 
 They exist for bookkeeping that must stay paired with the state change. Work

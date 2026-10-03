@@ -8,8 +8,8 @@ generic methods, with no dependency outside the standard library.
 that way. This file is the working detail behind it; the two are edited
 together.
 
-Library: `fsm.go` (package doc, `Event`, `Machine`, `Fire`, `Send`, `Check`,
-`Can`, `To`, the four error types), `rules.go` (`New`/`MustNew`, the `Rule`
+Library: `fsm.go` (package doc, `Event`, `Machine`, `Fire`, `Send`, `TryFire`,
+`TrySend`, `Check`, `Can`, `To`, the four error types), `rules.go` (`New`/`MustNew`, the `Rule`
 interface and everything that produces one — the `From`/`FromEach`/`FromGroup`
 chain through `On`/`To` with its `Guard`/`Action` methods, plus `Rules`,
 `Group`, `OnEnter`, `OnExit`, `OnEnterVia`, `OnExitVia`, `OnEnterWith`,
@@ -83,6 +83,16 @@ never boxed — `A` is known at the call site. Any new way to register or fire
 must keep that pairing, or the assertion becomes a runtime panic on a path that
 is supposed to return errors. `TestFireDoesNotAllocate` is the guard on the
 allocation half; it runs without `-race`, which changes the profile.
+
+**`Fire` is one function, on purpose.** A call to a private generic method is
+not inlined, and splitting `Fire` into a lookup and an apply step cost
+`BenchmarkFire` six nanoseconds a round trip. So `Fire` keeps its whole body;
+`TryFire` and `Check` share `lookup`, and `TryFire` carries a transition out
+through `apply`, a copy of `Fire`'s tail. `TestTryFireRunsTheHooksFireDoes`
+fires the same transitions both ways with every kind of hook and compares the
+logs, and `FuzzMachineInvariants` checks that `TryFire` fires exactly when
+`To` resolves: those are what keep the copy honest. A refusal from `TryFire`
+builds no error value (`TestTryFireRefusalDoesNotAllocate`).
 
 **Multiple guards and actions are combined at `On` time, not at `Fire` time,**
 for the same reason: the combining closure is built where `A` is still known.
