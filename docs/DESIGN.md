@@ -129,25 +129,37 @@ what to skip, group expansion is a deferred pass — and it must run *before*
 the `OnEnterWith`/`OnExitWith` pass, which reads the finished table. So there are two phases,
 not one: expansion adds edges, then the rules that read edges run.
 
-### What groups deliberately are not
+### Group hooks run where a hierarchy would run them
 
-A group has no entry or exit hooks. The reason to want them is exactly the
-thing a flat expansion cannot reproduce: in a real hierarchy, moving between
-two substates of the same superstate does *not* run the superstate's hooks.
-With every row flat there is nowhere to record that, so a counter of what is in
-the group would decrement and increment on a move a hierarchy would treat as
-staying put — the same dip as a self-transition, in a counter whose whole
-purpose is not to drift.
+A group has entry and exit hooks, `OnEnterGroup` and `OnExitGroup`, and they
+run only on a transition that crosses its boundary: in a real hierarchy,
+moving between two substates of the same superstate does *not* run the
+superstate's hooks, and neither does a move between members here. So a count
+of what is in the group, kept by them, never dips.
 
-The usual demand for it dissolves on inspection. "How many participants are
-live" is the sum of the per-state gauges, computed where the counters are
-read; `sum by (state)` in a metrics backend needs no group at all, and has no
-dip to observe. Adding exact suppression means precomputing the ordered hook
-sequence per edge and restructuring `Machine` around a single
-`map[edge[S]]*plan[S]` — worth doing if a superstate ever genuinely needs its
-own hook, and not before.
+This package used to leave them out, on the grounds that a flat table had
+nowhere to record that suppression, and that summing the members' gauges
+answered "how many are live". The first was wrong: every row knows its source
+and target, so which groups it leaves and enters is a fact about the row,
+worked out once the table is finished, and `Fire` only runs the list. What
+made it worth doing is a superstate whose hook is not a counter. A Raft
+leader is one: leading, and handing over to a successor, are two states of
+it, and stepping down — failing the calls waiting on the leader, answering
+the hand-over — must run when either is left for a follower, and not when
+leading becomes handing over. Before, that was a flag beside the machine.
 
-Groups do not nest, and entering one does not select an initial member.
+The order is the hierarchy's. Leaving: the state's exit hooks, then its
+groups', the smaller group first; entering: the larger group first, then the
+state's own. With overlapping groups there is no hierarchy to appeal to, and
+size, then declaration order, decides. A group entry hook runs before the
+state entered has run its own, so it must not fire the machine, as a
+transition hook must not. The cost is one flag check per direction in a
+machine with hooks, and none in one without.
+
+### What groups still are not
+
+Groups do not nest as states do, and entering one does not select an initial
+member.
 Overlapping groups are allowed, but two groups claiming the same event for one
 state is an error rather than a silent most-specific-wins, because with no
 nesting there is no specificity to appeal to.
@@ -371,8 +383,8 @@ boxed. See [Benchmark](../README.md#benchmark).
   inject, so this has not been a problem — but it rules out mocking the machine
   itself. Test against the states instead.
 - **Flat states only.** [`Group`](#groups-are-a-build-time-expansion) covers
-  shared transitions and per-member overrides, but not the rest of a
-  hierarchy: no group entry/exit hooks or gauges, no nesting, no initial
+  shared transitions, per-member overrides and superstate entry/exit hooks,
+  but not the rest of a hierarchy: no nesting as states, no initial
   transition into a group, no orthogonal regions.
 - **No built-in async.** No trigger queue, no run-to-completion mode. `Fire` is
   synchronous: if your state is already serialized behind a queue or a mutex,

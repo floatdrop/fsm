@@ -155,12 +155,25 @@ which group owns each inherited row so the two cases can be told apart. With
 no nesting there is no specificity rule to fall back on.
 
 **Groups are not states and `Fire` knows nothing about them.** They expand to
-ordinary rows before `New` returns. Do not add group entry/exit hooks: the
-only reason to want them is superstate hook suppression, which a flat table
-cannot express, and a group counter kept by them would dip on an intra-group
-move. `docs/DESIGN.md` has the argument and the sum-the-members
-answer. `TestGroupFireDoesNotAllocate` pins that the expansion produces rows
-indistinguishable from hand-written ones.
+ordinary rows before `New` returns. `TestGroupFireDoesNotAllocate` pins that
+the expansion produces rows indistinguishable from hand-written ones.
+
+**Group hooks are worked out per row, after everything else.** A flat table
+can suppress a superstate's hooks on an intra-group move after all: each row
+knows its source and target, so `attachGroupHooks` — the last step of `New`,
+after expansion and the deferred pass, so inherited rows count — gives every
+row the hooks of the groups it leaves (source in, target out) and enters, in
+the order they run: leaving, smaller groups first; entering, larger first;
+each group's in declaration order. `Fire` then runs `groupExit[e]` after the
+state's exit hooks and `groupEnter[e]` before its entry hooks, behind
+`hasGroupHooks`, a precomputed bool: a map-length check there cost a
+nanosecond more. An internal row runs none, and an external self-transition
+of a member crosses nothing. Pinned by `TestGroupHooksRunOnlyAcrossTheBoundary`,
+`TestGroupHooksRunBetweenStateHooks`, `TestGroupHooksRunOutsideInAndInsideOut`
+and `TestGroupHooksKeepAnExactCount`. A group entry hook must not fire on the
+same state, for the reason a transition hook must not: the state entered has
+not run its own entry hooks. Typed group hooks check the payload of every
+crossing row, one error per hook and event, as `OnEnterWith` does.
 
 **`ToStep.combine` builds the guard/action closures once and every expanded
 row shares them.** This is what keeps the one-directional type erasure intact
@@ -252,7 +265,7 @@ transition that skips the hooks. The internal kind is its own declaration,
 `From(a).On(ev).Stay()`: guards and actions run, then `Fire` returns before
 any hook, `OnTransition` included (`TestStayRunsGuardsAndActionsButNoHook`).
 `Machine.internal` holds those rows, and `Fire` and `apply` look it up only
-inside the hook block, behind a length check, so a hookless machine pays
+inside the hook block, behind `hasInternal`, so a hookless machine pays
 nothing. An internal row is registered with `to` set to its source, which
 keeps `To`, `Check` and the fuzzer's Fire-agrees-with-To invariant uniform,
 but it is not a way out (`Terminals` skips it) and it enters and leaves

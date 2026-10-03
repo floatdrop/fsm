@@ -136,6 +136,7 @@ Each of these returns a `Rule[S]`, the single option type. Rules are plain value
 | `OnEnterVia(s, ev, h)` / `OnExitVia(s, ev, h)` | hooks that see the payload of one event |
 | `OnEnterWith(s, h)` / `OnExitWith(s, h)` | hooks that see the payload of every event entering or leaving `s` |
 | `OnTransition(h)` | a hook on every transition |
+| `OnEnterGroup(g, h)` / `OnExitGroup(g, h)` | [hooks](#group-hooks) on the transitions that cross `g`'s boundary; `…With` variants see the payload |
 | `NewGroup(name, a, b)` | a [group](#groups), usable as a rule on its own |
 | `Rules(...)` | several rules as one value |
 
@@ -352,7 +353,18 @@ for _, e := range participantFSM.Edges() {
 
 `New` rejects an unknown member, a repeated one, a name reused for different members, two groups claiming one event for the same state, and a group transition every member overrides.
 
-Groups cover most of what substates are for, but not all: no group hooks or group counters, no nesting, no initial member. Why, in [docs/DESIGN.md](docs/DESIGN.md#groups-are-a-build-time-expansion).
+### Group hooks
+
+A group has entry and exit hooks, which run as a superstate's do: only on a transition that crosses its boundary.
+
+```go
+fsm.OnEnterGroup(pcpLive, func(_ context.Context, tr fsm.Transition[pcpState]) { live.Inc() })
+fsm.OnExitGroup(pcpLive, func(_ context.Context, tr fsm.Transition[pcpState]) { live.Dec() })
+```
+
+A move between members — `connected` to `reconnecting` and back — runs neither, so the count never dips. `OnEnterGroupWith` and `OnExitGroupWith` see the payload, which every event crossing the boundary must then carry. A transition leaving several groups leaves the smaller one first, and one entering several enters the larger one first, as a substate is left before its superstate and entered after it. The exit hooks of a group run after the state's own, and its entry hooks before the state's own.
+
+Groups cover most of what substates are for, but not all: no nesting as states, no initial member. Why, in [docs/DESIGN.md](docs/DESIGN.md#groups-are-a-build-time-expansion).
 
 ## Introspection
 
