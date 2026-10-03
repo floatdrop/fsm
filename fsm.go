@@ -346,22 +346,22 @@ func (m *Machine[S]) apply[A any](ctx context.Context, st *S, from, to S, ev Eve
 		*st = to
 		return t, nil
 	}
-	for _, c := range p.exit {
-		if c.plain != nil {
-			c.plain(ctx, t)
-		} else {
-			c.typed.(func(context.Context, Transition[S], A))(ctx, t, arg)
-		}
-	}
+	run(ctx, p.exit, t, arg)
 	*st = to
-	for _, c := range p.enter {
+	run(ctx, p.enter, t, arg)
+	return t, nil
+}
+
+// run runs calls with the payload, for apply. Fire keeps the loop inline:
+// the call would cost it.
+func run[S comparable, A any](ctx context.Context, calls []call[S], t Transition[S], arg A) {
+	for _, c := range calls {
 		if c.plain != nil {
 			c.plain(ctx, t)
 		} else {
 			c.typed.(func(context.Context, Transition[S], A))(ctx, t, arg)
 		}
 	}
-	return t, nil
 }
 
 // Send fires an event that carries no payload. It is [Machine.Fire] with the
