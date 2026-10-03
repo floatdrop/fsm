@@ -77,6 +77,13 @@ type builder[S comparable] struct {
 	// Group hooks in declaration order, attached to the rows that cross
 	// their group's boundary once the table is finished.
 	groupHooks []groupHookDecl[S]
+
+	// Hooks as declared, which buildPlans turns into each row's plan.
+	onEnter, onExit       map[S][]Hook[S]
+	onEnterVia, onExitVia map[edge[S]][]any // keyed by (state, event); func(context.Context, Transition[S], A)
+	onAll                 []Hook[S]
+	groupEnter, groupExit map[edge[S]][]call[S] // keyed by row, in the order they run
+	internal              map[edge[S]]bool      // the rows declared with Stay
 }
 
 // groupHookDecl is one declared group hook, before it is attached to rows.
@@ -85,7 +92,7 @@ type groupHookDecl[S comparable] struct {
 	what    string // the declaring function, for errors
 	group   Group[S]
 	enter   bool
-	hook    groupHook[S]
+	hook    call[S]
 	payload any // (*A)(nil) for a typed hook, nil for a plain one
 }
 
@@ -114,18 +121,19 @@ func payloadToken[A any]() any { return (*A)(nil) }
 func New[S comparable](name string, rules ...Rule[S]) (*Machine[S], error) {
 	b := &builder[S]{
 		m: &Machine[S]{
-			name:       name,
-			table:      make(map[edge[S]]S),
-			guards:     make(map[edge[S]]any),
-			actions:    make(map[edge[S]]any),
-			onEnter:    make(map[S][]Hook[S]),
-			onExit:     make(map[S][]Hook[S]),
-			onEnterVia: make(map[edge[S]][]any),
-			onExitVia:  make(map[edge[S]][]any),
-			internal:   make(map[edge[S]]bool),
-			groupEnter: make(map[edge[S]][]groupHook[S]),
-			groupExit:  make(map[edge[S]][]groupHook[S]),
+			name:    name,
+			table:   make(map[edge[S]]S),
+			guards:  make(map[edge[S]]any),
+			actions: make(map[edge[S]]any),
+			plans:   make(map[edge[S]]*plan[S]),
 		},
+		onEnter:    make(map[S][]Hook[S]),
+		onExit:     make(map[S][]Hook[S]),
+		onEnterVia: make(map[edge[S]][]any),
+		onExitVia:  make(map[edge[S]][]any),
+		internal:   make(map[edge[S]]bool),
+		groupEnter: make(map[edge[S]][]call[S]),
+		groupExit:  make(map[edge[S]][]call[S]),
 		seen:       make(map[S]bool),
 		inherited:  make(map[edge[S]]string),
 		groupEdges: make(map[groupEdge]string),
@@ -156,15 +164,12 @@ func New[S comparable](name string, rules ...Rule[S]) (*Machine[S], error) {
 		d(b)
 	}
 	b.attachGroupHooks()
+	b.buildPlans()
 
 	if len(b.m.table) == 0 {
 		b.errs = append(b.errs, errors.New("no transitions declared"))
 	}
-	b.m.hasHooks = len(b.m.onEnter) > 0 || len(b.m.onExit) > 0 ||
-		len(b.m.onEnterVia) > 0 || len(b.m.onExitVia) > 0 || len(b.m.onAll) > 0 ||
-		len(b.m.groupEnter) > 0 || len(b.m.groupExit) > 0
-	b.m.hasInternal = len(b.m.internal) > 0
-	b.m.hasGroupHooks = len(b.m.groupEnter) > 0 || len(b.m.groupExit) > 0
+	b.m.hasHooks = len(b.m.plans) > 0
 	if len(b.errs) > 0 {
 		return nil, fmt.Errorf("fsm %s: %w", name, errors.Join(b.errs...))
 	}
@@ -482,7 +487,7 @@ func (t *ToStep[S, A]) redeclared() string {
 
 // does says what the registered row e does, as ToStep.does.
 func (b *builder[S]) does(e edge[S]) string {
-	if b.m.internal[e] {
+	if b.internal[e] {
 		return "stays"
 	}
 	return fmt.Sprintf("goes to %v", b.m.table[e])
@@ -510,7 +515,7 @@ func (b *builder[S]) register(r row[S]) {
 	e := edge[S]{from: r.from, ev: r.ev}
 	b.m.table[e] = r.to
 	if r.internal {
-		b.m.internal[e] = true
+		b.internal[e] = true
 	}
 	b.decls = append(b.decls, decl[S]{key: e, to: r.to, internal: r.internal, payload: r.payload})
 	b.declare(r.from)
@@ -535,7 +540,7 @@ func OnEnter[S comparable](s S, h Hook[S]) Rule[S] {
 			b.errs = append(b.errs, fmt.Errorf("nil OnEnter hook for state %v", s))
 			return
 		}
-		b.m.onEnter[s] = append(b.m.onEnter[s], h)
+		b.onEnter[s] = append(b.onEnter[s], h)
 		b.declare(s)
 	})
 }
@@ -547,7 +552,7 @@ func OnExit[S comparable](s S, h Hook[S]) Rule[S] {
 			b.errs = append(b.errs, fmt.Errorf("nil OnExit hook for state %v", s))
 			return
 		}
-		b.m.onExit[s] = append(b.m.onExit[s], h)
+		b.onExit[s] = append(b.onExit[s], h)
 		b.declare(s)
 	})
 }
@@ -568,7 +573,7 @@ func OnTransition[S comparable](h Hook[S]) Rule[S] {
 			b.errs = append(b.errs, errors.New("nil OnTransition hook"))
 			return
 		}
-		b.m.onAll = append(b.m.onAll, h)
+		b.onAll = append(b.onAll, h)
 	})
 }
 
@@ -631,7 +636,7 @@ func OnEnterVia[S comparable, A any](s S, ev Event[A], h func(context.Context, T
 			return
 		}
 		k := edge[S]{from: s, ev: ev.def}
-		b.m.onEnterVia[k] = append(b.m.onEnterVia[k], h)
+		b.onEnterVia[k] = append(b.onEnterVia[k], h)
 		b.requireVia("OnEnterVia", "enters", s, ev.def, func(d decl[S]) bool { return d.to == s && !d.internal })
 	})
 }
@@ -646,7 +651,7 @@ func OnExitVia[S comparable, A any](s S, ev Event[A], h func(context.Context, Tr
 			return
 		}
 		k := edge[S]{from: s, ev: ev.def}
-		b.m.onExitVia[k] = append(b.m.onExitVia[k], h)
+		b.onExitVia[k] = append(b.onExitVia[k], h)
 		b.requireVia("OnExitVia", "leaves", s, ev.def, func(d decl[S]) bool { return d.key.from == s && !d.internal })
 	})
 }
@@ -705,7 +710,7 @@ func (b *builder[S]) requireVia(what, verb string, s S, def *eventDef, match fun
 // It runs after the plain and the [OnEnterVia] entry hooks of the same state.
 func OnEnterWith[S comparable, A any](s S, h func(context.Context, Transition[S], A)) Rule[S] {
 	return ruleFunc[S](func(b *builder[S]) {
-		b.attachWith("OnEnterWith", "enters", s, h, b.m.onEnterVia, func(d decl[S]) bool { return d.to == s && !d.internal })
+		b.attachWith("OnEnterWith", "enters", s, h, b.onEnterVia, func(d decl[S]) bool { return d.to == s && !d.internal })
 	})
 }
 
@@ -715,7 +720,7 @@ func OnEnterWith[S comparable, A any](s S, h func(context.Context, Transition[S]
 // the same state, and still before the state changes.
 func OnExitWith[S comparable, A any](s S, h func(context.Context, Transition[S], A)) Rule[S] {
 	return ruleFunc[S](func(b *builder[S]) {
-		b.attachWith("OnExitWith", "leaves", s, h, b.m.onExitVia, func(d decl[S]) bool { return d.key.from == s && !d.internal })
+		b.attachWith("OnExitWith", "leaves", s, h, b.onExitVia, func(d decl[S]) bool { return d.key.from == s && !d.internal })
 	})
 }
 
@@ -773,7 +778,7 @@ func (b *builder[S]) attachWith[A any](what, verb string, s S, h func(context.Co
 // transition could run.
 func OnEnterGroup[S comparable](g Group[S], h Hook[S]) Rule[S] {
 	return ruleFunc[S](func(b *builder[S]) {
-		b.declareGroupHook("OnEnterGroup", g, true, groupHook[S]{plain: h}, nil, h == nil)
+		b.declareGroupHook("OnEnterGroup", g, true, call[S]{plain: h}, nil, h == nil)
 	})
 }
 
@@ -783,7 +788,7 @@ func OnEnterGroup[S comparable](g Group[S], h Hook[S]) Rule[S] {
 // hooks run first. See [OnEnterGroup].
 func OnExitGroup[S comparable](g Group[S], h Hook[S]) Rule[S] {
 	return ruleFunc[S](func(b *builder[S]) {
-		b.declareGroupHook("OnExitGroup", g, false, groupHook[S]{plain: h}, nil, h == nil)
+		b.declareGroupHook("OnExitGroup", g, false, call[S]{plain: h}, nil, h == nil)
 	})
 }
 
@@ -792,7 +797,7 @@ func OnExitGroup[S comparable](g Group[S], h Hook[S]) Rule[S] {
 // that does not, as for [OnEnterWith].
 func OnEnterGroupWith[S comparable, A any](g Group[S], h func(context.Context, Transition[S], A)) Rule[S] {
 	return ruleFunc[S](func(b *builder[S]) {
-		b.declareGroupHook("OnEnterGroupWith", g, true, groupHook[S]{typed: h}, payloadToken[A](), h == nil)
+		b.declareGroupHook("OnEnterGroupWith", g, true, call[S]{typed: h}, payloadToken[A](), h == nil)
 	})
 }
 
@@ -800,13 +805,13 @@ func OnEnterGroupWith[S comparable, A any](g Group[S], h func(context.Context, T
 // g, which every event leaving g must carry.
 func OnExitGroupWith[S comparable, A any](g Group[S], h func(context.Context, Transition[S], A)) Rule[S] {
 	return ruleFunc[S](func(b *builder[S]) {
-		b.declareGroupHook("OnExitGroupWith", g, false, groupHook[S]{typed: h}, payloadToken[A](), h == nil)
+		b.declareGroupHook("OnExitGroupWith", g, false, call[S]{typed: h}, payloadToken[A](), h == nil)
 	})
 }
 
 // declareGroupHook records a group hook, declaring its group, for
 // attachGroupHooks to attach once the table is finished.
-func (b *builder[S]) declareGroupHook(what string, g Group[S], enter bool, h groupHook[S], payload any, nilHook bool) {
+func (b *builder[S]) declareGroupHook(what string, g Group[S], enter bool, h call[S], payload any, nilHook bool) {
 	if nilHook {
 		b.errs = append(b.errs, fmt.Errorf("nil %s hook for group %s", what, g.name))
 		return
@@ -873,9 +878,9 @@ func (b *builder[S]) attachGroupHooks() {
 					}
 					continue
 				}
-				hooks := b.m.groupExit
+				hooks := b.groupExit
 				if enter {
-					hooks = b.m.groupEnter
+					hooks = b.groupEnter
 				}
 				hooks[d.key] = append(hooks[d.key], h.hook)
 			}
@@ -894,6 +899,41 @@ func (b *builder[S]) attachGroupHooks() {
 			}
 			b.errs = append(b.errs, fmt.Errorf(
 				"%s for group %s: no transition %s it, so the hook would never run", h.what, h.group.name, verb))
+		}
+	}
+}
+
+// buildPlans gives every row the hooks it runs, in order: the exit hooks of
+// its source, plain, Via and With, then of the groups it leaves; and after
+// the assignment the transition hooks, the entry hooks of the groups it
+// enters, then of its target, plain, Via and With. An internal row runs
+// none.
+func (b *builder[S]) buildPlans() {
+	plain := func(hs []Hook[S]) []call[S] {
+		out := make([]call[S], len(hs))
+		for i, h := range hs {
+			out[i] = call[S]{plain: h}
+		}
+		return out
+	}
+	typed := func(hs []any) []call[S] {
+		out := make([]call[S], len(hs))
+		for i, h := range hs {
+			out[i] = call[S]{typed: h}
+		}
+		return out
+	}
+	for _, d := range b.decls {
+		if d.internal {
+			continue
+		}
+		p := &plan[S]{
+			exit: slices.Concat(plain(b.onExit[d.key.from]), typed(b.onExitVia[d.key]), b.groupExit[d.key]),
+			enter: slices.Concat(plain(b.onAll), b.groupEnter[d.key],
+				plain(b.onEnter[d.to]), typed(b.onEnterVia[edge[S]{from: d.to, ev: d.key.ev}])),
+		}
+		if len(p.exit) > 0 || len(p.enter) > 0 {
+			b.m.plans[d.key] = p
 		}
 	}
 }

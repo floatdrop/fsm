@@ -114,13 +114,13 @@ func (m *Machine[S]) DOT() string {
 	drawn := m.drawableGroups()
 	parent := make(map[string]string, len(drawn))
 	owner := make(map[S]string, len(m.states))
-	for _, g := range drawn {
-		if h, ok := innermost(drawn, g.members, g.name); ok {
+	for i, g := range drawn {
+		if h, ok := innermost(drawn, g.members, i); ok {
 			parent[g.name] = h
 		}
 	}
 	for _, s := range m.states {
-		if h, ok := innermost(drawn, []S{s}, ""); ok {
+		if h, ok := innermost(drawn, []S{s}, -1); ok {
 			owner[s] = h
 		}
 	}
@@ -242,16 +242,16 @@ func subset[S comparable](ss []S, g Group[S]) bool {
 }
 
 // innermost names the smallest group of drawn holding all of ss, other
-// than self, and reports whether there is one. Between two groups with the
-// same members, the later declared is inside the earlier, so a group with
-// a twin holds it only if declared before self.
-func innermost[S comparable](drawn []Group[S], ss []S, self string) (string, bool) {
+// than drawn[self] (self is -1 for a state), and reports whether there is
+// one. Of two groups with the same members the later is inside the earlier,
+// so a twin holds drawn[self] only if declared before it.
+func innermost[S comparable](drawn []Group[S], ss []S, self int) (string, bool) {
 	best, found := -1, false
 	for i, h := range drawn {
-		if h.name == self || !subset(ss, h) {
+		if i == self || !subset(ss, h) {
 			continue
 		}
-		if self != "" && len(h.members) == len(ss) && slices.IndexFunc(drawn, func(x Group[S]) bool { return x.name == self }) < i {
+		if self >= 0 && len(h.members) == len(ss) && self < i {
 			continue // a twin declared after self is inside it, not around it
 		}
 		if !found || len(h.members) <= len(drawn[best].members) {

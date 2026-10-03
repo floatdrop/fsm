@@ -135,7 +135,7 @@ Each of these returns a `Rule[S]`, the single option type. Rules are plain value
 | `OnEnter(s, h)` / `OnExit(s, h)` | [hooks](#hooks) around the assignment |
 | `OnEnterVia(s, ev, h)` / `OnExitVia(s, ev, h)` | hooks that see the payload of one event |
 | `OnEnterWith(s, h)` / `OnExitWith(s, h)` | hooks that see the payload of every event entering or leaving `s` |
-| `OnTransition(h)` | a hook on every transition |
+| `OnTransition(h)` | a hook on every transition but an internal one |
 | `OnEnterGroup(g, h)` / `OnExitGroup(g, h)` | [hooks](#group-hooks) on the transitions that cross `g`'s boundary; `…With` variants see the payload |
 | `NewGroup(name, a, b)` | a [group](#groups), usable as a rule on its own |
 | `Rules(...)` | several rules as one value |
@@ -447,12 +447,12 @@ A group inside another is drawn inside its cluster. A group that partly overlaps
 
 ## Performance
 
-Guards and actions are combined at construction, where the payload type is still known, and stored as a concrete `func(context.Context, A) error`. `Fire` asserts back to that type and passes the payload directly, so nothing is boxed; a machine with no hooks skips the hook block on one flag check.
+Guards and actions are combined at construction, where the payload type is still known, and stored as a concrete `func(context.Context, A) error`. `Fire` asserts back to that type and passes the payload directly, so nothing is boxed. Hooks are worked out at construction too: every row gets one list of what it runs, so a machine with hooks does one lookup per fire, and one without skips even that on a flag.
 
 ```
-goos: darwin, goarch: arm64, cpu: Apple M3 Pro
-BenchmarkFire-12             32.54 ns/op    0 B/op    0 allocs/op
-BenchmarkFireWithHooks-12    65.17 ns/op    0 B/op    0 allocs/op
+goos: darwin, goarch: arm64, cpu: Apple M3 Max
+BenchmarkFire-14             33.00 ns/op    0 B/op    0 allocs/op
+BenchmarkFireWithHooks-14    43.69 ns/op    0 B/op    0 allocs/op
 ```
 
 One iteration is two fires, one with an action, so a single `Fire` is about 16 ns. `BenchmarkFireWithHooks` is the same round trip with an entry hook, an exit hook and both payload hooks.
@@ -463,9 +463,9 @@ The same `a → b → a` cycle, built once and fired in a loop; one iteration is
 
 | | plain | guard + action | payload |
 | --- | --- | --- | --- |
-| **`floatdrop/fsm`** | **25.6 ns**, 0 allocs | **52.8 ns**, 0 allocs | **34.8 ns**, 0 allocs |
-| [`qmuntal/stateless`](https://github.com/qmuntal/stateless) v1.8.0 | 184 ns, 0 allocs | 269 ns, 6 allocs | 260 ns, 6 allocs |
-| [`looplab/fsm`](https://github.com/looplab/fsm) v1.0.4 | 384 ns, 10 allocs | 553 ns, 10 allocs | 549 ns, 12 allocs |
+| **`floatdrop/fsm`** | **26.1 ns**, 0 allocs | **49.6 ns**, 0 allocs | **35.6 ns**, 0 allocs |
+| [`qmuntal/stateless`](https://github.com/qmuntal/stateless) v1.8.0 | 188 ns, 0 allocs | 269 ns, 6 allocs | 267 ns, 6 allocs |
+| [`looplab/fsm`](https://github.com/looplab/fsm) v1.0.4 | 405 ns, 10 allocs | 562 ns, 10 allocs | 545 ns, 12 allocs |
 
 These are different designs, not a ranking:
 
