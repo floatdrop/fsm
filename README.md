@@ -276,6 +276,24 @@ They read the finished transition table, group-inherited edges included, so an e
 
 `New` rejects a typed hook that no transition could trigger, so a terminal state takes `OnEnterWith` without `OnExitWith`. Plain hooks run first, then Via hooks, then With hooks.
 
+A machine whose hooks all need the aggregate — a controller, an elector — tends to give every event one payload type: a small struct holding the aggregate and whatever the event adds. That is what lets `OnEnterWith` serve every state, at the price of per-event typing; name events with distinct payloads where that typing matters more.
+
+### Hooks that fire the machine
+
+An entry hook may fire the machine again, on the state it just entered: a start that fails can move straight back out. A package-level machine whose hook names it is an initialization cycle in Go, so build that one in `init`:
+
+```go
+var lifecycle *fsm.Machine[phase]
+
+func init() {
+	lifecycle = fsm.MustNew("singleton",
+		fsm.From(idle).On(evReconcile).To(starting),
+		fsm.From(starting).On(evStartFailed).To(idle),
+		fsm.OnEnterVia(starting, evReconcile, launch), // launch fires lifecycle when it cannot start
+	)
+}
+```
+
 ## Groups
 
 `NewGroup` names a set of states. A transition declared on the group applies to every member:

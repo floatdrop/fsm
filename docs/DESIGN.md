@@ -321,7 +321,12 @@ different payload type, so the hook would miss it
 ```
 
 A machine whose events carry different payloads can still use them on the
-states where they agree, and use `OnEnterVia` per event where they do not. A
+states where they agree, and use `OnEnterVia` per event where they do not.
+Letting a With hook take an interface its events' payloads implement would
+need reflection at build time and a conversion at fire time, which the
+one-directional type erasure exists to avoid; a machine whose hooks need the
+aggregate everywhere gives its events one payload type instead, a small
+struct holding the aggregate and what the event adds. A
 With hook no transition can trigger is rejected like a Via hook, so a terminal
 state takes `OnEnterWith` alone: the `OnExitWith` half could never run.
 
