@@ -1512,8 +1512,8 @@ func TestStayIsNotAWayOut(t *testing.T) {
 	if got := m.Terminals(); !slices.Equal(got, []state{running}) {
 		t.Errorf("Terminals() = %v, want [running]", got)
 	}
-	_, err = fsm.New("job", fsm.Initial(idle), fsm.From(idle).On(evStart).Stay())
-	if want := "fsm job: initial state idle has no outgoing transition"; err == nil || err.Error() != want {
+	_, err = fsm.New("job", fsm.Initial(idle), fsm.From(idle).On(evStart).Stay(), fsm.From(running).On(evFinish).To(idle))
+	if want := "fsm job: initial state idle has no way out: its transitions are all internal"; err == nil || err.Error() != want {
 		t.Errorf("got %v, want %q", err, want)
 	}
 }
@@ -1757,6 +1757,41 @@ func TestGroupHooksRunOutsideInAndInsideOut(t *testing.T) {
 		if !slices.Equal(log, tc.want) {
 			t.Errorf("from %v: ran %q, want %q", tc.from, log, tc.want)
 		}
+	}
+}
+
+// Two groups with the same members nest by declaration order, as DOT draws
+// them: entering runs every hook of the earlier group before the later's,
+// leaving the reverse.
+func TestTwinGroupHooksNestByDeclaration(t *testing.T) {
+	t.Parallel()
+
+	var log []string
+	note := func(what string) fsm.Hook[state] {
+		return func(context.Context, fsm.Transition[state]) { log = append(log, what) }
+	}
+	a := fsm.NewGroup("a", running, done)
+	b := fsm.NewGroup("b", running, done)
+	m, err := fsm.New("job",
+		fsm.From(idle).On(evStart).To(running),
+		fsm.From(running).On(evCancel).To(idle),
+		fsm.From(running).On(evFinish).To(done),
+		fsm.OnEnterGroup(a, note("enter a1")),
+		fsm.OnEnterGroup(b, note("enter b1")),
+		fsm.OnEnterGroup(a, note("enter a2")),
+		fsm.OnExitGroup(a, note("exit a1")),
+		fsm.OnExitGroup(b, note("exit b1")),
+		fsm.OnExitGroup(a, note("exit a2")),
+	)
+	if err != nil {
+		t.Fatalf("build: %v", err)
+	}
+	ctx, st := t.Context(), idle
+	_, _ = m.Send(ctx, &st, evStart)
+	_, _ = m.Send(ctx, &st, evCancel)
+	want := []string{"enter a1", "enter a2", "enter b1", "exit b1", "exit a1", "exit a2"}
+	if !slices.Equal(log, want) {
+		t.Errorf("ran %q, want %q", log, want)
 	}
 }
 
