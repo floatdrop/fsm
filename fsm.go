@@ -264,10 +264,120 @@ func (m *Machine[S]) Fire[A any](ctx context.Context, st *S, ev Event[A], arg A)
 	return t, nil
 }
 
+// TryFire is [Machine.Fire] for a caller that fires whenever an event might
+// apply — a controller that reconciles on every turn, say — to which a
+// refusal is no news. A state that does not accept ev, or a guard that
+// rejects it, reports false with a nil error and allocates nothing; the
+// state is untouched and no hook runs. A failed action and a state written
+// by a guard or action are still errors, as from Fire, and so are a nil
+// state pointer and the zero Event.
+//
+// Use Fire, or [Machine.Check], when the reason for a refusal matters.
+func (m *Machine[S]) TryFire[A any](ctx context.Context, st *S, ev Event[A], arg A) (Transition[S], bool, error) {
+	var none Transition[S]
+	if err := m.callerBug(st, ev.def, "fired"); err != nil {
+		return none, false, err
+	}
+	from := *st
+	to, ok, desc, err := m.lookup(ctx, from, ev, arg)
+	switch {
+	case !ok:
+		return none, false, nil
+	case *st != from:
+		return none, false, &StateChangedError[S]{Machine: m.name, From: from, To: to, Found: *st, Event: ev.def.name, Guard: desc, Err: err}
+	case err != nil:
+		return none, false, nil
+	}
+	t, err := m.apply(ctx, st, from, to, ev, arg)
+	return t, err == nil, err
+}
+
+// callerBug reports a nil state pointer or the zero Event, which are a
+// caller's mistakes rather than machine events.
+func (m *Machine[S]) callerBug(st *S, def *eventDef, verb string) error {
+	if st == nil {
+		return fmt.Errorf("fsm %s: nil state pointer", m.name)
+	}
+	if def == nil {
+		return fmt.Errorf("fsm %s: %s the zero Event; declare it with fsm.Define or fsm.Signal", m.name, verb)
+	}
+	return nil
+}
+
+// lookup finds where ev leads from from, and runs its guards. desc names the
+// guard that rejected, if one did. ev's A is the one the row's guard was
+// registered with, which is what makes the assertion safe.
+func (m *Machine[S]) lookup[A any](ctx context.Context, from S, ev Event[A], arg A) (to S, ok bool, desc string, err error) {
+	e := edge[S]{from: from, ev: ev.def}
+	if to, ok = m.table[e]; !ok {
+		return to, false, "", nil
+	}
+	if raw, guarded := m.guards[e]; guarded {
+		desc, err = raw.(func(context.Context, A) (string, error))(ctx, arg)
+	}
+	return to, true, desc, err
+}
+
+// apply carries out a transition its guards allowed: the action, then the
+// hooks around the assignment. It is the tail of Fire, which keeps its own
+// copy rather than call this: the call costs Fire about two nanoseconds.
+func (m *Machine[S]) apply[A any](ctx context.Context, st *S, from, to S, ev Event[A], arg A) (Transition[S], error) {
+	var none Transition[S]
+	e := edge[S]{from: from, ev: ev.def}
+	if raw, ok := m.actions[e]; ok {
+		// A write is reported ahead of a failure, as for guards: the caller
+		// must learn that *st no longer holds from.
+		err := raw.(func(context.Context, A) error)(ctx, arg)
+		if *st != from {
+			return none, &StateChangedError[S]{Machine: m.name, From: from, To: to, Found: *st, Event: ev.def.name, Err: err}
+		}
+		if err != nil {
+			return none, &ActionError[S]{Machine: m.name, From: from, To: to, Event: ev.def.name, Err: err}
+		}
+	}
+
+	t := Transition[S]{From: from, To: to, trigger: ev.def}
+	if !m.hasHooks {
+		*st = to
+		return t, nil
+	}
+
+	for _, h := range m.onExit[from] {
+		h(ctx, t)
+	}
+	if len(m.onExitVia) > 0 {
+		for _, raw := range m.onExitVia[e] {
+			raw.(func(context.Context, Transition[S], A))(ctx, t, arg)
+		}
+	}
+
+	*st = to
+
+	// Before the entry hooks, so an entry hook that fires again logs after
+	// this one. That is why a transition hook must not fire itself.
+	for _, h := range m.onAll {
+		h(ctx, t)
+	}
+	for _, h := range m.onEnter[to] {
+		h(ctx, t)
+	}
+	if len(m.onEnterVia) > 0 {
+		for _, raw := range m.onEnterVia[edge[S]{from: to, ev: ev.def}] {
+			raw.(func(context.Context, Transition[S], A))(ctx, t, arg)
+		}
+	}
+	return t, nil
+}
+
 // Send fires an event that carries no payload. It is [Machine.Fire] with the
 // payload fixed to Unit{}.
 func (m *Machine[S]) Send(ctx context.Context, st *S, ev Event[Unit]) (Transition[S], error) {
 	return m.Fire(ctx, st, ev, Unit{})
+}
+
+// TrySend is [Machine.TryFire] for an event that carries no payload.
+func (m *Machine[S]) TrySend(ctx context.Context, st *S, ev Event[Unit]) (Transition[S], bool, error) {
+	return m.TryFire(ctx, st, ev, Unit{})
 }
 
 // Check reports why firing ev from state from would fail, evaluating guards
@@ -280,16 +390,12 @@ func (m *Machine[S]) Check[A any](ctx context.Context, from S, ev Event[A], arg 
 	if ev.def == nil {
 		return fmt.Errorf("fsm %s: checked the zero Event; declare it with fsm.Define or fsm.Signal", m.name)
 	}
-
-	e := edge[S]{from: from, ev: ev.def}
-	to, ok := m.table[e]
-	if !ok {
+	to, ok, desc, err := m.lookup(ctx, from, ev, arg)
+	switch {
+	case !ok:
 		return &NoTransitionError[S]{Machine: m.name, From: from, Event: ev.def.name}
-	}
-	if raw, ok := m.guards[e]; ok {
-		if desc, err := raw.(func(context.Context, A) (string, error))(ctx, arg); err != nil {
-			return &GuardError[S]{Machine: m.name, From: from, To: to, Event: ev.def.name, Guard: desc, Err: err}
-		}
+	case err != nil:
+		return &GuardError[S]{Machine: m.name, From: from, To: to, Event: ev.def.name, Guard: desc, Err: err}
 	}
 	return nil
 }
