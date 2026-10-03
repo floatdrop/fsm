@@ -169,10 +169,19 @@ nesting there is no specificity to appeal to.
 `DOT` draws one arrow from a cluster boundary rather than one per member, and
 skips the sibling rows when it does. That makes a wrong decision worse than
 cosmetic: Graphviz refuses an `ltail` it cannot honour and the skipped rows
-disappear, so the picture shows a transition table that does not exist. Three
+disappear, so the picture shows a transition table that does not exist. Two
 cases therefore fall back to per-member arrows — a member that overrode the
-event, a group that lost members to an overlapping cluster, and a target that
-is itself a member.
+event, and a target that is itself a member — and a group that is not drawn
+as a cluster has no boundary to draw from.
+
+Clusters nest, so groups that are disjoint or contain one another are drawn
+as they are: a group inside the smallest that contains it, a state inside the
+smallest group that holds it, and two groups with the same members the later
+inside the earlier. A group that partly overlaps an earlier drawn one cannot
+be — a node sits in one cluster, so either cluster would show other members
+than it has — and drawing it anyway, as this package once did, put a box
+around the wrong states. It gets no cluster, and a `//` comment in the output
+says why.
 
 The count behind that decision is keyed on the trigger's identity, not its
 name. Keying on the name merges two same-named events into one group

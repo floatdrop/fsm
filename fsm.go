@@ -35,9 +35,9 @@
 // learns, once the table is finished, which groups it leaves and enters, so
 // a count of what is in a group, kept by those hooks, is exact.
 //
-// Groups do not nest as states do — the hooks of a group inside another run
-// inside the other's, but nothing more — and entering a group does not
-// select an initial member.
+// Groups do not nest as states do — a group inside another is drawn inside
+// it, and its hooks run inside the other's, but nothing more — and entering
+// a group does not select an initial member.
 package fsm
 
 import (

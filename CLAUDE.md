@@ -186,17 +186,26 @@ states and three `any` values positionally.** That is the same argument as
 `From`/`To`: transposable parameters of the same type do not belong in this
 package.
 
+**`DOT` draws only the groups it can draw truthfully.** `drawableGroups`
+keeps, in declaration order, each group that is disjoint from, inside, or
+around every one kept before it; clusters nest, so those are drawn exactly —
+a group in the smallest that contains it (`innermost`), a state in the
+smallest group that holds it, a later twin inside an earlier one. A group
+that partly overlaps a kept one gets no cluster and a `//` comment instead
+(`TestGroupDOTSkipsACrossingGroup`): a node sits in one cluster, so any
+cluster for it would show other members than it has.
+
 **`DOT` collapses a group edge to the cluster boundary only when all three
 conditions in `collapsible` hold.** `ltail` plus `compound=true` draws one
 arrow from the cluster and skips the sibling rows, so a wrong `yes` does not
 just mislabel — Graphviz drops the `ltail` with a warning and the skipped rows
 vanish from the diagram. The three: every member inherited it (otherwise the
-arrow claims to cover the member that overrode it); the group holds all its
-members in its own cluster (an overlapping group loses members to whichever
-cluster is emitted first, and a cluster cannot be the tail of an edge whose
-tail node is elsewhere); and the target is not itself a member (that is a
-self-loop out of its own cluster, which Graphviz also refuses). Each has a
-regression test, and the outputs were checked against real `dot`.
+arrow claims to cover the member that overrode it); the group is drawn as a
+cluster, which then holds all its members, nested clusters included; and the
+target is not itself a member (that is a self-loop out of its own cluster,
+which Graphviz also refuses). Each has a regression test, and the outputs,
+nested clusters and the comment line included, were checked against real
+`dot`.
 
 **The collapse is keyed on `(group, *eventDef)`, never on the event name.**
 Two events can share a name, so counting rows by name merges two group
