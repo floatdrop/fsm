@@ -71,7 +71,7 @@ type builder[S comparable] struct {
 
 	// Targets of the group transitions declared so far, so that one declared
 	// twice reads as a duplicate rather than as a group clashing with itself.
-	groupEdges map[groupEdge]S
+	groupEdges map[groupEdge]string // what the first declaration does
 }
 
 // groupEdge identifies one group transition, before it expands to a row per
@@ -82,9 +82,10 @@ type groupEdge struct {
 }
 
 type decl[S comparable] struct {
-	key     edge[S]
-	to      S
-	payload any // (*A)(nil) for the event's payload type A
+	key      edge[S]
+	to       S
+	internal bool // an internal transition enters and leaves nothing
+	payload  any  // (*A)(nil) for the event's payload type A
 }
 
 // payloadToken identifies a payload type without reflect: two typed nil
@@ -106,10 +107,11 @@ func New[S comparable](name string, rules ...Rule[S]) (*Machine[S], error) {
 			onExit:     make(map[S][]Hook[S]),
 			onEnterVia: make(map[edge[S]][]any),
 			onExitVia:  make(map[edge[S]][]any),
+			internal:   make(map[edge[S]]bool),
 		},
 		seen:       make(map[S]bool),
 		inherited:  make(map[edge[S]]string),
-		groupEdges: make(map[groupEdge]S),
+		groupEdges: make(map[groupEdge]string),
 	}
 
 	b.apply("rule", rules)
@@ -224,10 +226,28 @@ type OnStep[S comparable, A any] struct {
 // A self-transition — To naming the state On came from — is allowed and runs
 // the full sequence: the exit hooks of the state, the assignment, then its
 // entry hooks. That is UML's external self-transition, and it means a counter
-// kept by those hooks decrements and increments back to where it was. There is no
-// internal transition that skips the hooks; use an [ToStep.Action] for that.
+// kept by those hooks decrements and increments back to where it was. For an
+// event handled without leaving the state, see [OnStep.Stay].
 func (o OnStep[S, A]) To(to S) *ToStep[S, A] {
 	return &ToStep[S, A]{froms: o.froms, group: o.group, ev: o.ev, to: to}
+}
+
+// Stay completes the transition as an internal one: the state takes the
+// event and stays where it is, UML's internal transition.
+//
+//	fsm.From(follower).On(evHeartbeat).Stay().Action(recordLeader)
+//
+// Its guards and actions run as on any transition, and [Machine.Fire]
+// returns a Transition from the state to itself; but the state is not left,
+// so no hook runs, [OnTransition] included. That is what an external
+// self-transition, To naming its own source, cannot do. From [FromEach] or
+// [FromGroup], each source stays in itself.
+//
+// An internal transition is still a transition: it is what the state does
+// with the event, rather than refuse it. It is not a way out, so it does not
+// keep the state out of [Machine.Terminals].
+func (o OnStep[S, A]) Stay() *ToStep[S, A] {
+	return &ToStep[S, A]{froms: o.froms, group: o.group, ev: o.ev, internal: true}
 }
 
 // ToStep is a complete transition, optionally carrying guards and actions.
@@ -236,14 +256,15 @@ func (o OnStep[S, A]) To(to S) *ToStep[S, A] {
 // Its methods mutate and return the same value, so a guard attached to a
 // stored ToStep takes effect whether or not the result is reassigned.
 type ToStep[S comparable, A any] struct {
-	froms   []S
-	group   *Group[S]
-	to      S
-	ev      Event[A]
-	guards  []func(context.Context, A) error
-	descs   []string
-	actions []func(context.Context, A) error
-	errs    []error
+	froms    []S
+	group    *Group[S]
+	to       S
+	internal bool // declared with Stay: each source keeps its state
+	ev       Event[A]
+	guards   []func(context.Context, A) error
+	descs    []string
+	actions  []func(context.Context, A) error
+	errs     []error
 }
 
 // Guard rejects the transition when f returns a non-nil error. The error is
@@ -292,10 +313,11 @@ func (t *ToStep[S, A]) applyTo(b *builder[S]) {
 	}
 
 	r := row[S]{
-		to:      t.to,
-		ev:      t.ev.def,
-		payload: payloadToken[A](),
-		desc:    joinDescs(t.descs),
+		to:       t.to,
+		internal: t.internal,
+		ev:       t.ev.def,
+		payload:  payloadToken[A](),
+		desc:     joinDescs(t.descs),
 	}
 	r.guard, r.action = t.combine()
 
@@ -309,9 +331,9 @@ func (t *ToStep[S, A]) applyTo(b *builder[S]) {
 	}
 
 	for _, s := range t.froms {
-		if prev, dup := b.m.table[edge[S]{from: s, ev: r.ev}]; dup {
-			b.errs = append(b.errs, fmt.Errorf("duplicate transition from %v on %s: already goes to %v, redeclared to %v",
-				s, r.ev.name, prev, t.to))
+		if _, dup := b.m.table[edge[S]{from: s, ev: r.ev}]; dup {
+			b.errs = append(b.errs, fmt.Errorf("duplicate transition from %v on %s: already %s, redeclared to %s",
+				s, r.ev.name, b.does(edge[S]{from: s, ev: r.ev}), t.redeclared()))
 			continue
 		}
 		r.from = s
@@ -331,15 +353,17 @@ func (t *ToStep[S, A]) expandGroup(b *builder[S], r row[S], where string) {
 	gk := groupEdge{group: g.name, ev: r.ev}
 	if prev, dup := b.groupEdges[gk]; dup {
 		b.errs = append(b.errs, fmt.Errorf(
-			"duplicate transition from group %s on %s: already goes to %v, redeclared to %v",
-			g.name, r.ev.name, prev, t.to))
+			"duplicate transition from group %s on %s: already %s, redeclared to %s",
+			g.name, r.ev.name, prev, t.redeclared()))
 		return
 	}
-	b.groupEdges[gk] = t.to
+	b.groupEdges[gk] = t.does()
 
 	// The target is a state of the machine whether or not any member ends up
 	// inheriting the edge, and declaring it now lets member validation see it.
-	b.declare(t.to)
+	if !t.internal {
+		b.declare(t.to)
+	}
 
 	b.expand = append(b.expand, func(b *builder[S]) {
 		var inherited, clashes int
@@ -401,16 +425,46 @@ func (t *ToStep[S, A]) combine() (guard, action any) {
 }
 
 // describe names the rule in error messages: one source prints as a -> b,
-// several as [a b] -> c.
+// several as [a b] -> c, and an internal transition as internal transition a.
 func (t *ToStep[S, A]) describe() string {
+	var from string
 	switch {
 	case t.group != nil:
-		return fmt.Sprintf("transition group %s -> %v", t.group.name, t.to)
+		from = "group " + t.group.name
 	case len(t.froms) == 1:
-		return fmt.Sprintf("transition %v -> %v", t.froms[0], t.to)
+		from = fmt.Sprint(t.froms[0])
 	default:
-		return fmt.Sprintf("transition %v -> %v", t.froms, t.to)
+		from = fmt.Sprint(t.froms)
 	}
+	if t.internal {
+		return "internal transition " + from
+	}
+	return fmt.Sprintf("transition %s -> %v", from, t.to)
+}
+
+// does and redeclared say what the transition does, for a duplicate's error
+// message: "already goes to b, redeclared to c", "already stays, redeclared
+// to c", "already goes to b, redeclared to stay".
+func (t *ToStep[S, A]) does() string {
+	if t.internal {
+		return "stays"
+	}
+	return fmt.Sprintf("goes to %v", t.to)
+}
+
+func (t *ToStep[S, A]) redeclared() string {
+	if t.internal {
+		return "stay"
+	}
+	return fmt.Sprint(t.to)
+}
+
+// does says what the registered row e does, as ToStep.does.
+func (b *builder[S]) does(e edge[S]) string {
+	if b.m.internal[e] {
+		return "stays"
+	}
+	return fmt.Sprintf("goes to %v", b.m.table[e])
 }
 
 // row is one line of the transition table. Its fields are named because a
@@ -418,6 +472,7 @@ func (t *ToStep[S, A]) describe() string {
 // and easy to transpose.
 type row[S comparable] struct {
 	from, to S
+	internal bool // to is from, and no hook runs
 	ev       *eventDef
 	guard    any // func(context.Context, A) (string, error)
 	action   any // func(context.Context, A) error
@@ -428,9 +483,15 @@ type row[S comparable] struct {
 
 // register adds one row to the transition table.
 func (b *builder[S]) register(r row[S]) {
+	if r.internal {
+		r.to = r.from
+	}
 	e := edge[S]{from: r.from, ev: r.ev}
 	b.m.table[e] = r.to
-	b.decls = append(b.decls, decl[S]{key: e, to: r.to, payload: r.payload})
+	if r.internal {
+		b.m.internal[e] = true
+	}
+	b.decls = append(b.decls, decl[S]{key: e, to: r.to, internal: r.internal, payload: r.payload})
 	b.declare(r.from)
 	b.declare(r.to)
 
@@ -441,7 +502,7 @@ func (b *builder[S]) register(r row[S]) {
 		b.m.actions[e] = r.action
 	}
 	b.m.edges = append(b.m.edges, Edge[S]{
-		From: r.from, To: r.to, Guard: r.desc, Group: r.group, trigger: r.ev,
+		From: r.from, To: r.to, Guard: r.desc, Group: r.group, Internal: r.internal, trigger: r.ev,
 	})
 }
 
@@ -470,7 +531,8 @@ func OnExit[S comparable](s S, h Hook[S]) Rule[S] {
 	})
 }
 
-// OnTransition declares a hook that runs after every transition, just after
+// OnTransition declares a hook that runs after every transition that leaves
+// a state — every one but an internal transition ([OnStep.Stay]) — just after
 // the assignment and before the entry hooks of the new state, so an entry
 // hook that fires the machine again is logged after the transition that
 // caused it. It is where an audit log or a trace that must see every change
@@ -545,7 +607,7 @@ func OnEnterVia[S comparable, A any](s S, ev Event[A], h func(context.Context, T
 		}
 		k := edge[S]{from: s, ev: ev.def}
 		b.m.onEnterVia[k] = append(b.m.onEnterVia[k], h)
-		b.requireVia("OnEnterVia", "enters", s, ev.def, func(d decl[S]) bool { return d.to == s })
+		b.requireVia("OnEnterVia", "enters", s, ev.def, func(d decl[S]) bool { return d.to == s && !d.internal })
 	})
 }
 
@@ -560,7 +622,7 @@ func OnExitVia[S comparable, A any](s S, ev Event[A], h func(context.Context, Tr
 		}
 		k := edge[S]{from: s, ev: ev.def}
 		b.m.onExitVia[k] = append(b.m.onExitVia[k], h)
-		b.requireVia("OnExitVia", "leaves", s, ev.def, func(d decl[S]) bool { return d.key.from == s })
+		b.requireVia("OnExitVia", "leaves", s, ev.def, func(d decl[S]) bool { return d.key.from == s && !d.internal })
 	})
 }
 
@@ -618,7 +680,7 @@ func (b *builder[S]) requireVia(what, verb string, s S, def *eventDef, match fun
 // It runs after the plain and the [OnEnterVia] entry hooks of the same state.
 func OnEnterWith[S comparable, A any](s S, h func(context.Context, Transition[S], A)) Rule[S] {
 	return ruleFunc[S](func(b *builder[S]) {
-		b.attachWith("OnEnterWith", "enters", s, h, b.m.onEnterVia, func(d decl[S]) bool { return d.to == s })
+		b.attachWith("OnEnterWith", "enters", s, h, b.m.onEnterVia, func(d decl[S]) bool { return d.to == s && !d.internal })
 	})
 }
 
@@ -628,7 +690,7 @@ func OnEnterWith[S comparable, A any](s S, h func(context.Context, Transition[S]
 // the same state, and still before the state changes.
 func OnExitWith[S comparable, A any](s S, h func(context.Context, Transition[S], A)) Rule[S] {
 	return ruleFunc[S](func(b *builder[S]) {
-		b.attachWith("OnExitWith", "leaves", s, h, b.m.onExitVia, func(d decl[S]) bool { return d.key.from == s })
+		b.attachWith("OnExitWith", "leaves", s, h, b.m.onExitVia, func(d decl[S]) bool { return d.key.from == s && !d.internal })
 	})
 }
 
@@ -760,6 +822,10 @@ type Edge[S comparable] struct {
 	// member, so this is what tells the expansion apart from N hand-written
 	// rows.
 	Group string
+
+	// Internal is set on an internal transition, declared with
+	// [OnStep.Stay]: To is From, and no hook runs.
+	Internal bool
 
 	trigger *eventDef
 }

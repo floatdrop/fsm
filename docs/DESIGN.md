@@ -325,8 +325,31 @@ if tr.Is(evPcpKick) { … }
 
 `From(a).On(ev).To(a)` is allowed, and is UML's *external* self-transition: it
 runs the exit hooks, assigns, then runs the entry hooks. A counter kept by those
-hooks therefore dips to zero and comes back. There is no internal transition
-that skips the hooks; an `Action` covers that case.
+hooks therefore dips to zero and comes back.
+
+### Internal transitions run no hook
+
+`From(a).On(ev).Stay()` is UML's *internal* transition: guards and actions
+run, the state is not left, and no hook runs — `OnTransition` included, since
+nothing changed. It is a separate declaration, not a reading of `To(a)`, so an
+external self-transition keeps its meaning.
+
+This package once held that an `Action` covered the case. It does not: an
+action runs only as part of a transition, and the one transition that keeps
+the state, `To(a)`, runs the hooks. So an event a state handles without
+leaving it went around the machine, as code beside it, and the table stopped
+saying what the state accepts. A Raft elector shows how much that is: granting
+a vote, counting one, a follower's heartbeat and a leader's acks are the
+events it sees most, and none of them moves it. With `Stay` they are rows
+again: `NoTransitionError` means the state refuses the event rather than
+"handled elsewhere", `Check` and `Can` answer for them, and `DOT` draws them.
+
+An internal transition enters and leaves nothing, so it is not a way out
+(`Terminals` keeps a state that has only these), and it triggers no Via or
+With hook — one that only an internal transition could trigger is rejected
+as never running. `Fire` checks for one only inside its hook block, so a
+machine without hooks pays nothing for the feature, and one without internal
+transitions pays a length check.
 
 ## Fire does not allocate
 

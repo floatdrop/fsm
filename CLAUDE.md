@@ -248,7 +248,15 @@ before and after touching the fire path.
 **Self-transitions are UML's external kind.** `From(a).On(ev).To(a)` runs
 exit then entry, so a counter kept by those hooks dips and returns. Pinned by
 `TestSelfTransitionRunsExitAndEntry`; do not turn it into an internal
-transition that skips the hooks.
+transition that skips the hooks. The internal kind is its own declaration,
+`From(a).On(ev).Stay()`: guards and actions run, then `Fire` returns before
+any hook, `OnTransition` included (`TestStayRunsGuardsAndActionsButNoHook`).
+`Machine.internal` holds those rows, and `Fire` and `apply` look it up only
+inside the hook block, behind a length check, so a hookless machine pays
+nothing. An internal row is registered with `to` set to its source, which
+keeps `To`, `Check` and the fuzzer's Fire-agrees-with-To invariant uniform,
+but it is not a way out (`Terminals` skips it) and it enters and leaves
+nothing (`decl.internal` keeps it out of every Via and With hook).
 
 **Declaration order is the output order.** `Machine.states` and `Machine.edges`
 are slices kept alongside the maps purely so `States`, `Edges`, `Terminals` and
@@ -284,11 +292,12 @@ thing there is to test against, and that is the right target anyway.
   state closes over the shared `st`.
 - **`FuzzMachineInvariants` covers what nobody wrote down.** It builds a
   machine from fuzzed `(source, event, target)` rows — sources are the four
-  states plus two groups overlapping on `running`, and two of the three events
-  share the name `a` — then asserts what must hold for any definition `New`
-  accepted: `DOT` is deterministic, every edge endpoint is in `States()`, an
+  states plus two groups overlapping on `running`, targets the four states or
+  `Stay`, and two of the three events share the name `a` — then asserts what
+  must hold for any definition `New` accepted: `DOT` is deterministic, every
+  edge endpoint is in `States()`, an internal edge loops on its source, an
   inherited edge names a group that `Has` its source, `Events()` repeats no
-  name, `Terminals()` is exactly the states with no outgoing edge,
+  name, `Terminals()` is exactly the states with no outgoing external edge,
   `Unreachable` is closed under the edge relation, a declared `Initial` leaves
   nothing unreachable and is not terminal, and `Fire` agrees with `To` on every
   pair — failing without moving the state.
@@ -298,7 +307,9 @@ thing there is to test against, and that is the right target anyway.
   systematically, and each one makes `New` return an error, which skips the
   whole invariant block: unfiltered, acceptance at the ~200-byte inputs the
   engine actually generates is **0%**, so the fuzzer only ever exercised
-  `New`'s error paths. Filtered it is ~87%. Measure acceptance before changing
+  `New`'s error paths. Filtered it is ~79% (it was ~87% before internal
+  targets, which add no reachability, so more definitions leave a state
+  unreachable from their start). Measure acceptance before changing
   the generator, and keep the three named tests that cover those errors.
 - **A fuzz failure is a reproducer worth keeping.** Go writes it to
   `testdata/fuzz` and prints only the path, so CI uploads that directory as an
