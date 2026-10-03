@@ -3009,6 +3009,134 @@ func TestGroupDOTKeepsPerMemberEdgesForOverlappingGroups(t *testing.T) {
 	}
 }
 
+// A group inside another is drawn inside its cluster, and each state in the
+// innermost cluster that holds it; a boundary arrow may leave the inner one.
+func TestGroupDOTNestsAContainedGroup(t *testing.T) {
+	t.Parallel()
+
+	outer := fsm.NewGroup("outer", idle, running, done)
+	inner := fsm.NewGroup("inner", running, done)
+	m, err := fsm.New("nested",
+		fsm.Initial(idle),
+		fsm.From(idle).On(evStart).To(running),
+		fsm.From(running).On(evFinish).To(done),
+		fsm.FromGroup(inner).On(evCancel).To(idle),
+		fsm.FromGroup(outer).On(evStart).To(cancelled),
+		inner,
+	)
+	if err != nil {
+		t.Fatalf("build: %v", err)
+	}
+	want := `digraph "nested" {
+	rankdir=LR;
+	compound=true;
+	"__start" [shape=point];
+	subgraph "cluster_outer" {
+		label="outer";
+		style=rounded;
+		subgraph "cluster_inner" {
+			label="inner";
+			style=rounded;
+			"running" [shape=box];
+			"done" [shape=box];
+		}
+		"idle" [shape=box];
+	}
+	"cancelled" [shape=doublecircle];
+	"__start" -> "idle";
+	"idle" -> "running" [label="start"];
+	"running" -> "done" [label="finish"];
+	"running" -> "idle" [label="cancel", ltail="cluster_inner"];
+	"running" -> "cancelled" [label="start"];
+	"done" -> "cancelled" [label="start"];
+}
+`
+	if got := m.DOT(); got != want {
+		t.Errorf("DOT\n%s\nwant\n%s", got, want)
+	}
+}
+
+// A group that partly overlaps an earlier one cannot be drawn as a cluster
+// without showing other members than it has: it is left out, with a
+// comment, and its inherited edges are drawn per member.
+func TestGroupDOTSkipsACrossingGroup(t *testing.T) {
+	t.Parallel()
+
+	first := fsm.NewGroup("first", idle, running)
+	second := fsm.NewGroup("second", running, done)
+	m, err := fsm.New("crossing",
+		first,
+		fsm.From(idle).On(evStart).To(running),
+		fsm.From(running).On(evFinish).To(done),
+		fsm.FromGroup(second).On(evCancel).To(cancelled),
+	)
+	if err != nil {
+		t.Fatalf("build: %v", err)
+	}
+	want := `digraph "crossing" {
+	rankdir=LR;
+	compound=true;
+	subgraph "cluster_first" {
+		label="first";
+		style=rounded;
+		"idle" [shape=box];
+		"running" [shape=box];
+	}
+	// group second overlaps another without containing it, so it is not drawn as a cluster
+	"done" [shape=box];
+	"cancelled" [shape=doublecircle];
+	"idle" -> "running" [label="start"];
+	"running" -> "done" [label="finish"];
+	"running" -> "cancelled" [label="cancel"];
+	"done" -> "cancelled" [label="cancel"];
+}
+`
+	if got := m.DOT(); got != want {
+		t.Errorf("DOT\n%s\nwant\n%s", got, want)
+	}
+}
+
+// Two groups with the same members nest by declaration order: the later
+// inside the earlier, the members inside both.
+func TestGroupDOTNestsTwinGroups(t *testing.T) {
+	t.Parallel()
+
+	a := fsm.NewGroup("a", running, done)
+	b := fsm.NewGroup("b", running, done)
+	m, err := fsm.New("twins",
+		a, b,
+		fsm.From(idle).On(evStart).To(running),
+		fsm.From(running).On(evFinish).To(done),
+		fsm.FromGroup(b).On(evCancel).To(cancelled),
+	)
+	if err != nil {
+		t.Fatalf("build: %v", err)
+	}
+	want := `digraph "twins" {
+	rankdir=LR;
+	compound=true;
+	subgraph "cluster_a" {
+		label="a";
+		style=rounded;
+		subgraph "cluster_b" {
+			label="b";
+			style=rounded;
+			"running" [shape=box];
+			"done" [shape=box];
+		}
+	}
+	"idle" [shape=box];
+	"cancelled" [shape=doublecircle];
+	"idle" -> "running" [label="start"];
+	"running" -> "done" [label="finish"];
+	"running" -> "cancelled" [label="cancel", ltail="cluster_b"];
+}
+`
+	if got := m.DOT(); got != want {
+		t.Errorf("DOT\n%s\nwant\n%s", got, want)
+	}
+}
+
 // A target inside the group would make the boundary arrow a self-loop out of
 // its own cluster, which Graphviz refuses.
 func TestGroupDOTKeepsPerMemberEdgesWhenTargetIsAMember(t *testing.T) {

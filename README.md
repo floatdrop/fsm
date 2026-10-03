@@ -425,7 +425,7 @@ digraph "recording" {
   <img src="docs/assets/recording.svg" alt="a start dot pointing at active, active to stopped on stop, stopped to finished on finish guarded by all chunks and tracks uploaded, finished to uploaded" width="720">
 </p>
 
-A boundary arrow is drawn only when it would be accurate — per-member arrows are used when a member overrides the event, when overlapping groups cannot both hold all their members, or when the target is itself a member. Output follows declaration order, so it can be committed next to the code and diffed.
+A group inside another is drawn inside its cluster. A group that partly overlaps an earlier one cannot be drawn as a cluster without boxing the wrong states, so it gets none, and a comment in the output says so. A boundary arrow is drawn only when it would be accurate — per-member arrows are used when a member overrides the event, when the group has no cluster, or when the target is itself a member. Output follows declaration order, so it can be committed next to the code and diffed.
 
 ## Performance
 

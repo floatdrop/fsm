@@ -106,34 +106,63 @@ func (m *Machine[S]) DOT() string {
 		fmt.Fprintf(&b, "%s\"%s\" [shape=%s];\n", indent, dotEscape(fmt.Sprint(s)), shape)
 	}
 
-	// Graphviz puts a node in one cluster, so a state in overlapping groups is
-	// drawn in the first that claims it.
+	// Graphviz puts a node in one cluster, and nests clusters, so groups
+	// that are disjoint or contain one another are drawn as they are, a
+	// group inside the smallest that contains it and a state inside the
+	// smallest group that holds it. A group that partly overlaps an earlier
+	// drawn one cannot be: it gets no cluster, and a comment says so.
+	drawn := m.drawableGroups()
+	parent := make(map[string]string, len(drawn))
 	owner := make(map[S]string, len(m.states))
-	for _, g := range m.groups {
-		fmt.Fprintf(&b, "\tsubgraph \"cluster_%s\" {\n", dotEscape(g.name))
-		fmt.Fprintf(&b, "\t\tlabel=\"%s\";\n", dotEscape(g.name))
-		b.WriteString("\t\tstyle=rounded;\n")
-		for _, s := range g.members {
-			if _, taken := owner[s]; taken {
-				continue
-			}
-			owner[s] = g.name
-			node("\t\t", s)
+	for _, g := range drawn {
+		if h, ok := innermost(drawn, g.members, g.name); ok {
+			parent[g.name] = h
 		}
-		b.WriteString("\t}\n")
 	}
 	for _, s := range m.states {
-		if _, taken := owner[s]; !taken {
+		if h, ok := innermost(drawn, []S{s}, ""); ok {
+			owner[s] = h
+		}
+	}
+	var cluster func(g Group[S], indent string)
+	cluster = func(g Group[S], indent string) {
+		fmt.Fprintf(&b, "%ssubgraph \"cluster_%s\" {\n", indent, dotEscape(g.name))
+		fmt.Fprintf(&b, "%s\tlabel=\"%s\";\n", indent, dotEscape(g.name))
+		fmt.Fprintf(&b, "%s\tstyle=rounded;\n", indent)
+		for _, h := range drawn {
+			if parent[h.name] == g.name {
+				cluster(h, indent+"\t")
+			}
+		}
+		for _, s := range g.members {
+			if owner[s] == g.name {
+				node(indent+"\t", s)
+			}
+		}
+		fmt.Fprintf(&b, "%s}\n", indent)
+	}
+	for _, g := range drawn {
+		if _, inner := parent[g.name]; !inner {
+			cluster(g, "\t")
+		}
+	}
+	for _, g := range m.groups {
+		if !slices.ContainsFunc(drawn, func(h Group[S]) bool { return h.name == g.name }) {
+			fmt.Fprintf(&b, "\t// group %s overlaps another without containing it, so it is not drawn as a cluster\n",
+				commentReplacer.Replace(g.name))
+		}
+	}
+	for _, s := range m.states {
+		if _, grouped := owner[s]; !grouped {
 			node("\t", s)
 		}
 	}
 
 	// A cluster can only be the tail of an edge if it really holds every one
-	// of its members; an overlapping group that lost some to an earlier
-	// cluster cannot, and Graphviz would drop the ltail with a warning.
-	whole := make(map[string]bool, len(m.groups))
-	for _, g := range m.groups {
-		whole[g.name] = !slices.ContainsFunc(g.members, func(s S) bool { return owner[s] != g.name })
+	// of its members, which a drawn group does, nested clusters included.
+	whole := make(map[string]bool, len(drawn))
+	for _, g := range drawn {
+		whole[g.name] = true
 	}
 
 	// Rows are counted per group transition, identified by the group and the
@@ -159,7 +188,7 @@ func (m *Machine[S]) DOT() string {
 	if m.hasInitial {
 		fmt.Fprintf(&b, "\t\"%s\" -> \"%s\";\n", start, dotEscape(fmt.Sprint(m.initial)))
 	}
-	drawn := make(map[boundary]bool)
+	collapsed := make(map[boundary]bool)
 	for _, e := range m.edges {
 		// The guard is appended after escaping so that the \n stays a
 		// Graphviz line break rather than becoming a literal backslash-n.
@@ -174,10 +203,10 @@ func (m *Machine[S]) DOT() string {
 		}
 		if e.Group != "" && collapsible(e, byName[e.Group], rows[of(e)], whole[e.Group]) {
 			k := of(e)
-			if drawn[k] {
+			if collapsed[k] {
 				continue
 			}
-			drawn[k] = true
+			collapsed[k] = true
 			attrs = fmt.Sprintf(`, ltail="cluster_%s"`, dotEscape(e.Group))
 		}
 		fmt.Fprintf(&b, "\t\"%s\" -> \"%s\" [label=\"%s\"%s];\n",
@@ -186,6 +215,53 @@ func (m *Machine[S]) DOT() string {
 
 	b.WriteString("}\n")
 	return b.String()
+}
+
+// drawableGroups returns the groups that can be drawn as clusters, in
+// declaration order: each one disjoint from, inside, or around every earlier
+// one drawn. One that partly overlaps an earlier one is left out.
+func (m *Machine[S]) drawableGroups() []Group[S] {
+	var out []Group[S]
+	for _, g := range m.groups {
+		if !slices.ContainsFunc(out, func(h Group[S]) bool { return crosses(g, h) }) {
+			out = append(out, g)
+		}
+	}
+	return out
+}
+
+// crosses reports whether g and h share a member while neither holds all of
+// the other's, which no nesting of clusters can draw.
+func crosses[S comparable](g, h Group[S]) bool {
+	shared := slices.ContainsFunc(g.members, h.Has)
+	return shared && !subset(g.members, h) && !subset(h.members, g)
+}
+
+func subset[S comparable](ss []S, g Group[S]) bool {
+	return !slices.ContainsFunc(ss, func(s S) bool { return !g.Has(s) })
+}
+
+// innermost names the smallest group of drawn holding all of ss, other
+// than self, and reports whether there is one. Between two groups with the
+// same members, the later declared is inside the earlier, so a group with
+// a twin holds it only if declared before self.
+func innermost[S comparable](drawn []Group[S], ss []S, self string) (string, bool) {
+	best, found := -1, false
+	for i, h := range drawn {
+		if h.name == self || !subset(ss, h) {
+			continue
+		}
+		if self != "" && len(h.members) == len(ss) && slices.IndexFunc(drawn, func(x Group[S]) bool { return x.name == self }) < i {
+			continue // a twin declared after self is inside it, not around it
+		}
+		if !found || len(h.members) <= len(drawn[best].members) {
+			best, found = i, true
+		}
+	}
+	if !found {
+		return "", false
+	}
+	return drawn[best].name, true
 }
 
 // collapsible reports whether e may be drawn once from its cluster's boundary
@@ -200,6 +276,9 @@ func (m *Machine[S]) DOT() string {
 func collapsible[S comparable](e Edge[S], g Group[S], rows int, whole bool) bool {
 	return whole && rows == len(g.members) && !g.Has(e.To)
 }
+
+// commentReplacer keeps a name on its line in a // comment.
+var commentReplacer = strings.NewReplacer("\n", " ", "\r", " ")
 
 // dotReplacer makes a string safe inside double quotes in Graphviz.
 var dotReplacer = strings.NewReplacer(`\`, `\\`, `"`, `\"`, "\n", `\n`)
