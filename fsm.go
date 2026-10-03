@@ -164,14 +164,14 @@ type Machine[S comparable] struct {
 	initial    S
 	hasInitial bool
 
-	// Declaration order, kept so that introspection and DOT output are
+	// Declaration order, kept so that introspection and the diagrams are
 	// deterministic rather than map-iteration order.
 	states []S
 	edges  []Edge[S]
 	groups []Group[S]
 }
 
-// Name returns the machine's name, used in error messages and DOT output.
+// Name returns the machine's name, used in error messages and diagrams.
 func (m *Machine[S]) Name() string { return m.name }
 
 // Fire applies ev to the state pointed to by st and returns the transition

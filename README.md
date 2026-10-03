@@ -150,7 +150,7 @@ fsm.From(recStopped).On(evRecFinish).To(recFinished).
 	Action(sealManifest)
 ```
 
-**Guards** run in registration order and the first rejection wins. The description is the static condition — it names the guard in the error and labels the edge in [`DOT`](#dot); the returned error is why it failed *this time*, and `GuardError` unwraps to it, so `errors.Is(err, errUploadPending)` works.
+**Guards** run in registration order and the first rejection wins. The description is the static condition — it names the guard in the error and labels the edge in [`DOT`](#dot) and [`Mermaid`](#mermaid); the returned error is why it failed *this time*, and `GuardError` unwraps to it, so `errors.Is(err, errUploadPending)` works.
 
 An **action** runs after every guard passed and before the state moves; if it fails, nothing is assigned and no hook runs.
 
@@ -179,7 +179,7 @@ fsm.MustNew("recording",
 // panic: fsm recording: states [finished uploaded] cannot be reached from initial state active
 ```
 
-It is also what [`DOT`](#dot) draws the start marker from.
+It is also what [`DOT`](#dot) and [`Mermaid`](#mermaid) draw the start marker from.
 
 ## Firing
 
@@ -252,7 +252,7 @@ An event a state handles without leaving it — a heartbeat that refreshes a dea
 fsm.From(follower).On(evHeartbeat).Stay().Action(recordLeader)
 ```
 
-Guards and actions run as on any transition, and `Fire` returns a transition from the state to itself; the state is not left, so no hook runs, `OnTransition` included. Keeping such events in the table is what lets it say what each state accepts: a `NoTransitionError` still means the state refuses the event, `Check` and `Can` answer for it, and `DOT` draws it as a dashed loop. It is not a way out, so a state with only internal transitions is still in `Terminals()`.
+Guards and actions run as on any transition, and `Fire` returns a transition from the state to itself; the state is not left, so no hook runs, `OnTransition` included. Keeping such events in the table is what lets it say what each state accepts: a `NoTransitionError` still means the state refuses the event, `Check` and `Can` answer for it, and `DOT` draws it as a dashed loop, `Mermaid` as a line inside the state. It is not a way out, so a state with only internal transitions is still in `Terminals()`.
 
 ### Typed hooks
 
@@ -410,6 +410,8 @@ func TestRecordingShape(t *testing.T) {
 
 An unintended terminal is somewhere a value gets stuck; an unreachable state usually means a missing transition. Declaring `Initial` turns the second check into a build error.
 
+`DOT` and `Mermaid` draw the machine.
+
 `Edges` returns the table, guard descriptions included:
 
 ```go
@@ -451,6 +453,32 @@ digraph "recording" {
 </p>
 
 A group inside another is drawn inside its cluster. A group that partly overlaps an earlier one cannot be drawn as a cluster without boxing the wrong states, so it gets none, and a comment in the output says so. A boundary arrow is drawn only when it would be accurate — per-member arrows are used when a member overrides the event, when the group has no cluster, or when the target is itself a member. Output follows declaration order, so it can be committed next to the code and diffed.
+
+### Mermaid
+
+`Mermaid` renders the same diagram as a Mermaid state diagram, for a `mermaid` block in Markdown, which GitHub draws in place. Groups are composite states, nested, left out and drawn from as `DOT` draws its clusters; an internal transition is a line inside its state, below the name; `[*]` points at the initial state, and a terminal points at `[*]`. This is `participantFSM` from [Groups](#groups):
+
+```mermaid
+---
+title: "participant"
+---
+stateDiagram-v2
+    direction LR
+    state "live" as g0 {
+        s0
+        s1
+    }
+    s0 : connected
+    s1 : reconnecting
+    s2 : deleted
+    [*] --> s0
+    s0 --> s1 : disconnect<br>[disconnect was not intentional]
+    s1 --> s0 : reconnect
+    g0 --> s2 : kick
+    s2 --> [*]
+```
+
+A block in a README goes stale as the machine changes; a test that compares it with `Mermaid()` keeps it honest. States and groups are numbered by declaration order (`s0`, `g0`) and labelled with their names, so any name is safe: Mermaid's syntax characters are written as entity codes.
 
 ## Performance
 

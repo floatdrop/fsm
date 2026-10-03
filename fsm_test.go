@@ -3281,6 +3281,155 @@ func TestGroupRejectsARepeatedMember(t *testing.T) {
 	}
 }
 
+// --- Mermaid ---------------------------------------------------------------
+
+// Mermaid draws the groups DOT draws, as composite states nested the same
+// way, leaves out the one DOT leaves out with a comment, and draws a
+// boundary arrow from the inner group as DOT does.
+func TestMermaidDrawsGroupsAsDOTDoes(t *testing.T) {
+	t.Parallel()
+
+	outer := fsm.NewGroup("outer", idle, running, done)
+	inner := fsm.NewGroup("inner", running, done)
+	cross := fsm.NewGroup("cross", done, cancelled)
+	m, err := fsm.New("nested",
+		fsm.Initial(idle),
+		fsm.From(idle).On(evStart).To(running),
+		fsm.From(running).On(evFinish).To(done),
+		fsm.FromGroup(inner).On(evCancel).To(idle),
+		fsm.FromGroup(outer).On(evStart).To(cancelled),
+		cross,
+	)
+	if err != nil {
+		t.Fatalf("build: %v", err)
+	}
+	want := `---
+title: "nested"
+---
+stateDiagram-v2
+    direction LR
+    state "outer" as g1 {
+        state "inner" as g0 {
+            s1
+            s2
+        }
+        s0
+    }
+    %% group cross overlaps another without containing it, so it is not drawn as a composite state
+    s0 : idle
+    s1 : running
+    s2 : done
+    s3 : cancelled
+    [*] --> s0
+    s0 --> s1 : start
+    s1 --> s2 : finish
+    g0 --> s0 : cancel
+    s1 --> s3 : start
+    s2 --> s3 : start
+    s3 --> [*]
+`
+	if got := m.Mermaid(); got != want {
+		t.Errorf("Mermaid\n%s\nwant\n%s", got, want)
+	}
+}
+
+// An internal transition is a line inside its state, below the name, rather
+// than an arrow, and its guard follows the event on that line.
+func TestMermaidWritesInternalTransitionsInsideTheState(t *testing.T) {
+	t.Parallel()
+
+	m, err := fsm.New("job",
+		fsm.From(idle).On(evStart).To(running),
+		fsm.From(running).On(evFinish).Stay().Guard("positive", func(context.Context, int) error { return nil }),
+		fsm.From(running).On(evCancel).Stay(),
+	)
+	if err != nil {
+		t.Fatalf("build: %v", err)
+	}
+	want := `---
+title: "job"
+---
+stateDiagram-v2
+    direction LR
+    s0 : idle
+    s1 : running
+    s1 : finish [positive]
+    s1 : cancel
+    s0 --> s1 : start
+    s1 --> [*]
+`
+	if got := m.Mermaid(); got != want {
+		t.Errorf("Mermaid\n%s\nwant\n%s", got, want)
+	}
+}
+
+// On an arrow a guard goes below its event, as in DOT.
+func TestMermaidPutsAGuardBelowItsEvent(t *testing.T) {
+	t.Parallel()
+
+	m, err := fsm.New("job",
+		fsm.From(idle).On(evStart).To(running).Guard("ready", func(context.Context, fsm.Unit) error { return nil }),
+	)
+	if err != nil {
+		t.Fatalf("build: %v", err)
+	}
+	if got, want := m.Mermaid(), "    s0 --> s1 : start<br>[ready]\n"; !strings.Contains(got, want) {
+		t.Errorf("Mermaid lacks %q:\n%s", want, got)
+	}
+}
+
+// A machine with no Initial has no start; [*] is only ever where it ends.
+func TestMermaidDrawsNoStartWithoutInitial(t *testing.T) {
+	t.Parallel()
+
+	if got := linear(t).Mermaid(); strings.Contains(got, "[*] -->") {
+		t.Errorf("a machine without Initial is entered from [*]:\n%s", got)
+	}
+}
+
+// Names are written as Mermaid entity codes wherever Mermaid would read
+// them as syntax or markup, the comment for an undrawn group included, since
+// Mermaid applies a %%{ directive even there; they are kept on their line,
+// an empty one is a zero-width space rather than nothing, which Mermaid would
+// fill with the id, and the title is a quoted YAML string.
+func TestMermaidEscapesNames(t *testing.T) {
+	t.Parallel()
+
+	odd := fsm.Signal(`a --> b; c: 50% <i>"q"</i> #1 &amp;`)
+	m, err := fsm.New("we\"ird: \\ name\x1b",
+		fsm.From("a:b").On(odd).To("c\nd").Guard("x; y", func(context.Context, fsm.Unit) error { return nil }),
+		fsm.From("c\nd").On(odd).To(""),
+		fsm.NewGroup("g%%\n", "a:b"),
+		fsm.NewGroup("h\n", "a:b", "c\nd"),
+		fsm.NewGroup("x%%{init: {}}%%", "c\nd", ""),
+	)
+	if err != nil {
+		t.Fatalf("build: %v", err)
+	}
+	want := `---
+title: "we\"ird: \\ name\x1b"
+---
+stateDiagram-v2
+    direction LR
+    state "h " as g1 {
+        state "g#37;#37; " as g0 {
+            s0
+        }
+        s1
+    }
+    %% group x#37;#37;{init#58; {}}#37;#37; overlaps another without containing it, so it is not drawn as a composite state
+    s0 : a#58;b
+    s1 : c d
+    s2 : #8203;
+    s0 --> s1 : a --#62; b#59; c#58; 50#37; #60;i#62;#34;q#34;#60;/i#62; #35;1 #38;amp#59;<br>[x#59; y]
+    s1 --> s2 : a --#62; b#59; c#58; 50#37; #60;i#62;#34;q#34;#60;/i#62; #35;1 #38;amp#59;
+    s2 --> [*]
+`
+	if got := m.Mermaid(); got != want {
+		t.Errorf("Mermaid\n%s\nwant\n%s", got, want)
+	}
+}
+
 // --- Fuzz ------------------------------------------------------------------
 
 // Whatever table it is handed, a machine New accepted must keep the contract
@@ -3367,6 +3516,9 @@ func FuzzMachineInvariants(f *testing.F) {
 
 		if dot := m.DOT(); dot != m.DOT() {
 			t.Fatalf("DOT output varies between calls:\n%s", dot)
+		}
+		if mmd := m.Mermaid(); mmd != m.Mermaid() {
+			t.Fatalf("Mermaid output varies between calls:\n%s", mmd)
 		}
 
 		known, edges := m.States(), m.Edges()
@@ -3490,7 +3642,7 @@ func TestAMachineIsSafeToShareAcrossGoroutines(t *testing.T) {
 				// gauge nets to zero only if every leg ran.
 				_, start := m.Send(ctx, &st, evStart)
 				// Introspection reads the same tables Fire does.
-				_, _, _ = m.DOT(), m.Terminals(), m.Edges()
+				_, _, _, _ = m.DOT(), m.Mermaid(), m.Terminals(), m.Edges()
 				_, finish := m.Fire(ctx, &st, evFinish, 0)
 				_, cancel := m.Send(ctx, &st, evCancel)
 				if err := errors.Join(start, finish, cancel); err != nil {

@@ -185,6 +185,13 @@ than it has — and drawing it anyway, as this package once did, put a box
 around the wrong states. It gets no cluster, and a `//` comment in the output
 says why.
 
+`Mermaid` draws from the same layout: a group is a composite state, nested,
+left out and drawn from exactly where `DOT` has a cluster, so the two cannot
+disagree about which states a group holds. Its own choices follow UML's
+notation: an internal transition is a line in the state's box rather than a
+loop, since a loop reads as leaving and coming back, and a terminal leads to
+`[*]`, Mermaid's final state, rather than wearing a style a theme can lose.
+
 The count behind that decision is keyed on the trigger's identity, not its
 name. Keying on the name merges two same-named events into one group
 transition, and the arrow it collapses to covers neither of them. `Edge` keeps
@@ -374,7 +381,7 @@ saying what the state accepts. A Raft elector shows how much that is: granting
 a vote, counting one, a follower's heartbeat and a leader's acks are the
 events it sees most, and none of them moves it. With `Stay` they are rows
 again: `NoTransitionError` means the state refuses the event rather than
-"handled elsewhere", `Check` and `Can` answer for them, and `DOT` draws them.
+"handled elsewhere", `Check` and `Can` answer for them, and the diagrams draw them.
 
 An internal transition enters and leaves nothing, so it is not a way out
 (`Terminals` keeps a state that has only these), and it triggers no Via or

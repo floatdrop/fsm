@@ -15,7 +15,8 @@ chain through `On`/`To` with its `Guard`/`Action` methods, plus `Rules`,
 `Group`, `OnEnter`, `OnExit`, `OnEnterVia`, `OnExitVia`, `OnEnterWith`,
 `OnExitWith`, `OnTransition`, `Initial`, `Stay`, `OnEnterGroup`/`OnExitGroup` and
 their With variants, and `buildPlans`), `introspect.go` (`States`, `Events`, `Edges`,
-`Groups`, `Initial`, `Terminals`, `Unreachable`, `DOT`). Tests are
+`Groups`, `Initial`, `Terminals`, `Unreachable`, `DOT`, `Mermaid`, and the
+`layout` both diagrams draw groups from). Tests are
 `fsm_test.go` and the worked machines in `example_test.go`.
 
 ## Working rules
@@ -143,7 +144,7 @@ without measuring.
 
 **`Initial` is configuration, not state.** It records where a fresh instance
 starts so that `New` can reject an unreachable state or a dead start, and so
-`DOT` can draw the `__start` point. It must not grow into a `Machine.State()`;
+`DOT` can draw the `__start` point and `Mermaid` its `[*]`. It must not grow into a `Machine.State()`;
 see the first paragraph. The check runs in `b.deferred`, after group
 expansion, so inherited edges count as reachability, and is skipped when the
 definition already has errors, since a mistyped group member is a state that
@@ -233,6 +234,27 @@ mirroring `Transition.Event()`/`Transition.trigger`/`Transition.Is`.
 `compound=true` is only emitted when the machine has groups, which keeps the
 existing `ExampleMachine_DOT` output byte-identical.
 
+**`Mermaid` and `DOT` share one `layout`.** `layout` holds which groups are
+boxed (`drawableGroups`) and which are not (`unboxed`), how boxes nest
+(`parent`), the box holding each state (`owner`), and per edge whether it
+leaves a box's boundary (`tail`) or is covered by an arrow already drawn from
+it (`skip`); `nest` walks the boxes for either renderer, and `Edge.label`
+writes both renderers' edge labels. A rule about what may be drawn goes
+there, once, so the two diagrams cannot drift apart. Mermaid ids are
+positional — `sN` by `States()` order, `gN` by `Groups()` order — and names
+are only ever labels, written by `mermaidEscape` with entity codes (`#58;`)
+for every character Mermaid reads as syntax or markup, so no name can break
+the syntax: `&` because labels are HTML, `%` because Mermaid applies a
+`%%{…}%%` directive even inside a `%%` comment, which is why the comment for
+an unboxed group is escaped the same way. An empty name is a zero-width
+space, since Mermaid fills an empty label with the id. The title is
+`strconv.Quote`d, whose escapes YAML's double-quoted strings read. An
+internal transition is a description line in its state (`sN : ev [guard]`),
+the first line being the name, and a terminal leads to `[*]`. Every shape the
+tests pin was rendered with `@mermaid-js/mermaid-cli` (`mmdc`), edges between
+states in different composite states included, which Mermaid's docs call
+unsupported but it draws; re-check with it before changing the syntax.
+
 **A broken group reports one error, not a cascade.** `declareGroup` returns a
 bool and `expandGroup` bails on false, so an unnamed group, an empty one, or
 one listing a member twice does not also get reported as "every member
@@ -296,9 +318,9 @@ but it is not a way out (`Terminals` skips it) and it enters and leaves
 nothing (`decl.internal` keeps it out of every Via and With hook).
 
 **Declaration order is the output order.** `Machine.states` and `Machine.edges`
-are slices kept alongside the maps purely so `States`, `Edges`, `Terminals` and
-`DOT` never iterate a map. `S` is only `comparable`, not ordered, so there is
-nothing to sort by; first-seen order is the stable answer. `DOT` output is
+are slices kept alongside the maps purely so `States`, `Edges`, `Terminals`,
+`DOT` and `Mermaid` never iterate a map. `S` is only `comparable`, not ordered, so there is
+nothing to sort by; first-seen order is the stable answer. The diagrams are
 committed-and-diffable only as long as that holds.
 
 ## Tests
@@ -331,8 +353,9 @@ thing there is to test against, and that is the right target anyway.
   machine from fuzzed `(source, event, target)` rows — sources are the four
   states plus two groups overlapping on `running`, targets the four states or
   `Stay`, and two of the three events share the name `a` — then asserts what
-  must hold for any definition `New` accepted: `DOT` is deterministic, every
-  edge endpoint is in `States()`, an internal edge loops on its source, an
+  must hold for any definition `New` accepted: `DOT` and `Mermaid` are
+  deterministic, every edge endpoint is in `States()`, an internal edge loops
+  on its source, an
   inherited edge names a group that `Has` its source, `Events()` repeats no
   name, `Terminals()` is exactly the states with no outgoing external edge,
   `Unreachable` is closed under the edge relation, a declared `Initial` leaves
@@ -366,13 +389,14 @@ thing there is to test against, and that is the right target anyway.
   concrete-func assertion in `Fire` panics.
 - **`GuardError` unwraps to the guard's error**, so a guard can reject with a
   sentinel the caller matches with `errors.Is`. `Guard`'s `desc` is the
-  *static* condition — it labels the edge in `DOT` and names the guard in the
+  *static* condition — it labels the edge in the diagrams and names the guard in the
   message — and the returned error is the *dynamic* reason it did not hold this
   time. Keep both; they are not redundant.
 - **Examples are `Example` functions with verified `Output`.** `example_test.go`
   carries the two machines the design was drawn from, a recording lifecycle and
   a participant connection. They are tests, not prose: changing the API means
-  changing them, and `ExampleMachine_DOT` pins the exact rendering.
+  changing them, and `ExampleMachine_DOT` and `ExampleMachine_Mermaid` pin the
+  exact renderings.
 - **Events are prefixed `ev`; states take the plain domain prefix.** The rule
   exists because the natural names collide by tense — `recStop` the event
   beside `recStopped` the state, `pcpReconnect` beside `pcpReconnecting`. A
@@ -418,7 +442,8 @@ thing there is to test against, and that is the right target anyway.
   `looplab.FSM` is one object per entity, which is a different trade, not a
   slower implementation of the same one.
 - **Every Go block in `README.md` compiles.** The quick start is a whole
-  `main.go`, and its printed output, the `Edges` listing and the `DOT` block
+  `main.go`, and its printed output, the `Edges` listing, the `DOT` block and
+  the `mermaid` block (`ExampleMachine_Mermaid`'s output)
   are copied from a real run of that exact machine, which is the same machine
   `example_test.go` pins. Changing one means re-running all of them — extract
   the blocks, `go vet`, run, paste back.
