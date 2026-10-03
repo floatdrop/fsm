@@ -280,19 +280,26 @@ A machine whose hooks all need the aggregate — a controller, an elector — te
 
 ### Hooks that fire the machine
 
-An entry hook may fire the machine again, on the state it just entered: a start that fails can move straight back out. A package-level machine whose hook names it is an initialization cycle in Go, so build that one in `init`:
+An entry hook may fire the machine again, on the state it just entered: a start that fails can move straight back out. A package-level machine whose hook names it would be a variable initialized with itself, which Go rejects as an initialization cycle. Reach the machine through the payload instead — the aggregate holds the machine it runs on — and the variable stays a plain declaration:
 
 ```go
-var lifecycle *fsm.Machine[phase]
-
-func init() {
-	lifecycle = fsm.MustNew("singleton",
-		fsm.From(idle).On(evReconcile).To(starting),
-		fsm.From(starting).On(evStartFailed).To(idle),
-		fsm.OnEnterVia(starting, evReconcile, launch), // launch fires lifecycle when it cannot start
-	)
+type job struct {
+	phase   phase
+	machine *fsm.Machine[phase] // the machine it runs on, for hooks that fire it
 }
+
+var lifecycle = fsm.MustNew("job",
+	fsm.From(idle).On(evStart).To(starting),
+	fsm.From(starting).On(evStartFailed).To(idle),
+	fsm.OnEnterVia(starting, evStart, func(ctx context.Context, _ fsm.Transition[phase], j *job) {
+		if err := j.launch(); err != nil {
+			_, _ = j.machine.Fire(ctx, &j.phase, evStartFailed, j) // through the job, not by name
+		}
+	}),
+)
 ```
+
+Building the machine in `init` also compiles, but only hides the cycle from the compiler.
 
 ## Groups
 
