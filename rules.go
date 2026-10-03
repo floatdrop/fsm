@@ -596,7 +596,11 @@ func Initial[S comparable](s S) Rule[S] {
 			}
 			// A dead start makes every other state unreachable; report the cause.
 			if slices.Contains(b.m.Terminals(), s) {
-				b.errs = append(b.errs, fmt.Errorf("initial state %v has no outgoing transition", s))
+				if slices.ContainsFunc(b.m.edges, func(e Edge[S]) bool { return e.From == s }) {
+					b.errs = append(b.errs, fmt.Errorf("initial state %v has no way out: its transitions are all internal", s))
+				} else {
+					b.errs = append(b.errs, fmt.Errorf("initial state %v has no outgoing transition", s))
+				}
 				return
 			}
 			if u := b.m.Unreachable(s); len(u) > 0 {
@@ -824,13 +828,21 @@ func (b *builder[S]) attachGroupHooks() {
 	if len(b.groupHooks) == 0 {
 		return
 	}
-	bySize := func(asc bool) []groupHookDecl[S] {
+	// Groups from outermost to innermost: larger first, and of two the same
+	// size the one declared first, as DOT nests them. Entering runs their
+	// hooks in that order and leaving in its reverse, a group's own hooks in
+	// declaration order either way.
+	rank := func(g Group[S]) int {
+		return slices.IndexFunc(b.m.groups, func(h Group[S]) bool { return h.name == g.name })
+	}
+	byNesting := func(outerFirst bool) []groupHookDecl[S] {
 		out := slices.Clone(b.groupHooks)
 		slices.SortStableFunc(out, func(x, y groupHookDecl[S]) int {
-			if asc {
-				return cmp.Compare(len(x.group.members), len(y.group.members))
+			c := cmp.Or(cmp.Compare(len(y.group.members), len(x.group.members)), cmp.Compare(rank(x.group), rank(y.group)))
+			if !outerFirst {
+				c = -c
 			}
-			return cmp.Compare(len(y.group.members), len(x.group.members))
+			return c
 		})
 		return out
 	}
@@ -869,8 +881,8 @@ func (b *builder[S]) attachGroupHooks() {
 			}
 		}
 	}
-	attach(bySize(true), false)
-	attach(bySize(false), true)
+	attach(byNesting(false), false)
+	attach(byNesting(true), true)
 	if b.broken {
 		return // a broken rule may be what dropped the rows
 	}
