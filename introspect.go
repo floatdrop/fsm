@@ -35,14 +35,15 @@ func (m *Machine[S]) Events() []string {
 // Initial returns the state declared with [Initial], and false when none was.
 func (m *Machine[S]) Initial() (S, bool) { return m.initial, m.hasInitial }
 
-// Terminals returns the states with no outgoing transition.
+// Terminals returns the states with no outgoing transition. An internal
+// transition, declared with [OnStep.Stay], is not a way out.
 //
 // A machine's terminal set is worth asserting in a test: an unintended
 // terminal state is a state something can get stuck in.
 func (m *Machine[S]) Terminals() []S {
 	out := []S{}
 	for _, s := range m.states {
-		if !slices.ContainsFunc(m.edges, func(e Edge[S]) bool { return e.From == s }) {
+		if !slices.ContainsFunc(m.edges, func(e Edge[S]) bool { return e.From == s && !e.Internal }) {
 			out = append(out, s)
 		}
 	}
@@ -168,6 +169,9 @@ func (m *Machine[S]) DOT() string {
 		}
 
 		var attrs string
+		if e.Internal {
+			attrs = ", style=dashed" // handled in the state, which it does not leave
+		}
 		if e.Group != "" && collapsible(e, byName[e.Group], rows[of(e)], whole[e.Group]) {
 			k := of(e)
 			if drawn[k] {

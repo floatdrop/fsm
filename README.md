@@ -131,6 +131,7 @@ Each of these returns a `Rule[S]`, the single option type. Rules are plain value
 | `From(a).On(ev).To(b)` | one transition |
 | `FromEach(a, b).On(ev).To(c)` | the same transition from several sources |
 | `FromGroup(g).On(ev).To(c)` | a transition inherited by every member of a [group](#groups) |
+| `From(a).On(ev).Stay()` | an [internal transition](#internal-transitions): the event is handled in `a`, which it does not leave |
 | `OnEnter(s, h)` / `OnExit(s, h)` | [hooks](#hooks) around the assignment |
 | `OnEnterVia(s, ev, h)` / `OnExitVia(s, ev, h)` | hooks that see the payload of one event |
 | `OnEnterWith(s, h)` / `OnExitWith(s, h)` | hooks that see the payload of every event entering or leaving `s` |
@@ -241,6 +242,16 @@ The order inside `Fire` is fixed:
 > lookup → guards → action → the check that neither wrote the state → `OnExit(from)` → **assignment** → `OnTransition` → `OnEnter(to)`
 
 `OnTransition` precedes the entry hooks so an entry hook that fires again is logged after its cause; the price is that a transition hook must observe and not fire. A self-transition `From(a).On(ev).To(a)` is UML's *external* kind — it runs exit then entry.
+
+### Internal transitions
+
+An event a state handles without leaving it — a heartbeat that refreshes a deadline, a vote that is counted — is declared with `Stay`, UML's *internal* transition:
+
+```go
+fsm.From(follower).On(evHeartbeat).Stay().Action(recordLeader)
+```
+
+Guards and actions run as on any transition, and `Fire` returns a transition from the state to itself; the state is not left, so no hook runs, `OnTransition` included. Keeping such events in the table is what lets it say what each state accepts: a `NoTransitionError` still means the state refuses the event, `Check` and `Can` answer for it, and `DOT` draws it as a dashed loop. It is not a way out, so a state with only internal transitions is still in `Terminals()`.
 
 ### Typed hooks
 

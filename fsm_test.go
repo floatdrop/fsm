@@ -735,18 +735,27 @@ func TestEntryAndExitHooksStayPaired(t *testing.T) {
 	}
 }
 
+// A source takes an event one way: a second declaration, external or
+// internal, is reported with what each would do.
 func TestBuildRejectsDuplicateTransition(t *testing.T) {
 	t.Parallel()
 
-	_, err := fsm.New("job",
-		fsm.From(idle).On(evStart).To(running),
-		fsm.From(idle).On(evStart).To(cancelled),
-	)
-	if err == nil {
-		t.Fatal("expected a duplicate-transition error")
-	}
-	if !strings.Contains(err.Error(), "duplicate transition") {
-		t.Errorf("error %q does not mention the duplicate", err)
+	for _, tc := range []struct {
+		name          string
+		first, second fsm.Rule[state]
+		want          string
+	}{
+		{"two targets", fsm.From(idle).On(evStart).To(running), fsm.From(idle).On(evStart).To(cancelled),
+			"fsm job: duplicate transition from idle on start: already goes to running, redeclared to cancelled"},
+		{"a target, then stay", fsm.From(idle).On(evStart).To(running), fsm.From(idle).On(evStart).Stay(),
+			"fsm job: duplicate transition from idle on start: already goes to running, redeclared to stay"},
+		{"stay, then a target", fsm.From(idle).On(evStart).Stay(), fsm.From(idle).On(evStart).To(running),
+			"fsm job: duplicate transition from idle on start: already stays, redeclared to running"},
+	} {
+		_, err := fsm.New("job", tc.first, tc.second, fsm.From(running).On(evFinish).To(done))
+		if err == nil || err.Error() != tc.want {
+			t.Errorf("%s: got %v, want %q", tc.name, err, tc.want)
+		}
 	}
 }
 
@@ -1435,6 +1444,196 @@ func TestFireRejectsANilStatePointer(t *testing.T) {
 	}
 }
 
+// --- Internal transitions -------------------------------------------------
+
+// Stay handles the event without leaving the state: guards and actions run
+// as on any transition, no hook does, and Fire reports a transition from the
+// state to itself.
+func TestStayRunsGuardsAndActionsButNoHook(t *testing.T) {
+	t.Parallel()
+
+	var log []string
+	note := func(what string) fsm.Hook[state] {
+		return func(context.Context, fsm.Transition[state]) { log = append(log, what) }
+	}
+	m, err := fsm.New("job",
+		fsm.From(idle).On(evStart).To(running),
+		fsm.From(running).On(evFinish).Stay().
+			Guard("positive", func(_ context.Context, n int) error {
+				if n <= 0 {
+					return errNever
+				}
+				return nil
+			}).
+			Action(func(_ context.Context, n int) error { log = append(log, fmt.Sprint("action ", n)); return nil }),
+		fsm.OnExit(running, note("exit")),
+		fsm.OnEnter(running, note("enter")),
+		fsm.OnTransition(note("transition")),
+	)
+	if err != nil {
+		t.Fatalf("build: %v", err)
+	}
+	ctx, st := t.Context(), running
+
+	tr, err := m.Fire(ctx, &st, evFinish, 2)
+	if err != nil || tr.From != running || tr.To != running || !tr.Is(evFinish) || st != running {
+		t.Fatalf("Fire: %v -> %v, err %v, state %v; want running -> running", tr.From, tr.To, err, st)
+	}
+	if _, fired, err := m.TryFire(ctx, &st, evFinish, 3); !fired || err != nil {
+		t.Errorf("TryFire: fired=%v, err %v", fired, err)
+	}
+	if !slices.Equal(log, []string{"action 2", "action 3"}) {
+		t.Errorf("ran %v, want only the actions", log)
+	}
+	// It is refused as any transition is.
+	if _, err := m.Fire(ctx, &st, evFinish, 0); !errors.Is(err, errNever) {
+		t.Errorf("a rejecting guard: %v, want a GuardError", err)
+	}
+	if !m.Can(ctx, running, evFinish, 1) || m.Can(ctx, idle, evFinish, 1) {
+		t.Error("Can does not see the internal transition, or sees it from idle")
+	}
+	if to, ok := m.To(running, evFinish); !ok || to != running {
+		t.Errorf("To = %v, %v; want running, true", to, ok)
+	}
+}
+
+// An internal transition is not a way out: a state with only those is
+// terminal, and a start with only those is dead.
+func TestStayIsNotAWayOut(t *testing.T) {
+	t.Parallel()
+
+	m, err := fsm.New("job",
+		fsm.From(idle).On(evStart).To(running),
+		fsm.From(running).On(evCancel).Stay(),
+	)
+	if err != nil {
+		t.Fatalf("build: %v", err)
+	}
+	if got := m.Terminals(); !slices.Equal(got, []state{running}) {
+		t.Errorf("Terminals() = %v, want [running]", got)
+	}
+	_, err = fsm.New("job", fsm.Initial(idle), fsm.From(idle).On(evStart).Stay())
+	if want := "fsm job: initial state idle has no outgoing transition"; err == nil || err.Error() != want {
+		t.Errorf("got %v, want %q", err, want)
+	}
+}
+
+// An internal transition enters and leaves nothing, so a typed hook that
+// only it could trigger would never run, and New says so.
+func TestStayTriggersNoTypedHook(t *testing.T) {
+	t.Parallel()
+
+	stay := fsm.From(running).On(evFinish).Stay()
+	in := fsm.From(idle).On(evStart).To(running)
+	for _, tc := range []struct {
+		name string
+		hook fsm.Rule[state]
+		want string
+	}{
+		{"OnEnterVia", fsm.OnEnterVia(running, evFinish, func(context.Context, fsm.Transition[state], int) {}),
+			"fsm job: OnEnterVia for state running: no transition on finish enters it, so the hook would never run"},
+		{"OnExitVia", fsm.OnExitVia(running, evFinish, func(context.Context, fsm.Transition[state], int) {}),
+			"fsm job: OnExitVia for state running: no transition on finish leaves it, so the hook would never run"},
+		{"OnExitWith", fsm.OnExitWith(running, func(context.Context, fsm.Transition[state], int) {}),
+			"fsm job: OnExitWith for state running: no transition leaves it, so the hook would never run"},
+	} {
+		_, err := fsm.New("job", in, stay, tc.hook)
+		if err == nil || err.Error() != tc.want {
+			t.Errorf("%s: got %v, want %q", tc.name, err, tc.want)
+		}
+	}
+}
+
+// A group can declare an internal transition, each member staying in
+// itself, and a member overrides it, or a group's external one, as usual.
+func TestStayInAGroup(t *testing.T) {
+	t.Parallel()
+
+	live := fsm.NewGroup("live", idle, running)
+	m, err := fsm.New("job",
+		fsm.From(idle).On(evStart).To(running),
+		fsm.FromGroup(live).On(evCancel).Stay(),
+		fsm.From(running).On(evCancel).To(cancelled), // overrides the group's
+		fsm.FromGroup(live).On(evFinish).To(done),
+		fsm.From(idle).On(evFinish).Stay(), // overrides the group's
+	)
+	if err != nil {
+		t.Fatalf("build: %v", err)
+	}
+	for _, tc := range []struct {
+		from, want state
+		ev         fsm.Event[fsm.Unit]
+	}{
+		{idle, idle, evCancel},
+		{running, cancelled, evCancel},
+	} {
+		st := tc.from
+		if _, err := m.Send(t.Context(), &st, tc.ev); err != nil || st != tc.want {
+			t.Errorf("%v on %s: %v, err %v; want %v", tc.from, tc.ev, st, err, tc.want)
+		}
+	}
+	var got []string
+	for _, e := range m.Edges() {
+		got = append(got, fmt.Sprintf("%v-%s->%v internal=%v group=%q", e.From, e.Event(), e.To, e.Internal, e.Group))
+	}
+	want := []string{
+		"idle-start->running internal=false group=\"\"",
+		"running-cancel->cancelled internal=false group=\"\"",
+		"idle-finish->idle internal=true group=\"\"",
+		"idle-cancel->idle internal=true group=\"live\"",
+		"running-finish->done internal=false group=\"live\"",
+	}
+	if !slices.Equal(got, want) {
+		t.Errorf("Edges()\n got %q\nwant %q", got, want)
+	}
+}
+
+// Error messages name an internal transition as one.
+func TestStayIsNamedInErrors(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		rule fsm.Rule[state]
+		want string
+	}{
+		{fsm.From(idle).On(evStart).Stay().Guard("g", nil),
+			`fsm job: internal transition idle: guard "g" is nil`},
+		{fsm.FromEach(idle, running).On(evStart).Stay().Guard("g", nil),
+			`fsm job: internal transition [idle running]: guard "g" is nil`},
+		{fsm.FromGroup(fsm.NewGroup("live", idle, running)).On(evStart).Stay().Guard("g", nil),
+			`fsm job: internal transition group live: guard "g" is nil`},
+	} {
+		_, err := fsm.New("job", tc.rule, fsm.From(idle).On(evCancel).To(cancelled), fsm.From(running).On(evFinish).To(done))
+		if err == nil || err.Error() != tc.want {
+			t.Errorf("got %v, want %q", err, tc.want)
+		}
+	}
+}
+
+// DOT draws an internal transition as a dashed loop on its state.
+func TestStayIsDrawnDashed(t *testing.T) {
+	t.Parallel()
+
+	m, err := fsm.New("job",
+		fsm.From(idle).On(evStart).To(running),
+		fsm.From(running).On(evFinish).Stay().Guard("positive", func(context.Context, int) error { return nil }),
+	)
+	if err != nil {
+		t.Fatalf("build: %v", err)
+	}
+	want := `digraph "job" {
+	rankdir=LR;
+	"idle" [shape=box];
+	"running" [shape=doublecircle];
+	"idle" -> "running" [label="start"];
+	"running" -> "running" [label="finish\n[positive]", style=dashed];
+}
+`
+	if got := m.DOT(); got != want {
+		t.Errorf("DOT\n%s\nwant\n%s", got, want)
+	}
+}
+
 // --- TryFire ----------------------------------------------------------------
 
 // TryFire makes the transition Fire would, hooks and all, and says it did.
@@ -1762,6 +1961,7 @@ func TestFireDoesNotAllocate(t *testing.T) {
 	m, err := fsm.New("job",
 		fsm.From(idle).On(evStart).To(running).Guard("always", func(context.Context, fsm.Unit) error { return nil }),
 		fsm.From(running).On(evFinish).To(idle).Action(func(context.Context, int) error { return nil }),
+		fsm.From(running).On(evCancel).Stay().Action(func(context.Context, fsm.Unit) error { return nil }),
 		fsm.OnEnter(running, func(context.Context, fsm.Transition[state]) {}),
 		fsm.OnExit(running, func(context.Context, fsm.Transition[state]) {}),
 		// Payload hooks run in the same path and must not box the payload.
@@ -1776,6 +1976,7 @@ func TestFireDoesNotAllocate(t *testing.T) {
 
 	avg := testing.AllocsPerRun(1000, func() {
 		_, _ = m.Send(ctx, &st, evStart)
+		_, _ = m.Send(ctx, &st, evCancel) // internal: running stays
 		_, _ = m.Fire(ctx, &st, evFinish, 7)
 	})
 	if avg != 0 {
@@ -2668,7 +2869,8 @@ func FuzzMachineInvariants(f *testing.F) {
 		seen := map[[2]int]bool{}
 		claimedBy := map[int]int{} // event -> the group source holding it
 		for i := 0; i+2 < len(rows); i += 3 {
-			r := row{int(rows[i]) % (len(states) + len(groups)), int(rows[i+1]) % len(events), int(rows[i+2]) % len(states)}
+			// A target past the states is Stay: an internal transition.
+			r := row{int(rows[i]) % (len(states) + len(groups)), int(rows[i+1]) % len(events), int(rows[i+2]) % (len(states) + 1)}
 			if seen[[2]int{r.src, r.ev}] {
 				continue
 			}
@@ -2688,11 +2890,17 @@ func FuzzMachineInvariants(f *testing.F) {
 				})
 		})
 		for _, r := range picked {
-			ev, to := events[r.ev], states[r.to]
+			ev := events[r.ev]
+			var from fsm.FromStep[state]
 			if r.src < len(states) {
-				rules = append(rules, fsm.From(states[r.src]).On(ev).To(to))
+				from = fsm.From(states[r.src])
 			} else {
-				rules = append(rules, fsm.FromGroup(groups[r.src-len(states)]).On(ev).To(to))
+				from = fsm.FromGroup(groups[r.src-len(states)])
+			}
+			if r.to == len(states) {
+				rules = append(rules, from.On(ev).Stay())
+			} else {
+				rules = append(rules, from.On(ev).To(states[r.to]))
 			}
 		}
 
@@ -2718,7 +2926,13 @@ func FuzzMachineInvariants(f *testing.F) {
 					t.Fatalf("edge %v --%s--> %v claims group %q, which does not hold %v", e.From, e.Event(), e.To, e.Group, e.From)
 				}
 			}
-			outgoing[e.From] = true
+			// An internal transition is a loop, and not a way out.
+			if e.Internal && e.To != e.From {
+				t.Fatalf("internal edge %v --%s--> %v leaves its state", e.From, e.Event(), e.To)
+			}
+			if !e.Internal {
+				outgoing[e.From] = true
+			}
 		}
 
 		// Events deduplicates by name; States and Edges do not repeat a row.

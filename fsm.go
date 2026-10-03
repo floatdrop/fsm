@@ -150,6 +150,10 @@ type Machine[S comparable] struct {
 	onEnterVia map[edge[S]][]any
 	onExitVia  map[edge[S]][]any
 
+	// The rows declared with [OnStep.Stay], which run no hook. Empty in a
+	// machine that declares none, which then pays one length check per fire.
+	internal map[edge[S]]bool
+
 	// Hooks that run after every transition, declared with [OnTransition].
 	onAll []Hook[S]
 
@@ -178,7 +182,9 @@ func (m *Machine[S]) Name() string { return m.name }
 // action, run the exit hooks of the old state, assign the new state, run the
 // [OnTransition] hooks, then the entry hooks of the new state. If the lookup
 // fails, a guard rejects, or the action returns an error, Fire assigns
-// nothing, runs no hook, and returns the zero Transition.
+// nothing, runs no hook, and returns the zero Transition. An internal
+// transition, declared with [OnStep.Stay], stops after the action: the state
+// is not left, so no hook runs.
 //
 // The payload often aliases the state. A guard or action that writes *st, or
 // fires this machine on it, is reported as a [StateChangedError], again with
@@ -234,6 +240,11 @@ func (m *Machine[S]) Fire[A any](ctx context.Context, st *S, ev Event[A], arg A)
 	t := Transition[S]{From: from, To: to, trigger: ev.def}
 	if !m.hasHooks {
 		*st = to
+		return t, nil
+	}
+	// An internal transition leaves nothing, so it runs no hook; *st is
+	// already to.
+	if len(m.internal) > 0 && m.internal[e] {
 		return t, nil
 	}
 
@@ -339,6 +350,11 @@ func (m *Machine[S]) apply[A any](ctx context.Context, st *S, from, to S, ev Eve
 	t := Transition[S]{From: from, To: to, trigger: ev.def}
 	if !m.hasHooks {
 		*st = to
+		return t, nil
+	}
+	// An internal transition leaves nothing, so it runs no hook; *st is
+	// already to.
+	if len(m.internal) > 0 && m.internal[e] {
 		return t, nil
 	}
 
