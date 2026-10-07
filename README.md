@@ -10,7 +10,7 @@
 [![License](https://img.shields.io/github/license/floatdrop/fsm)](LICENSE)
 [![Awesome Go](https://raw.githubusercontent.com/floatdrop/awesome-go/main/badges/floatdrop--fsm.svg)](https://floatdrop.github.io/awesome-go/#floatdrop--fsm)
 
-A finite state machine for Go, in one package with no dependencies.
+A finite state machine for Go.
 
 ```sh
 go get github.com/floatdrop/fsm
